@@ -1,15 +1,22 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
-import { serve } from "./server.js";
+import { serve, serveHttp } from "./server.js";
 import { Store } from "./store.js";
 
 const [cmd, ...args] = process.argv.slice(2);
 const dbPath = process.env.UNDERWRIGHT_DB ?? "underwright.db";
 
 switch (cmd) {
-  case "serve":
-    await serve(dbPath);
+  case "serve": {
+    const httpIdx = args.indexOf("--http");
+    if (httpIdx !== -1) {
+      const [host, port] = (args[httpIdx + 1] ?? "127.0.0.1:8741").split(":");
+      await serveHttp(dbPath, host, Number(port));
+    } else {
+      await serve(dbPath);
+    }
     break;
+  }
 
   case "board": {
     const store = new Store(dbPath);
@@ -47,9 +54,10 @@ switch (cmd) {
     console.log(`underwright — control plane for agentic software development
 
 Usage:
-  underwright serve   Start the MCP server (stdio). Point your agent's MCP config at this.
-  underwright run     Execute queued jobs locally (test/build/deploy/review).
-  underwright board   Print the task board.
+  underwright serve              MCP server over stdio (local agent config).
+  underwright serve --http H:P   MCP server over HTTP at host:port (/mcp) — shared across machines.
+  underwright run                Execute queued jobs locally (test/build/deploy/review).
+  underwright board              Print the task board.
 
 Env:
   UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)`);

@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer as createHttpServer } from "node:http";
 import { z } from "zod";
 import { Store } from "./store.js";
 
@@ -114,4 +116,27 @@ Rules of engagement:
 export async function serve(dbPath: string) {
   const { server } = createServer(dbPath);
   await server.connect(new StdioServerTransport());
+}
+
+/** Shared control plane over HTTP — agents on any machine connect to /mcp. */
+export async function serveHttp(dbPath: string, host: string, port: number) {
+  const http = createHttpServer(async (req, res) => {
+    if (req.url === "/mcp") {
+      // Stateless mode: fresh transport + server per request — all shared
+      // state lives in the store, so any agent can call any tool anytime.
+      const { server } = createServer(dbPath);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on("close", () => { transport.close(); server.close(); });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => http.listen(port, host, resolve));
+  console.error(`[underwright] MCP over HTTP at http://${host}:${port}/mcp (stateless)`);
 }

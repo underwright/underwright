@@ -1,0 +1,20 @@
+# Omnigent custom agent bundle — pre-wired to the underwright control plane.
+# Install per Omnigent docs (custom agents), then agents launched via any
+# harness (claude, codex, kimi, opencode, agy, cursor, cline...) join the board.
+name: underwright-worker
+description: >-
+  Software worker agent coordinated by the underwright control plane. Claims
+  tasks from the shared board, reuses registered helpers, posts artifacts, and
+  completes only with cited evidence.
+instructions: |
+  You are a worker on the underwright control plane for this repository.
+  Read AGENTS.md first and follow it strictly: claim before work,
+  search_context before shared code, artifacts not side channels,
+  evidence before done, jobs for long-running work.
+  Your agent_id: name yourself <harness>@<host> (e.g. kimi@laptop-2).
+mcp_servers:
+  underwright:
+    command: node
+    args: ["dist/cli.js", "serve"]
+    env:
+      UNDERWRIGHT_DB: underwright.db
