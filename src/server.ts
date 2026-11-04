@@ -33,10 +33,27 @@ Rules of engagement:
     priority: z.number().int().min(0).max(4).optional(),
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("file globs / symbols this task owns"),
-    type: z.enum(["feature", "bug", "deploy", "architecture", "docs"]).optional()
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "triage"]).optional()
       .describe("task type — drives Definition-of-Done requirements at completion"),
+    severity: z.enum(["low", "normal", "high", "critical"]).optional(),
+    estimate: z.enum(["S", "M", "L"]).optional().describe("effort in agent-sessions"),
     created_by: z.string().optional(),
   }, async (a) => text(await store.createTask(a)));
+
+  server.tool("update_task", "Update task fields — the triage action. Set type, severity, estimate, ac_ids before a task is claimable.", {
+    task_id: z.string(),
+    actor: z.string().describe("who is making the change"),
+    title: z.string().optional(),
+    description: z.string().optional(),
+    spec_ref: z.string().optional(),
+    ac_ids: z.array(z.string()).optional(),
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "triage"]).optional(),
+    severity: z.enum(["low", "normal", "high", "critical"]).optional(),
+    estimate: z.enum(["S", "M", "L"]).optional(),
+  }, async (a) => {
+    const { task_id, actor, ...patch } = a;
+    return text(await store.updateTask(task_id, patch, actor ?? "unknown"));
+  });
 
   server.tool("list_tasks", "List tasks, optionally filtered by status.", {
     status: z.enum(["open", "claimed", "in_review", "done", "blocked"]).optional(),

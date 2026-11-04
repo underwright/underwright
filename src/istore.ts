@@ -11,6 +11,8 @@ export interface CreateTaskArgs {
   title: string; description?: string; spec_ref?: string; ac_ids?: string[];
   priority?: number; ownership?: object; created_by?: string; id?: string;
   type?: TaskType;
+  severity?: "low" | "normal" | "high" | "critical";
+  estimate?: "S" | "M" | "L" | "";
 }
 
 export interface IStore {
@@ -20,6 +22,7 @@ export interface IStore {
   linkTask(id: string, spec_ref: string): Awaitable<any>;
   listTasks(status?: TaskStatus): Awaitable<any[]>;
   claimTask(taskId: string, agentId: string, ttlSeconds?: number, scope?: object): Awaitable<any>;
+  updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string): Awaitable<any>;
   releaseTask(taskId: string, agentId: string): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;

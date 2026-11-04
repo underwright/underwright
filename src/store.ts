@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
 import type { IStore, CreateTaskArgs } from "./istore.js";
 
 export type { TaskStatus } from "./istore.js";
@@ -52,6 +52,15 @@ export class SqliteStore implements IStore {
       }
       this.db.exec("PRAGMA user_version = 2;");
     }
+    if (v < 3) {
+      // v3: triage fields — severity + effort estimate (definition of ready).
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("severity")) this.db.exec("ALTER TABLE tasks ADD COLUMN severity TEXT NOT NULL DEFAULT 'normal';");
+      if (!cols.has("estimate")) this.db.exec("ALTER TABLE tasks ADD COLUMN estimate TEXT NOT NULL DEFAULT '';");
+      this.db.exec("PRAGMA user_version = 3;");
+    }
   }
 
   private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -70,14 +79,14 @@ export class SqliteStore implements IStore {
     const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
-        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type)
-         VALUES (?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         id, args.title, args.description ?? "", args.spec_ref ?? null,
         JSON.stringify(args.ac_ids ?? []), args.priority ?? 2,
         JSON.stringify(args.ownership ?? {}), args.created_by ?? "human",
-        args.type ?? "feature"
+        args.type ?? "feature", args.severity ?? "normal", args.estimate ?? ""
       );
     this.log("task", id, "created", args.created_by ?? "human", args);
     return this.getTask(id);
@@ -97,6 +106,22 @@ export class SqliteStore implements IStore {
     this.db.prepare("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?").run(status, id);
     this.log("task", id, `status:${status}`, actor);
     return { id, status };
+  }
+
+  updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
+    const t = this.getTask(id);
+    if (!t) return { error: `task ${id} not found` };
+    const sets: string[] = [];
+    const vals: any[] = [];
+    for (const k of ["title", "description", "spec_ref", "type", "severity", "estimate"] as const) {
+      if (patch[k] !== undefined) { sets.push(`${k}=?`); vals.push(patch[k]); }
+    }
+    if (patch.ac_ids !== undefined) { sets.push("ac_ids=?"); vals.push(JSON.stringify(patch.ac_ids)); }
+    if (!sets.length) return { id, unchanged: true };
+    sets.push("updated_at=datetime('now')");
+    this.db.prepare(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`).run(...vals, id);
+    this.log("task", id, "updated", actor, patch);
+    return this.getTask(id);
   }
 
   linkTask(id: string, spec_ref: string) {
@@ -124,6 +149,11 @@ export class SqliteStore implements IStore {
     const now = new Date().toISOString();
     if (existing && existing.lease_expires > now && existing.agent_id !== agentId) {
       return { error: `task ${taskId} is claimed by ${existing.agent_id} until ${existing.lease_expires}` };
+    }
+
+    const dor = evaluateDoR(task, loadPolicy());
+    if (!dor.ready) {
+      return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
     }
 
     const expires = new Date(Date.now() + ttlSeconds * 1000).toISOString();

@@ -7,6 +7,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   spec_ref      TEXT,                    -- path/URI to the governing spec artifact
   ac_ids        TEXT NOT NULL DEFAULT '[]',  -- acceptance criterion ids from the spec
   type          TEXT NOT NULL DEFAULT 'feature',  -- drives Definition-of-Done rules
+  severity      TEXT NOT NULL DEFAULT 'normal',   -- low|normal|high|critical
+  estimate      TEXT NOT NULL DEFAULT '',          -- S|M|L (agent-sessions); empty = unestimated
   status        TEXT NOT NULL DEFAULT 'open'
                 CHECK (status IN ('open','claimed','in_review','done','blocked')),
   priority      INTEGER NOT NULL DEFAULT 2,

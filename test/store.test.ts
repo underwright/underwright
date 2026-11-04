@@ -12,6 +12,8 @@ beforeEach(() => {
   rmSync(DB, { force: true });
   rmSync(`${DB}-wal`, { force: true });
   rmSync(`${DB}-shm`, { force: true });
+  // isolate: tests opt into a policy explicitly
+  process.env.UNDERWRIGHT_POLICY = "/tmp/uw-no-policy.json";
   store = new SqliteStore(DB);
 });
 afterEach(() => store.close());
@@ -124,6 +126,18 @@ describe("definition of done", () => {
     store.reportEvidence({ task_id: t.id, agent_id: "agent-B", kind: "review" });
     r = store.completeTask(t.id, "agent-A") as any;
     expect(r).toHaveProperty("completed", t.id);
+    delete process.env.UNDERWRIGHT_POLICY;
+  });
+});
+
+describe("definition of ready", () => {
+  it("blocks claim until triaged under dor policy", () => {
+    process.env.UNDERWRIGHT_POLICY = new URL("../underwright.policy.json", import.meta.url).pathname;
+    const t = store.createTask({ title: "untriaged" });
+    const r = store.claimTask(t.id, "agent-A") as any;
+    expect(r.error).toContain("not ready");
+    store.updateTask(t.id, { type: "bug", ac_ids: ["a1"], estimate: "S" }, "triage-bot");
+    expect(store.claimTask(t.id, "agent-A")).not.toHaveProperty("error");
     delete process.env.UNDERWRIGHT_POLICY;
   });
 });

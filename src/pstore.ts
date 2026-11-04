@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
 import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
 
 const DDL = `
@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   spec_ref    TEXT,
   ac_ids      JSONB NOT NULL DEFAULT '[]',
   type        TEXT NOT NULL DEFAULT 'feature',
+  severity    TEXT NOT NULL DEFAULT 'normal',
+  estimate    TEXT NOT NULL DEFAULT '',
   status      TEXT NOT NULL DEFAULT 'open'
               CHECK (status IN ('open','claimed','in_review','done','blocked')),
   priority    INT NOT NULL DEFAULT 2,
@@ -96,6 +98,8 @@ export class PgStore implements IStore {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
     return new PgStore(sql);
   }
 
@@ -106,10 +110,11 @@ export class PgStore implements IStore {
   async createTask(a: CreateTaskArgs) {
     const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
     await this.sql`
-      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type)
+      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
       VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
               ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
-              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"})`;
+              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"},
+              ${a.severity ?? "normal"},${a.estimate ?? ""})`;
     await this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
   }
@@ -128,6 +133,21 @@ export class PgStore implements IStore {
     await this.sql`UPDATE tasks SET status=${status}, updated_at=now() WHERE id=${id}`;
     await this.log("task", id, `status:${status}`, actor);
     return { id, status };
+  }
+
+  async updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
+    const t = await this.getTask(id);
+    if (!t) return { error: `task ${id} not found` };
+    const sets: string[] = [];
+    const vals: any[] = [];
+    for (const k of ["title", "description", "spec_ref", "type", "severity", "estimate"] as const) {
+      if (patch[k] !== undefined) { sets.push(`${k}=$${vals.length + 2}`); vals.push(patch[k]); }
+    }
+    if (patch.ac_ids !== undefined) { sets.push(`ac_ids=$${vals.length + 2}`); vals.push(JSON.stringify(patch.ac_ids)); }
+    if (!sets.length) return { id, unchanged: true };
+    await this.sql.unsafe(`UPDATE tasks SET ${sets.join(",")}, updated_at=now() WHERE id=$1`, [id, ...vals]);
+    await this.log("task", id, "updated", actor, patch);
+    return this.getTask(id);
   }
 
   async linkTask(id: string, spec_ref: string) {
@@ -152,6 +172,12 @@ export class PgStore implements IStore {
     if (claim && new Date(claim.lease_expires) > new Date() && claim.agent_id !== agentId) {
       return { error: `task ${taskId} is claimed by ${claim.agent_id} until ${claim.lease_expires}` };
     }
+
+    const dor = evaluateDoR(task, loadPolicy());
+    if (!dor.ready) {
+      return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
+    }
+
     const expires = new Date(Date.now() + ttlSeconds * 1000);
     await this.sql`
       INSERT INTO claims (task_id, agent_id, lease_expires, scope) VALUES (${taskId},${agentId},${expires},${this.sql.json(scope)})

@@ -7,5 +7,11 @@
     "docs":         { "evidence": ["review"] },
     "default":      { "evidence": ["test_run"] }
   },
-  "enforcement": "warn"
+  "enforcement": "warn",
+  "dor": {
+    "require_type": true,
+    "require_ac_ids": true,
+    "require_estimate": true,
+    "require_description": false
+  }
 }

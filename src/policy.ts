@@ -22,9 +22,30 @@ export function loadPolicy(path?: string): Policy {
   if (!p || !existsSync(p)) return DEFAULT_POLICY;
   const parsed = JSON.parse(readFileSync(p, "utf8"));
   return {
+    ...parsed,
     dod: parsed.dod ?? {},
     enforcement: parsed.enforcement ?? "warn",
   };
+}
+
+/** Definition of Ready — mirror of DoD at intake. Policy "dor" block lists
+ *  required fields; empty/missing values fail the gate. */
+export interface DorRule {
+  require_ac_ids?: boolean;
+  require_estimate?: boolean;
+  require_type?: boolean;
+  require_description?: boolean;
+}
+
+export function evaluateDoR(task: any, policy: Policy) {
+  const rule = (policy as any).dor as DorRule | undefined;
+  if (!rule) return { ready: true, missing: [] as string[] };
+  const missing: string[] = [];
+  if (rule.require_type && !task.type) missing.push("type unset");
+  if (rule.require_description && !task.description) missing.push("no description");
+  if (rule.require_ac_ids && !(task.ac_ids as string[]).length) missing.push("no acceptance criteria (ac_ids)");
+  if (rule.require_estimate && !task.estimate) missing.push("no effort estimate (S|M|L)");
+  return { ready: missing.length === 0, missing };
 }
 
 export function evaluateDoD(args: {
