@@ -60,6 +60,19 @@ switch (cmd) {
     }
     const store = await openStore(dbPath);
     if (sub === "sync") {
+      const wIdx = args.indexOf("--watch");
+      if (wIdx !== -1) {
+        const interval = Number(args[wIdx + 1] ?? 60) * 1000;
+        console.error(`[underwright] watching ${repo} every ${interval / 1000}s`);
+        for (;;) {
+          try {
+            console.error(new Date().toISOString(), JSON.stringify(await syncIssues(store, repo)));
+          } catch (e: any) {
+            console.error("sync error:", e.message);
+          }
+          await new Promise((r) => setTimeout(r, interval));
+        }
+      }
       console.log(JSON.stringify(await syncIssues(store, repo), null, 2));
     } else if (sub === "post-evidence") {
       const task = args[args.indexOf("--task") + 1];
