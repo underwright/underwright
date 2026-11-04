@@ -2,6 +2,7 @@
 import { execSync } from "node:child_process";
 import { serve, serveHttp } from "./server.js";
 import { Store } from "./store.js";
+import { syncIssues, postEvidenceComment } from "./github.js";
 
 const [cmd, ...args] = process.argv.slice(2);
 const dbPath = process.env.UNDERWRIGHT_DB ?? "underwright.db";
@@ -46,6 +47,24 @@ switch (cmd) {
       console.log(`[underwright] ${job.id} ${status}`);
     }
     if (!ran) console.log("[underwright] no queued jobs");
+    store.close();
+    break;
+  }
+
+  case "github": {
+    const sub = args[0];
+    const repo = args[args.indexOf("--repo") + 1];
+    if (!repo) {
+      console.error("usage: underwright github sync|post-evidence --repo owner/name [--task ID]");
+      process.exit(1);
+    }
+    const store = new Store(dbPath);
+    if (sub === "sync") {
+      console.log(JSON.stringify(syncIssues(store, repo), null, 2));
+    } else if (sub === "post-evidence") {
+      const task = args[args.indexOf("--task") + 1];
+      console.log(JSON.stringify(postEvidenceComment(store, repo, task)));
+    }
     store.close();
     break;
   }

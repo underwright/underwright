@@ -28,9 +28,9 @@ export class Store {
 
   createTask(args: {
     title: string; description?: string; spec_ref?: string; ac_ids?: string[];
-    priority?: number; ownership?: object; created_by?: string;
+    priority?: number; ownership?: object; created_by?: string; id?: string;
   }) {
-    const id = `task-${randomUUID().slice(0, 8)}`;
+    const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
         `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by)
@@ -50,6 +50,15 @@ export class Store {
     if (!t) return null;
     const claim = this.db.prepare("SELECT * FROM claims WHERE task_id = ?").get(id) ?? null;
     return { ...t, ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim };
+  }
+
+  setTaskStatus(id: string, status: TaskStatus, actor: string) {
+    const t = this.getTask(id);
+    if (!t) return { error: `task ${id} not found` };
+    if (t.status === status) return { id, status };
+    this.db.prepare("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?").run(status, id);
+    this.log("task", id, `status:${status}`, actor);
+    return { id, status };
   }
 
   listTasks(status?: TaskStatus) {
@@ -147,6 +156,12 @@ export class Store {
     this.db.prepare("DELETE FROM claims WHERE task_id=?").run(taskId);
     this.log("task", taskId, "completed", agentId);
     return { completed: taskId };
+  }
+
+  getEvidence(taskId: string) {
+    return this.db
+      .prepare("SELECT * FROM evidence WHERE task_id=? ORDER BY created_at")
+      .all(taskId) as any[];
   }
 
   registerHelper(args: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {
