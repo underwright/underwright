@@ -164,3 +164,19 @@ describe("resource locks", () => {
     expect(r.warning).toContain("agent-B");
   });
 });
+
+describe("mailbox", () => {
+  it("send, inbox marks read, watcher notified on status change", () => {
+    store.sendMessage("agent-B", "agent-A", "blocked on you", "task-1");
+    const msgs = store.inbox("agent-B") as any[];
+    expect(msgs.length).toBe(1);
+    expect(msgs[0].body).toBe("blocked on you");
+    expect((store.inbox("agent-B") as any[]).length).toBe(0);
+    const t = store.createTask({ title: "w" });
+    store.watchTask("agent-C", t.id);
+    store.setTaskStatus(t.id, "in_review", "agent-A");
+    const note = store.inbox("agent-C") as any[];
+    expect(note.length).toBe(1);
+    expect(note[0].body).toContain("in_review");
+  });
+});

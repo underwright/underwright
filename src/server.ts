@@ -95,6 +95,18 @@ Rules of engagement:
     resources: z.array(z.string()),
   }, async (a) => text(await store.checkLocks(a.resources)));
 
+  server.tool("send_message", "Send a direct message to another agent (e.g. blocked-on, handoff request). Keep it structured and short.", {
+    to: z.string(), from: z.string(), body: z.string(), task_id: z.string().optional(),
+  }, async (a) => text(await store.sendMessage(a.to, a.from, a.body, a.task_id)));
+
+  server.tool("inbox", "Read your messages. Returns unread by default and marks them read.", {
+    agent_id: z.string(), unread_only: z.boolean().optional(),
+  }, async (a) => text(await store.inbox(a.agent_id, a.unread_only ?? true)));
+
+  server.tool("watch_task", "Subscribe to a task — the control plane messages you when its status or jobs change. This is how agents de-register instead of polling.", {
+    agent_id: z.string(), task_id: z.string(),
+  }, async (a) => text(await store.watchTask(a.agent_id, a.task_id)));
+
   server.tool("post_artifact", "Post a durable artifact (spec, design, handoff, note, review) — the only inter-agent communication channel.", {
     task_id: z.string().optional(),
     agent_id: z.string(),

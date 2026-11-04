@@ -70,6 +70,21 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at  TIMESTAMPTZ,
   finished_at TIMESTAMPTZ
 );
+CREATE TABLE IF NOT EXISTS messages (
+  id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  to_agent   TEXT NOT NULL,
+  from_agent TEXT NOT NULL,
+  task_id    TEXT,
+  body       TEXT NOT NULL,
+  read       BOOLEAN NOT NULL DEFAULT false,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS watches (
+  agent_id   TEXT NOT NULL,
+  task_id    TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, task_id)
+);
 CREATE TABLE IF NOT EXISTS locks (
   resource      TEXT PRIMARY KEY,
   agent_id      TEXT NOT NULL,
@@ -139,6 +154,7 @@ export class PgStore implements IStore {
     if (t.status === status) return { id, status };
     await this.sql`UPDATE tasks SET status=${status}, updated_at=now() WHERE id=${id}`;
     await this.log("task", id, `status:${status}`, actor);
+    await this.notifyWatchers(id, `task ${id} → ${status}`);
     return { id, status };
   }
 
@@ -358,6 +374,8 @@ export class PgStore implements IStore {
   async finishJob(jobId: string, status: "done" | "failed", result: string) {
     await this.sql`UPDATE jobs SET status=${status}, result=${result}, finished_at=now() WHERE id=${jobId}`;
     await this.log("job", jobId, status, "runner", { result: result.slice(0, 500) });
+    const job = await this.getJob(jobId);
+    if (job?.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
   }
 
@@ -373,6 +391,33 @@ export class PgStore implements IStore {
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;
     return { tasks, job_counts, helpers_registered: n };
+  }
+
+  async sendMessage(to: string, from: string, body: string, taskId?: string) {
+    await this.sql`INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (${to},${from},${taskId ?? null},${body})`;
+    await this.log("message", to, "sent", from, { task_id: taskId });
+    return { sent: to };
+  }
+
+  async inbox(agentId: string, unreadOnly = true) {
+    const rows = unreadOnly
+      ? await this.sql`SELECT * FROM messages WHERE to_agent=${agentId} AND NOT read ORDER BY id`
+      : await this.sql`SELECT * FROM messages WHERE to_agent=${agentId} ORDER BY id`;
+    await this.sql`UPDATE messages SET read=true WHERE to_agent=${agentId} AND NOT read`;
+    return rows;
+  }
+
+  async watchTask(agentId: string, taskId: string) {
+    await this.sql`INSERT INTO watches (agent_id, task_id) VALUES (${agentId},${taskId}) ON CONFLICT DO NOTHING`;
+    await this.log("watch", taskId, "watching", agentId);
+    return { watching: taskId };
+  }
+
+  private async notifyWatchers(taskId: string, body: string) {
+    const watchers = await this.sql`SELECT agent_id FROM watches WHERE task_id=${taskId}`;
+    for (const w of watchers as any[]) {
+      await this.sql`INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (${w.agent_id},'underwright',${taskId},${body})`;
+    }
   }
 
   async auditLog(limit = 50) {

@@ -28,6 +28,9 @@ export interface IStore {
   claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds?: number): Awaitable<any>;
   releaseResources(resources: string[], agentId: string): Awaitable<any>;
   checkLocks(resources: string[]): Awaitable<any[]>;
+  sendMessage(to: string, from: string, body: string, taskId?: string): Awaitable<any>;
+  inbox(agentId: string, unreadOnly?: boolean): Awaitable<any[]>;
+  watchTask(agentId: string, taskId: string): Awaitable<any>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;
   listArtifacts(taskId: string): Awaitable<any[]>;
   reportEvidence(a: {

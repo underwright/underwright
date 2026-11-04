@@ -71,6 +71,23 @@ export class SqliteStore implements IStore {
       }
       this.db.exec("PRAGMA user_version = 4;");
     }
+    if (v < 5) {
+      for (const tbl of ["messages", "watches"]) {
+        const has = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?").get(tbl);
+        if (!has) {
+          this.db.exec(tbl === "messages"
+            ? `CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_agent TEXT NOT NULL, from_agent TEXT NOT NULL, task_id TEXT, body TEXT NOT NULL, read INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT (datetime('now')))`
+            : `CREATE TABLE watches (agent_id TEXT NOT NULL, task_id TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (agent_id, task_id))`);
+        }
+      }
+      this.db.exec("PRAGMA user_version = 5;");
+    }
+  }
+
+  private notifyWatchers(taskId: string, body: string) {
+    const watchers = this.db.prepare("SELECT agent_id FROM watches WHERE task_id=?").all(taskId) as any[];
+    const stmt = this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)");
+    for (const w of watchers) stmt.run(w.agent_id, "underwright", taskId, body);
   }
 
   private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -115,6 +132,7 @@ export class SqliteStore implements IStore {
     if (t.status === status) return { id, status };
     this.db.prepare("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?").run(status, id);
     this.log("task", id, `status:${status}`, actor);
+    this.notifyWatchers(id, `task ${id} → ${status}`);
     return { id, status };
   }
 
@@ -215,6 +233,27 @@ export class SqliteStore implements IStore {
     return this.db
       .prepare(`SELECT * FROM locks WHERE resource IN (${marks}) AND lease_expires > ?`)
       .all(...resources, now);
+  }
+
+  sendMessage(to: string, from: string, body: string, taskId?: string) {
+    this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)")
+      .run(to, from, taskId ?? null, body);
+    this.log("message", to, "sent", from, { task_id: taskId });
+    return { sent: to };
+  }
+
+  inbox(agentId: string, unreadOnly = true) {
+    const rows = unreadOnly
+      ? this.db.prepare("SELECT * FROM messages WHERE to_agent=? AND read=0 ORDER BY id").all(agentId)
+      : this.db.prepare("SELECT * FROM messages WHERE to_agent=? ORDER BY id").all(agentId);
+    this.db.prepare("UPDATE messages SET read=1 WHERE to_agent=? AND read=0").run(agentId);
+    return rows;
+  }
+
+  watchTask(agentId: string, taskId: string) {
+    this.db.prepare("INSERT OR IGNORE INTO watches (agent_id, task_id) VALUES (?,?)").run(agentId, taskId);
+    this.log("watch", taskId, "watching", agentId);
+    return { watching: taskId };
   }
 
   releaseTask(taskId: string, agentId: string) {
@@ -349,6 +388,8 @@ export class SqliteStore implements IStore {
     this.db.prepare("UPDATE jobs SET status=?, result=?, finished_at=datetime('now') WHERE id=?")
       .run(status, result, jobId);
     this.log("job", jobId, status, "runner", { result: result.slice(0, 500) });
+    const job = this.getJob(jobId) as any;
+    if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
   }
 

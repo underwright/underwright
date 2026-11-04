@@ -81,6 +81,22 @@ CREATE TABLE IF NOT EXISTS locks (
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS messages (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  to_agent    TEXT NOT NULL,
+  from_agent  TEXT NOT NULL,
+  task_id     TEXT,
+  body        TEXT NOT NULL,
+  read        INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS watches (
+  agent_id    TEXT NOT NULL,
+  task_id     TEXT NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (agent_id, task_id)
+);
+
 -- Append-only audit log: every mutation lands here.
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
