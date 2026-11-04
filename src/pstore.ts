@@ -130,6 +130,14 @@ export class PgStore implements IStore {
     return { id, status };
   }
 
+  async linkTask(id: string, spec_ref: string) {
+    const t = await this.getTask(id);
+    if (!t) return { error: `task ${id} not found` };
+    await this.sql`UPDATE tasks SET spec_ref=${spec_ref}, updated_at=now() WHERE id=${id}`;
+    await this.log("task", id, "linked", "sync", { spec_ref });
+    return { id, spec_ref };
+  }
+
   async listTasks(status?: TaskStatus) {
     return status
       ? this.sql`SELECT id, title, status, priority FROM tasks WHERE status=${status} ORDER BY priority, created_at`

@@ -99,6 +99,14 @@ export class SqliteStore implements IStore {
     return { id, status };
   }
 
+  linkTask(id: string, spec_ref: string) {
+    const t = this.getTask(id);
+    if (!t) return { error: `task ${id} not found` };
+    this.db.prepare("UPDATE tasks SET spec_ref=?, updated_at=datetime('now') WHERE id=?").run(spec_ref, id);
+    this.log("task", id, "linked", "sync", { spec_ref });
+    return { id, spec_ref };
+  }
+
   listTasks(status?: TaskStatus) {
     const rows = status
       ? this.db.prepare("SELECT id, title, status, priority FROM tasks WHERE status = ? ORDER BY priority, created_at").all(status)

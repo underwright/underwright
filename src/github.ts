@@ -34,6 +34,25 @@ export async function syncIssues(store: IStore, repo: string, actor = "github-sy
   const out = { imported: 0, closed_tasks: [] as string[], closed_issues: [] as number[], skipped: 0 };
 
   for (const issue of issues) {
+    // Marker link: "uw:<task-id>" in the body binds the issue to an existing
+    // task instead of importing a duplicate.
+    const marker = issue.body?.match(/uw:([\w-]+)/)?.[1];
+    if (marker) {
+      const task = await store.getTask(marker);
+      if (task) {
+        if (task.spec_ref !== issue.url) await store.linkTask(marker, issue.url);
+        if (issue.state === "CLOSED" && task.status !== "done") {
+          await store.setTaskStatus(marker, "done", actor);
+          out.closed_tasks.push(marker);
+        } else if (task.status === "done" && issue.state === "OPEN") {
+          execSync(`gh issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`, { encoding: "utf8" });
+          out.closed_issues.push(issue.number);
+        }
+        out.skipped++;
+        continue;
+      }
+    }
+
     const id = `gh-${issue.number}`;
     const task = await store.getTask(id);
 

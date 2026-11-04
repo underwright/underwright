@@ -17,6 +17,7 @@ export interface IStore {
   createTask(a: CreateTaskArgs): Awaitable<any>;
   getTask(id: string): Awaitable<any>;
   setTaskStatus(id: string, status: TaskStatus, actor: string): Awaitable<any>;
+  linkTask(id: string, spec_ref: string): Awaitable<any>;
   listTasks(status?: TaskStatus): Awaitable<any[]>;
   claimTask(taskId: string, agentId: string, ttlSeconds?: number, scope?: object): Awaitable<any>;
   releaseTask(taskId: string, agentId: string): Awaitable<any>;
