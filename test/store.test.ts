@@ -92,3 +92,38 @@ describe.skipIf(!process.env.DATABASE_URL)("pg backend", () => {
     await pg.close();
   });
 });
+
+describe("definition of done", () => {
+  it("warns (not blocks) when policy missing requirements at warn level", async () => {
+    process.env.UNDERWRIGHT_POLICY = new URL("../underwright.policy.json", import.meta.url).pathname;
+    const t = store.createTask({ title: "feat", type: "feature" });
+    store.claimTask(t.id, "agent-A");
+    store.reportEvidence({ task_id: t.id, agent_id: "agent-A", kind: "test_run", exit_code: 0 });
+    const r = store.completeTask(t.id, "agent-A") as any;
+    expect(r).toHaveProperty("completed", t.id);
+    expect(r.warnings?.join(" ")).toContain("coverage");
+    delete process.env.UNDERWRIGHT_POLICY;
+  });
+
+  it("blocks at block level, incl. self-review", () => {
+    const { mkdtempSync, writeFileSync } = require("node:fs");
+    const dir = mkdtempSync("/tmp/uwpol-");
+    writeFileSync(`${dir}/pol.json`, JSON.stringify({
+      dod: { bug: { evidence: ["test_run", "review"] } },
+      enforcement: "block",
+    }));
+    process.env.UNDERWRIGHT_POLICY = `${dir}/pol.json`;
+    const t = store.createTask({ title: "fix", type: "bug" });
+    store.claimTask(t.id, "agent-A");
+    store.reportEvidence({ task_id: t.id, agent_id: "agent-A", kind: "test_run", exit_code: 0 });
+    // self-review doesn't count
+    store.reportEvidence({ task_id: t.id, agent_id: "agent-A", kind: "review" });
+    let r = store.completeTask(t.id, "agent-A") as any;
+    expect(r.error).toContain("other than the claim holder");
+    // independent review passes
+    store.reportEvidence({ task_id: t.id, agent_id: "agent-B", kind: "review" });
+    r = store.completeTask(t.id, "agent-A") as any;
+    expect(r).toHaveProperty("completed", t.id);
+    delete process.env.UNDERWRIGHT_POLICY;
+  });
+});

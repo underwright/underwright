@@ -1,7 +1,8 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
-import type { IStore } from "./istore.js";
+import { loadPolicy, evaluateDoD } from "./policy.js";
+import type { IStore, CreateTaskArgs } from "./istore.js";
 
 export type { TaskStatus } from "./istore.js";
 import type { TaskStatus } from "./istore.js";
@@ -41,6 +42,16 @@ export class SqliteStore implements IStore {
         PRAGMA user_version = 1;
       `);
     }
+    if (v < 2) {
+      // v2: task type drives DoD policy dispatch.
+      const hasType = this.db
+        .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='type'")
+        .get();
+      if (!hasType) {
+        this.db.exec("ALTER TABLE tasks ADD COLUMN type TEXT NOT NULL DEFAULT 'feature';");
+      }
+      this.db.exec("PRAGMA user_version = 2;");
+    }
   }
 
   private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -55,20 +66,18 @@ export class SqliteStore implements IStore {
       .run(entityType, entityId, title, content);
   }
 
-  createTask(args: {
-    title: string; description?: string; spec_ref?: string; ac_ids?: string[];
-    priority?: number; ownership?: object; created_by?: string; id?: string;
-  }) {
+  createTask(args: CreateTaskArgs) {
     const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
-        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by)
-         VALUES (?,?,?,?,?,?,?,?)`
+        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type)
+         VALUES (?,?,?,?,?,?,?,?,?)`
       )
       .run(
         id, args.title, args.description ?? "", args.spec_ref ?? null,
         JSON.stringify(args.ac_ids ?? []), args.priority ?? 2,
-        JSON.stringify(args.ownership ?? {}), args.created_by ?? "human"
+        JSON.stringify(args.ownership ?? {}), args.created_by ?? "human",
+        args.type ?? "feature"
       );
     this.log("task", id, "created", args.created_by ?? "human", args);
     return this.getTask(id);
@@ -171,7 +180,7 @@ export class SqliteStore implements IStore {
     const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id=?").get(taskId) as any;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
 
-    const rows = this.db.prepare("SELECT ac_ids FROM evidence WHERE task_id=?").all(taskId) as any[];
+    const rows = this.getEvidence(taskId) as any[];
     const proven = new Set(rows.flatMap((r) => JSON.parse(r.ac_ids)));
     const missing = (task.ac_ids as string[]).filter((ac) => !proven.has(ac));
     if (missing.length > 0) {
@@ -181,10 +190,23 @@ export class SqliteStore implements IStore {
       return { error: "no evidence attached. Done requires proof." };
     }
 
+    const policy = loadPolicy();
+    const dod = evaluateDoD({
+      task, evidence: rows, artifacts: this.listArtifacts(taskId),
+      claimAgent: claim?.agent_id ?? agentId, policy,
+    });
+    if (dod.blocked) {
+      return { error: `definition of done not met (${task.type}): ${dod.missing.join("; ")}` };
+    }
+
     this.db.prepare("UPDATE tasks SET status='done', updated_at=datetime('now') WHERE id=?").run(taskId);
     this.db.prepare("DELETE FROM claims WHERE task_id=?").run(taskId);
-    this.log("task", taskId, "completed", agentId);
-    return { completed: taskId };
+    this.log("task", taskId, "completed", agentId, { dod: dod.missing });
+    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
+  }
+
+  listArtifacts(taskId: string) {
+    return this.db.prepare("SELECT * FROM artifacts WHERE task_id=? ORDER BY created_at").all(taskId);
   }
 
   getEvidence(taskId: string) {

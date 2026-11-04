@@ -33,6 +33,8 @@ Rules of engagement:
     priority: z.number().int().min(0).max(4).optional(),
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("file globs / symbols this task owns"),
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs"]).optional()
+      .describe("task type — drives Definition-of-Done requirements at completion"),
     created_by: z.string().optional(),
   }, async (a) => text(await store.createTask(a)));
 

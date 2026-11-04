@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import { randomUUID } from "node:crypto";
+import { loadPolicy, evaluateDoD } from "./policy.js";
 import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
 
 const DDL = `
@@ -9,6 +10,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT NOT NULL DEFAULT '',
   spec_ref    TEXT,
   ac_ids      JSONB NOT NULL DEFAULT '[]',
+  type        TEXT NOT NULL DEFAULT 'feature',
   status      TEXT NOT NULL DEFAULT 'open'
               CHECK (status IN ('open','claimed','in_review','done','blocked')),
   priority    INT NOT NULL DEFAULT 2,
@@ -93,6 +95,7 @@ export class PgStore implements IStore {
   static async connect(url: string) {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     return new PgStore(sql);
   }
 
@@ -103,10 +106,10 @@ export class PgStore implements IStore {
   async createTask(a: CreateTaskArgs) {
     const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
     await this.sql`
-      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by)
+      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type)
       VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
               ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
-              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"})`;
+              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"})`;
     await this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
   }
@@ -185,6 +188,10 @@ export class PgStore implements IStore {
     return { id };
   }
 
+  async listArtifacts(taskId: string) {
+    return this.sql`SELECT * FROM artifacts WHERE task_id=${taskId} ORDER BY created_at`;
+  }
+
   async getEvidence(taskId: string) {
     return this.sql`SELECT * FROM evidence WHERE task_id=${taskId} ORDER BY created_at`;
   }
@@ -204,10 +211,21 @@ export class PgStore implements IStore {
     if (acs.length === 0 && rows.length === 0) {
       return { error: "no evidence attached. Done requires proof." };
     }
+
+    const policy = loadPolicy();
+    const artifacts = await this.listArtifacts(taskId);
+    const dod = evaluateDoD({
+      task, evidence: rows, artifacts,
+      claimAgent: claim?.agent_id ?? agentId, policy,
+    });
+    if (dod.blocked) {
+      return { error: `definition of done not met (${task.type}): ${dod.missing.join("; ")}` };
+    }
+
     await this.sql`UPDATE tasks SET status='done', updated_at=now() WHERE id=${taskId}`;
     await this.sql`DELETE FROM claims WHERE task_id=${taskId}`;
-    await this.log("task", taskId, "completed", agentId);
-    return { completed: taskId };
+    await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
+    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
   }
 
   async registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {

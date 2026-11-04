@@ -5,9 +5,12 @@ type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
 
+export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | string;
+
 export interface CreateTaskArgs {
   title: string; description?: string; spec_ref?: string; ac_ids?: string[];
   priority?: number; ownership?: object; created_by?: string; id?: string;
+  type?: TaskType;
 }
 
 export interface IStore {
@@ -19,6 +22,7 @@ export interface IStore {
   releaseTask(taskId: string, agentId: string): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;
+  listArtifacts(taskId: string): Awaitable<any[]>;
   reportEvidence(a: {
     task_id: string; agent_id: string; kind: string; command?: string;
     exit_code?: number; output?: string; ac_ids?: string[];
