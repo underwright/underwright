@@ -3,14 +3,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer as createHttpServer } from "node:http";
 import { z } from "zod";
-import { Store } from "./store.js";
+import { openStore } from "./store.js";
+import type { IStore } from "./istore.js";
 
 const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
 });
 
-export function createServer(dbPath: string) {
-  const store = new Store(dbPath);
+export function createServer(store: IStore) {
   const server = new McpServer(
     { name: "underwright", version: "0.1.0" },
     { instructions: `Underwright is the shared control plane for agentic development on this workspace.
@@ -23,7 +23,7 @@ Rules of engagement:
   );
 
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
-    async () => text(store.board()));
+    async () => text(await store.board()));
 
   server.tool("create_task", "Create a task on the board. Reference the spec and list its acceptance criterion ids.", {
     title: z.string(),
@@ -34,15 +34,15 @@ Rules of engagement:
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("file globs / symbols this task owns"),
     created_by: z.string().optional(),
-  }, async (a) => text(store.createTask(a)));
+  }, async (a) => text(await store.createTask(a)));
 
   server.tool("list_tasks", "List tasks, optionally filtered by status.", {
     status: z.enum(["open", "claimed", "in_review", "done", "blocked"]).optional(),
-  }, async ({ status }) => text(store.listTasks(status)));
+  }, async ({ status }) => text(await store.listTasks(status)));
 
   server.tool("get_task", "Get a task with its claim state and full detail.", {
     task_id: z.string(),
-  }, async ({ task_id }) => text(store.getTask(task_id) ?? { error: "not found" }));
+  }, async ({ task_id }) => text(await store.getTask(task_id) ?? { error: "not found" }));
 
   server.tool("claim_task", "Atomically claim a task with a lease. Fails if another agent holds an unexpired claim.", {
     task_id: z.string(),
@@ -50,15 +50,15 @@ Rules of engagement:
     ttl_seconds: z.number().int().optional().describe("lease duration, default 1800"),
     scope: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("subset of the task's ownership you're claiming"),
-  }, async (a) => text(store.claimTask(a.task_id, a.agent_id, a.ttl_seconds, a.scope)));
+  }, async (a) => text(await store.claimTask(a.task_id, a.agent_id, a.ttl_seconds, a.scope)));
 
   server.tool("release_task", "Release your claim, returning the task to open.", {
     task_id: z.string(), agent_id: z.string(),
-  }, async ({ task_id, agent_id }) => text(store.releaseTask(task_id, agent_id)));
+  }, async ({ task_id, agent_id }) => text(await store.releaseTask(task_id, agent_id)));
 
   server.tool("renew_lease", "Extend your claim's lease.", {
     task_id: z.string(), agent_id: z.string(), ttl_seconds: z.number().int().optional(),
-  }, async (a) => text(store.renewLease(a.task_id, a.agent_id, a.ttl_seconds)));
+  }, async (a) => text(await store.renewLease(a.task_id, a.agent_id, a.ttl_seconds)));
 
   server.tool("post_artifact", "Post a durable artifact (spec, design, handoff, note, review) — the only inter-agent communication channel.", {
     task_id: z.string().optional(),
@@ -66,12 +66,12 @@ Rules of engagement:
     kind: z.enum(["spec", "design", "handoff", "note", "review"]),
     title: z.string().optional(),
     content: z.string(),
-  }, async (a) => text(store.postArtifact(a)));
+  }, async (a) => text(await store.postArtifact(a)));
 
   server.tool("search_context", "Search shared knowledge: helpers, specs, handoffs, prior decisions. Call before writing new shared code.", {
     query: z.string(),
     kinds: z.array(z.enum(["helper", "artifact", "evidence"])).optional(),
-  }, async ({ query, kinds }) => text(store.searchContext(query, kinds)));
+  }, async ({ query, kinds }) => text(await store.searchContext(query, kinds)));
 
   server.tool("register_helper", "Publish a reusable helper (utility, pattern, config, fixture) so other agents reuse it instead of duplicating.", {
     agent_id: z.string(),
@@ -79,7 +79,7 @@ Rules of engagement:
     symbol: z.string().optional(),
     kind: z.enum(["util", "pattern", "config", "fixture"]),
     summary: z.string(),
-  }, async (a) => text(store.registerHelper(a)));
+  }, async (a) => text(await store.registerHelper(a)));
 
   server.tool("report_evidence", "Attach proof of work to a task: a test run, CI check, review, or coverage result, citing which acceptance criteria it proves.", {
     task_id: z.string(),
@@ -89,32 +89,32 @@ Rules of engagement:
     exit_code: z.number().int().optional(),
     output: z.string().optional(),
     ac_ids: z.array(z.string()).optional(),
-  }, async (a) => text(store.reportEvidence(a)));
+  }, async (a) => text(await store.reportEvidence(a)));
 
   server.tool("complete_task", "Mark a task done. Refuses unless every declared acceptance criterion has cited evidence.", {
     task_id: z.string(), agent_id: z.string(),
-  }, async ({ task_id, agent_id }) => text(store.completeTask(task_id, agent_id)));
+  }, async ({ task_id, agent_id }) => text(await store.completeTask(task_id, agent_id)));
 
   server.tool("submit_job", "Submit long-running work (test/build/deploy/review) to the job queue and continue other work. Don't poll in-context — check job_status later or let the runner callback.", {
     agent_id: z.string(),
     task_id: z.string().optional(),
     type: z.enum(["test", "build", "deploy", "review"]),
     command: z.string(),
-  }, async (a) => text(store.submitJob(a)));
+  }, async (a) => text(await store.submitJob(a)));
 
   server.tool("job_status", "Check a submitted job's status and result.", {
     job_id: z.string(),
-  }, async ({ job_id }) => text(store.getJob(job_id) ?? { error: "not found" }));
+  }, async ({ job_id }) => text(await store.getJob(job_id) ?? { error: "not found" }));
 
   server.tool("audit_log", "Recent control-plane events (who did what, when).", {
     limit: z.number().int().optional(),
-  }, async ({ limit }) => text(store.auditLog(limit)));
+  }, async ({ limit }) => text(await store.auditLog(limit)));
 
   return { server, store };
 }
 
 export async function serve(dbPath: string) {
-  const { server } = createServer(dbPath);
+  const { server } = createServer(await openStore(dbPath));
   await server.connect(new StdioServerTransport());
 }
 
@@ -132,7 +132,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     if (req.url === "/mcp") {
       // Stateless mode: fresh transport + server per request — all shared
       // state lives in the store, so any agent can call any tool anytime.
-      const { server } = createServer(dbPath);
+      const { server } = createServer(await openStore(dbPath));
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); server.close(); });
       await server.connect(transport);

@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { Store, TaskStatus } from "./store.js";
+import type { IStore, TaskStatus } from "./istore.js";
 
 // GitHub adapter v1: issue⇄task sync via the `gh` CLI.
 // Requires `gh` to be installed and authenticated — no token plumbing here.
@@ -29,17 +29,17 @@ const taskStatusToIssueState = (s: TaskStatus) =>
 
 /** Import open issues as tasks; close tasks whose issues were closed;
  *  close issues whose tasks are done. */
-export function syncIssues(store: Store, repo: string, actor = "github-sync") {
+export async function syncIssues(store: IStore, repo: string, actor = "github-sync") {
   const issues = gh(`issue list --repo ${repo} --state all --limit 200 --json number,title,body,url,state,labels`) as Issue[];
   const out = { imported: 0, closed_tasks: [] as string[], closed_issues: [] as number[], skipped: 0 };
 
   for (const issue of issues) {
     const id = `gh-${issue.number}`;
-    const task = store.getTask(id);
+    const task = await store.getTask(id);
 
     if (!task) {
       if (issue.state === "CLOSED") { out.skipped++; continue; }
-      store.createTask({
+      await store.createTask({
         id,
         title: `[#${issue.number}] ${issue.title}`,
         description: issue.body ?? "",
@@ -53,7 +53,7 @@ export function syncIssues(store: Store, repo: string, actor = "github-sync") {
 
     // Reconcile: issue closed → task done; task done → close issue.
     if (issue.state === "CLOSED" && task.status !== "done") {
-      store.setTaskStatus(id, "done", actor);
+      await store.setTaskStatus(id, "done", actor);
       out.closed_tasks.push(id);
     } else if (task.status === "done" && issue.state === "OPEN") {
       execSync(`gh issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`, { encoding: "utf8" });
@@ -64,10 +64,10 @@ export function syncIssues(store: Store, repo: string, actor = "github-sync") {
 }
 
 /** Render a task's evidence pack as markdown (for PR/issue comments or review gates). */
-export function evidencePack(store: Store, taskId: string) {
-  const task = store.getTask(taskId);
+export async function evidencePack(store: IStore, taskId: string) {
+  const task = await store.getTask(taskId);
   if (!task) return null;
-  const rows = store.getEvidence(taskId);
+  const rows = await store.getEvidence(taskId);
   const lines = [
     `### Evidence pack — ${task.id}`,
     `**${task.title}**`,
@@ -83,13 +83,13 @@ export function evidencePack(store: Store, taskId: string) {
 }
 
 /** Post a task's evidence pack as a comment on its linked issue/PR. */
-export function postEvidenceComment(store: Store, repo: string, taskId: string) {
-  const task = store.getTask(taskId);
+export async function postEvidenceComment(store: IStore, repo: string, taskId: string) {
+  const task = await store.getTask(taskId);
   if (!task?.spec_ref) return { error: `task ${taskId} has no spec_ref` };
   const m = String(task.spec_ref).match(/\/(?:issues|pull)\/(\d+)/);
   if (!m) return { error: `spec_ref ${task.spec_ref} is not an issue/PR URL` };
   const number = m[1];
-  const body = evidencePack(store, taskId) ?? "";
+  const body = (await evidencePack(store, taskId)) ?? "";
   const target = task.spec_ref.includes("/pull/") ? "pr" : "issue";
   execSync(`gh ${target} comment ${number} --repo ${repo} --body-file -`, {
     encoding: "utf8",

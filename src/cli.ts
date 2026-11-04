@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
 import { serve, serveHttp } from "./server.js";
-import { Store } from "./store.js";
+import { openStore } from "./store.js";
 import { syncIssues, postEvidenceComment } from "./github.js";
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -20,19 +20,19 @@ switch (cmd) {
   }
 
   case "board": {
-    const store = new Store(dbPath);
-    console.log(JSON.stringify(store.board(), null, 2));
-    store.close();
+    const store = await openStore(dbPath);
+    console.log(JSON.stringify(await store.board(), null, 2));
+    await store.close();
     break;
   }
 
   case "run": {
     // Local job runner: executes queued jobs one at a time, records results.
     // This is the "agents wait on processes" half of the loop.
-    const store = new Store(dbPath);
+    const store = await openStore(dbPath);
     let job;
     let ran = 0;
-    while ((job = store.nextJob("local-runner"))) {
+    while ((job = await store.nextJob("local-runner"))) {
       ran++;
       console.log(`[underwright] running ${job.id}: ${job.command}`);
       let status: "done" | "failed" = "done";
@@ -43,11 +43,11 @@ switch (cmd) {
         status = "failed";
         result = `${e.stdout ?? ""}\n${e.stderr ?? e.message}`;
       }
-      store.finishJob(job.id, status, result.slice(-8000));
+      await store.finishJob(job.id, status, result.slice(-8000));
       console.log(`[underwright] ${job.id} ${status}`);
     }
     if (!ran) console.log("[underwright] no queued jobs");
-    store.close();
+    await store.close();
     break;
   }
 
@@ -58,14 +58,14 @@ switch (cmd) {
       console.error("usage: underwright github sync|post-evidence --repo owner/name [--task ID]");
       process.exit(1);
     }
-    const store = new Store(dbPath);
+    const store = await openStore(dbPath);
     if (sub === "sync") {
-      console.log(JSON.stringify(syncIssues(store, repo), null, 2));
+      console.log(JSON.stringify(await syncIssues(store, repo), null, 2));
     } else if (sub === "post-evidence") {
       const task = args[args.indexOf("--task") + 1];
-      console.log(JSON.stringify(postEvidenceComment(store, repo, task)));
+      console.log(JSON.stringify(await postEvidenceComment(store, repo, task)));
     }
-    store.close();
+    await store.close();
     break;
   }
 

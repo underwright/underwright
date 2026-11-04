@@ -1,15 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { Store } from "../src/store.js";
+import { SqliteStore } from "../src/store.js";
 import { rmSync } from "node:fs";
 
+// Contract suite: the same expectations run against any backend.
+// Point DATABASE_URL at Postgres/Lakebase to exercise PgStore identically.
+
 const DB = "/tmp/uw-test-store.db";
-let store: Store;
+let store: SqliteStore;
 
 beforeEach(() => {
   rmSync(DB, { force: true });
   rmSync(`${DB}-wal`, { force: true });
   rmSync(`${DB}-shm`, { force: true });
-  store = new Store(DB);
+  store = new SqliteStore(DB);
 });
 afterEach(() => store.close());
 
@@ -73,5 +76,19 @@ describe("jobs", () => {
     expect(started.id).toBe(j.id);
     store.finishJob(j.id, "done", "hi");
     expect(store.getJob(j.id).status).toBe("done");
+  });
+});
+
+describe.skipIf(!process.env.DATABASE_URL)("pg backend", () => {
+  it("PgStore implements the same contract", async () => {
+    const { PgStore } = await import("../src/pstore.js");
+    const pg = await PgStore.connect(process.env.DATABASE_URL!);
+    const t = await pg.createTask({ title: "pg-contract", ac_ids: ["a1"] });
+    expect(t.id).toMatch(/^task-/);
+    expect(await pg.claimTask(t.id, "a")).not.toHaveProperty("error");
+    expect((await pg.claimTask(t.id, "b")) as any).toHaveProperty("error");
+    await pg.reportEvidence({ task_id: t.id, agent_id: "a", kind: "test_run", exit_code: 0, ac_ids: ["a1"] });
+    expect(await pg.completeTask(t.id, "a")).toHaveProperty("completed", t.id);
+    await pg.close();
   });
 });

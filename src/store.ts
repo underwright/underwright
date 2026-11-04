@@ -1,10 +1,13 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
+import type { IStore } from "./istore.js";
 
-export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
+export type { TaskStatus } from "./istore.js";
+import type { TaskStatus } from "./istore.js";
+import { PgStore } from "./pstore.js";
 
-export class Store {
+export class SqliteStore implements IStore {
   private db: Database.Database;
 
   constructor(path = "underwright.db") {
@@ -263,4 +266,12 @@ export class Store {
   close() {
     this.db.close();
   }
+}
+
+/** Open the configured backend. DATABASE_URL → Postgres/Lakebase;
+ *  otherwise a local SQLite file. Backend selection is pure config. */
+export async function openStore(dbPath: string): Promise<IStore> {
+  const url = process.env.DATABASE_URL;
+  if (url) return PgStore.connect(url);
+  return new SqliteStore(dbPath);
 }
