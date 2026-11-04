@@ -12,7 +12,7 @@ switch (cmd) {
     const httpIdx = args.indexOf("--http");
     if (httpIdx !== -1) {
       const [host, port] = (args[httpIdx + 1] ?? "127.0.0.1:8741").split(":");
-      await serveHttp(dbPath, host, Number(port));
+      await serveHttp(dbPath, host, Number(port), process.env.UNDERWRIGHT_TOKEN);
     } else {
       await serve(dbPath);
     }

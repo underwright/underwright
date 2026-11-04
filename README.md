@@ -51,9 +51,21 @@ Point any MCP-capable agent at the server:
 Or run the CLI directly:
 
 ```bash
-underwright serve   # MCP server over stdio
-underwright run     # execute queued jobs locally
-underwright board   # print the task board
+underwright serve              # MCP server over stdio (local agent)
+underwright serve --http H:P   # shared MCP over HTTP (/mcp) — multi-machine
+underwright run                # execute queued jobs locally
+underwright board              # print the task board
+underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
+```
+
+For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
+`Authorization: Bearer <token>` (`/health` stays open).
+
+Docker (ghcr.io/underwright/underwright, published on tags):
+
+```bash
+docker run -v $(pwd)/.uw:/data -p 8741:8741 \
+  -e UNDERWRIGHT_TOKEN=$TOKEN ghcr.io/underwright/underwright
 ```
 
 ## Tool surface

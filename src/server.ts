@@ -118,9 +118,17 @@ export async function serve(dbPath: string) {
   await server.connect(new StdioServerTransport());
 }
 
-/** Shared control plane over HTTP — agents on any machine connect to /mcp. */
-export async function serveHttp(dbPath: string, host: string, port: number) {
+/** Shared control plane over HTTP — agents on any machine connect to /mcp.
+ *  Bearer auth required when UNDERWRIGHT_TOKEN is set; /health stays open. */
+export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
   const http = createHttpServer(async (req, res) => {
+    if (token && req.url === "/mcp") {
+      const auth = req.headers.authorization;
+      if (auth !== `Bearer ${token}`) {
+        res.writeHead(401, { "www-authenticate": "Bearer" }).end('{"error":"unauthorized"}');
+        return;
+      }
+    }
     if (req.url === "/mcp") {
       // Stateless mode: fresh transport + server per request — all shared
       // state lives in the store, so any agent can call any tool anytime.
@@ -138,5 +146,5 @@ export async function serveHttp(dbPath: string, host: string, port: number) {
     res.writeHead(404).end();
   });
   await new Promise<void>((resolve) => http.listen(port, host, resolve));
-  console.error(`[underwright] MCP over HTTP at http://${host}:${port}/mcp (stateless)`);
+  console.error(`[underwright] MCP over HTTP at http://${host}:${port}/mcp (stateless${token ? ", bearer-auth" : ", NO AUTH — set UNDERWRIGHT_TOKEN for shared use"})`);
 }
