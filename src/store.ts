@@ -12,6 +12,32 @@ export class Store {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Schema versioning via PRAGMA user_version. */
+  private migrate() {
+    const v = (this.db.pragma("user_version", { simple: true }) as number) ?? 0;
+    if (v < 1) {
+      // v1: widen evidence.kind CHECK to the full taxonomy.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS evidence_v1 (
+          id          TEXT PRIMARY KEY,
+          task_id     TEXT NOT NULL REFERENCES tasks(id),
+          agent_id    TEXT NOT NULL,
+          kind        TEXT NOT NULL CHECK (kind IN ('test_run','ci_check','review','coverage','deploy','contract_test','security_scan','smoke_test','mutation')),
+          command     TEXT NOT NULL DEFAULT '',
+          exit_code   INTEGER,
+          output      TEXT NOT NULL DEFAULT '',
+          ac_ids      TEXT NOT NULL DEFAULT '[]',
+          created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT OR IGNORE INTO evidence_v1 SELECT * FROM evidence;
+        DROP TABLE evidence;
+        ALTER TABLE evidence_v1 RENAME TO evidence;
+        PRAGMA user_version = 1;
+      `);
+    }
   }
 
   private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {

@@ -1,0 +1,11 @@
+{
+  "dod": {
+    "feature":      { "evidence": ["test_run", "coverage", "review"], "tdd": true },
+    "bug":          { "evidence": ["test_run", "review"], "tdd": true },
+    "deploy":       { "evidence": ["deploy", "smoke_test"] },
+    "architecture": { "artifacts": ["design"], "evidence": ["review"] },
+    "docs":         { "evidence": ["review"] },
+    "default":      { "evidence": ["test_run"] }
+  },
+  "enforcement": "warn"
+}

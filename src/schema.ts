@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   id          TEXT PRIMARY KEY,
   task_id     TEXT NOT NULL REFERENCES tasks(id),
   agent_id    TEXT NOT NULL,
-  kind        TEXT NOT NULL CHECK (kind IN ('test_run','ci_check','review','coverage','deploy')),
+  kind        TEXT NOT NULL CHECK (kind IN ('test_run','ci_check','review','coverage','deploy','contract_test','security_scan','smoke_test','mutation')),
   command     TEXT NOT NULL DEFAULT '',
   exit_code   INTEGER,
   output      TEXT NOT NULL DEFAULT '',

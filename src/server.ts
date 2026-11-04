@@ -84,7 +84,7 @@ Rules of engagement:
   server.tool("report_evidence", "Attach proof of work to a task: a test run, CI check, review, or coverage result, citing which acceptance criteria it proves.", {
     task_id: z.string(),
     agent_id: z.string(),
-    kind: z.enum(["test_run", "ci_check", "review", "coverage", "deploy"]),
+    kind: z.enum(["test_run", "ci_check", "review", "coverage", "deploy", "contract_test", "security_scan", "smoke_test", "mutation"]),
     command: z.string().optional(),
     exit_code: z.number().int().optional(),
     output: z.string().optional(),
