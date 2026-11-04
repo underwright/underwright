@@ -73,6 +73,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   finished_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS locks (
+  resource      TEXT PRIMARY KEY,       -- file glob, folder, or entity ref (e.g. "src/db/**", "gh-3")
+  agent_id      TEXT NOT NULL,
+  task_id       TEXT,
+  lease_expires TEXT NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Append-only audit log: every mutation lands here.
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -61,6 +61,16 @@ export class SqliteStore implements IStore {
       if (!cols.has("estimate")) this.db.exec("ALTER TABLE tasks ADD COLUMN estimate TEXT NOT NULL DEFAULT '';");
       this.db.exec("PRAGMA user_version = 3;");
     }
+    if (v < 4) {
+      // v4: resource locks (file/folder/entity claims) for dedupe below task level.
+      const has = this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='locks'").get();
+      if (!has) {
+        this.db.exec(`CREATE TABLE locks (
+          resource TEXT PRIMARY KEY, agent_id TEXT NOT NULL, task_id TEXT,
+          lease_expires TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))`);
+      }
+      this.db.exec("PRAGMA user_version = 4;");
+    }
   }
 
   private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -165,7 +175,46 @@ export class SqliteStore implements IStore {
       .run(taskId, agentId, expires, JSON.stringify(scope));
     this.db.prepare("UPDATE tasks SET status='claimed', updated_at=datetime('now') WHERE id=?").run(taskId);
     this.log("task", taskId, "claimed", agentId, { ttlSeconds, scope });
+
+    // Auto-lock the task's declared ownership paths — dedupe below task level.
+    const paths = (task.ownership as any)?.paths ?? [];
+    if (paths.length) {
+      const lr = this.claimResources(paths, agentId, taskId, ttlSeconds);
+      if ((lr as any).error) return { task_id: taskId, agent_id: agentId, lease_expires: expires, warning: `claimed task but resource locks conflict: ${JSON.stringify((lr as any).conflicts)}` };
+    }
     return { task_id: taskId, agent_id: agentId, lease_expires: expires };
+  }
+
+  claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds = 1800) {
+    const now = new Date().toISOString();
+    const conflicts = (this.checkLocks(resources) as any[]).filter(
+      (l: any) => l.agent_id !== agentId && l.lease_expires > now
+    );
+    if (conflicts.length) return { error: "locked", conflicts };
+    const expires = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+    const stmt = this.db.prepare(
+      `INSERT INTO locks (resource, agent_id, task_id, lease_expires) VALUES (?,?,?,?)
+       ON CONFLICT(resource) DO UPDATE SET agent_id=excluded.agent_id, task_id=excluded.task_id, lease_expires=excluded.lease_expires`
+    );
+    for (const r of resources) stmt.run(r, agentId, taskId ?? null, expires);
+    this.log("locks", resources.join(","), "claimed", agentId, { task_id: taskId, ttlSeconds });
+    return { claimed: resources, lease_expires: expires };
+  }
+
+  releaseResources(resources: string[], agentId: string) {
+    const stmt = this.db.prepare("DELETE FROM locks WHERE resource=? AND agent_id=?");
+    for (const r of resources) stmt.run(r, agentId);
+    this.log("locks", resources.join(","), "released", agentId);
+    return { released: resources };
+  }
+
+  checkLocks(resources: string[]) {
+    if (!resources.length) return [];
+    const now = new Date().toISOString();
+    const marks = resources.map(() => "?").join(",");
+    return this.db
+      .prepare(`SELECT * FROM locks WHERE resource IN (${marks}) AND lease_expires > ?`)
+      .all(...resources, now);
   }
 
   releaseTask(taskId: string, agentId: string) {

@@ -141,3 +141,26 @@ describe("definition of ready", () => {
     delete process.env.UNDERWRIGHT_POLICY;
   });
 });
+
+describe("resource locks", () => {
+  it("blocks second agent on same resource, allows others", () => {
+    expect(store.claimResources(["src/db/**"], "agent-A")).not.toHaveProperty("error");
+    const r = store.claimResources(["src/db/**"], "agent-B") as any;
+    expect(r.error).toBe("locked");
+    expect(r.conflicts[0].agent_id).toBe("agent-A");
+    expect(store.claimResources(["src/api/**"], "agent-B")).not.toHaveProperty("error");
+  });
+  it("batch check returns only active locks; release frees them", () => {
+    store.claimResources(["a.ts", "b.ts"], "agent-A");
+    expect((store.checkLocks(["a.ts", "b.ts", "c.ts"]) as any[]).length).toBe(2);
+    store.releaseResources(["a.ts"], "agent-A");
+    expect((store.checkLocks(["a.ts"]) as any[]).length).toBe(0);
+  });
+  it("claim_task auto-locks ownership paths and warns on conflict", () => {
+    const t = store.createTask({ title: "x", ownership: { paths: ["src/x/**"] } });
+    store.claimResources(["src/x/**"], "agent-B");
+    const r = store.claimTask(t.id, "agent-A") as any;
+    expect(r.task_id).toBe(t.id);
+    expect(r.warning).toContain("agent-B");
+  });
+});

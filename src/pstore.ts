@@ -70,6 +70,13 @@ CREATE TABLE IF NOT EXISTS jobs (
   started_at  TIMESTAMPTZ,
   finished_at TIMESTAMPTZ
 );
+CREATE TABLE IF NOT EXISTS locks (
+  resource      TEXT PRIMARY KEY,
+  agent_id      TEXT NOT NULL,
+  task_id       TEXT,
+  lease_expires TIMESTAMPTZ NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS events (
   id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   entity_type TEXT NOT NULL,
@@ -184,7 +191,39 @@ export class PgStore implements IStore {
       ON CONFLICT(task_id) DO UPDATE SET agent_id=EXCLUDED.agent_id, lease_expires=EXCLUDED.lease_expires, scope=EXCLUDED.scope`;
     await this.sql`UPDATE tasks SET status='claimed', updated_at=now() WHERE id=${taskId}`;
     await this.log("task", taskId, "claimed", agentId, { ttlSeconds, scope });
+
+    // Auto-lock the task's declared ownership paths — dedupe below task level.
+    const paths = (task.ownership as any)?.paths ?? [];
+    if (paths.length) {
+      const lr = await this.claimResources(paths, agentId, taskId, ttlSeconds);
+      if ((lr as any).error) return { task_id: taskId, agent_id: agentId, lease_expires: expires.toISOString(), warning: `claimed task but resource locks conflict: ${JSON.stringify((lr as any).conflicts)}` };
+    }
     return { task_id: taskId, agent_id: agentId, lease_expires: expires.toISOString() };
+  }
+
+  async claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds = 1800) {
+    const conflicts = (await this.checkLocks(resources)).filter((l: any) => l.agent_id !== agentId);
+    if (conflicts.length) return { error: "locked", conflicts };
+    const expires = new Date(Date.now() + ttlSeconds * 1000);
+    for (const r of resources) {
+      await this.sql`INSERT INTO locks (resource, agent_id, task_id, lease_expires) VALUES (${r},${agentId},${taskId ?? null},${expires})
+        ON CONFLICT(resource) DO UPDATE SET agent_id=EXCLUDED.agent_id, task_id=EXCLUDED.task_id, lease_expires=EXCLUDED.lease_expires`;
+    }
+    await this.log("locks", resources.join(","), "claimed", agentId, { task_id: taskId, ttlSeconds });
+    return { claimed: resources, lease_expires: expires.toISOString() };
+  }
+
+  async releaseResources(resources: string[], agentId: string) {
+    for (const r of resources) {
+      await this.sql`DELETE FROM locks WHERE resource=${r} AND agent_id=${agentId}`;
+    }
+    await this.log("locks", resources.join(","), "released", agentId);
+    return { released: resources };
+  }
+
+  async checkLocks(resources: string[]) {
+    if (!resources.length) return [];
+    return this.sql`SELECT * FROM locks WHERE resource = ANY(${resources}) AND lease_expires > now()`;
   }
 
   async releaseTask(taskId: string, agentId: string) {

@@ -79,6 +79,22 @@ Rules of engagement:
     task_id: z.string(), agent_id: z.string(), ttl_seconds: z.number().int().optional(),
   }, async (a) => text(await store.renewLease(a.task_id, a.agent_id, a.ttl_seconds)));
 
+  server.tool("claim_resources", "Lock files/folders/entities so no other agent duplicates your intermediate work. Call check_locks first for batch conflict check.", {
+    resources: z.array(z.string()).describe("file globs, folders, or entity refs e.g. 'src/db/**'"),
+    agent_id: z.string(),
+    task_id: z.string().optional(),
+    ttl_seconds: z.number().int().optional(),
+  }, async (a) => text(await store.claimResources(a.resources, a.agent_id, a.task_id, a.ttl_seconds)));
+
+  server.tool("release_resources", "Release your resource locks.", {
+    resources: z.array(z.string()),
+    agent_id: z.string(),
+  }, async (a) => text(await store.releaseResources(a.resources, a.agent_id)));
+
+  server.tool("check_locks", "Check whether resources are locked by other agents. Returns only active conflicts — call before touching shared files.", {
+    resources: z.array(z.string()),
+  }, async (a) => text(await store.checkLocks(a.resources)));
+
   server.tool("post_artifact", "Post a durable artifact (spec, design, handoff, note, review) — the only inter-agent communication channel.", {
     task_id: z.string().optional(),
     agent_id: z.string(),
