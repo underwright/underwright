@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
 import type { IStore, CreateTaskArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
@@ -104,20 +104,27 @@ export class SqliteStore implements IStore {
   }
 
   createTask(args: CreateTaskArgs) {
-    const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const { args: seeded, error } = expandTemplate(args, loadPolicy());
+    if (error) return { error };
+    const a = seeded;
+    const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
         `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
          VALUES (?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        id, args.title, args.description ?? "", args.spec_ref ?? null,
-        JSON.stringify(args.ac_ids ?? []), args.priority ?? 2,
-        JSON.stringify(args.ownership ?? {}), args.created_by ?? "human",
-        args.type ?? "feature", args.severity ?? "normal", args.estimate ?? ""
+        id, a.title, a.description ?? "", a.spec_ref ?? null,
+        JSON.stringify(a.ac_ids ?? []), a.priority ?? 2,
+        JSON.stringify(a.ownership ?? {}), a.created_by ?? "human",
+        a.type ?? "feature", a.severity ?? "normal", a.estimate ?? ""
       );
-    this.log("task", id, "created", args.created_by ?? "human", args);
+    this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
+  }
+
+  listTemplates() {
+    return allTemplates(loadPolicy());
   }
 
   getTask(id: string) {

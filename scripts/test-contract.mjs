@@ -96,6 +96,13 @@ async function matrix(token) {
     const unknown = await first.callTool({ name: 'does_not_exist', arguments: {} });
     assert.equal(unknown.isError, true);
     assert.deepEqual((await call('board')).tasks, []);
+    const templates = await call('list_templates');
+    assert(templates.some(t => t.id === 'feature'));
+    const templated = await call('create_task', { title: 'Templated HTTP task', template: 'feature',
+      created_by: agent });
+    assert.equal(templated.type, 'feature');
+    assert(templated.ac_ids.length > 0);
+    assert.match(templated.description, /Definition of Ready/);
     const task = await call('create_task', { title: 'HTTP matrix', ac_ids: ['http-ac'],
       type: 'triage', estimate: 'S', created_by: agent });
     assert.match(task.id, /^task-/);

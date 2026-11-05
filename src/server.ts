@@ -42,8 +42,13 @@ Rules of engagement:
       .describe("task type — drives Definition-of-Done requirements at completion"),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional().describe("effort in agent-sessions"),
+    template: z.string().optional()
+      .describe("task template id — expands AC scaffold, type, and a DoR checklist (builtin: feature/bug/architecture/tdd, or policy-defined)"),
     created_by: z.string().optional(),
   }, async (a) => text(await store.createTask(a)));
+
+  server.tool("list_templates", "List task templates (builtin + policy-defined) that seed a task's AC scaffold, type, and DoR checklist.", {},
+    async () => text(await store.listTemplates()));
 
   server.tool("update_task", "Update task fields — the triage action. Set type, severity, estimate, ac_ids before a task is claimable.", {
     task_id: z.string(),

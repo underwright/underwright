@@ -55,6 +55,8 @@ underwright serve              # MCP server over stdio (local agent)
 underwright serve --http H:P   # shared MCP over HTTP (/mcp) — multi-machine
 underwright run                # execute queued jobs locally
 underwright board              # print the task board
+underwright create --template feature --title "Add search"   # create a task from a template
+underwright templates          # list builtin + policy-defined templates
 underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 ```
 
@@ -86,6 +88,7 @@ docker run -v $(pwd)/.uw:/data -p 8741:8741 \
 |---|---|
 | `board` | Task board: statuses, claim holders, job counts |
 | `create_task` / `list_tasks` / `get_task` | Task lifecycle |
+| `list_templates` | Builtin + policy-defined task templates (AC scaffold, DoR checklist) |
 | `claim_task` / `release_task` / `renew_lease` | Atomic claims with expiring leases |
 | `post_artifact` | Specs, designs, handoffs, reviews — durable, searchable |
 | `search_context` | FTS over helpers + artifacts — call before writing shared code |
@@ -94,6 +97,34 @@ docker run -v $(pwd)/.uw:/data -p 8741:8741 \
 | `complete_task` | Refuses unless every AC has cited evidence |
 | `submit_job` / `job_status` | Async job queue — wait on processes, not inference |
 | `audit_log` | Who did what, when |
+
+## Task templates
+
+Requirements-gathering should be structured, not a blank text box. A task
+created from a template carries the shape agents need: an acceptance-criteria
+scaffold, a task type, and a Definition-of-Ready checklist.
+
+Builtins ship for `feature`, `bug`, `architecture`, and `tdd`. `create_task`
+takes a `template` id; explicit `ac_ids` or `type` still win:
+
+```bash
+underwright create --template feature --title "Add search"      # or --ac a,b --type TYPE
+```
+
+Add or override templates from the policy file (`underwright.policy.json`) —
+they are resolved by id alongside the builtins:
+
+```json
+{
+  "templates": [
+    { "id": "spike", "type": "feature", "ac_ids": ["spike-goal"],
+      "description": "## Spike", "dor_checklist": ["Timebox set"] }
+  ]
+}
+```
+
+The template body lands in the task description with a `## Definition of Ready`
+checklist for the triager to complete before the task is claimable.
 
 ## Design principles
 

@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
 import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
 
 const DDL = `
@@ -130,15 +130,22 @@ export class PgStore implements IStore {
   }
 
   async createTask(a: CreateTaskArgs) {
-    const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const { args: seeded, error } = expandTemplate(a, loadPolicy());
+    if (error) return { error };
+    const t = seeded;
+    const id = t.id ?? `task-${randomUUID().slice(0, 8)}`;
     await this.sql`
       INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
-      VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
-              ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
-              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"},
-              ${a.severity ?? "normal"},${a.estimate ?? ""})`;
-    await this.log("task", id, "created", a.created_by ?? "human", a);
+      VALUES (${id},${t.title},${t.description ?? ""},${t.spec_ref ?? null},
+              ${this.sql.json(t.ac_ids ?? [])},${t.priority ?? 2},
+              ${this.sql.json(t.ownership ?? {})},${t.created_by ?? "human"},${t.type ?? "feature"},
+              ${t.severity ?? "normal"},${t.estimate ?? ""})`;
+    await this.log("task", id, "created", t.created_by ?? "human", t);
     return this.getTask(id);
+  }
+
+  async listTemplates() {
+    return allTemplates(loadPolicy());
   }
 
   async getTask(id: string) {

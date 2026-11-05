@@ -12,6 +12,12 @@ import {
 const [cmd, ...args] = process.argv.slice(2);
 const dbPath = process.env.UNDERWRIGHT_DB ?? "underwright.db";
 
+/** Value of `--name value`, or undefined when the flag is absent. */
+const flag = (name: string) => {
+  const i = args.indexOf(`--${name}`);
+  return i === -1 ? undefined : args[i + 1];
+};
+
 switch (cmd) {
   case "serve": {
     const httpIdx = args.indexOf("--http");
@@ -27,6 +33,35 @@ switch (cmd) {
   case "board": {
     const store = await openStore(dbPath);
     console.log(JSON.stringify(await store.board(), null, 2));
+    await store.close();
+    break;
+  }
+
+  case "create": {
+    // underwright create --template feature --title ... [--type T] [--ac a,b] [--spec REF]
+    const title = flag("title");
+    if (!title) {
+      console.error("usage: underwright create --title TITLE [--template ID] [--type TYPE] [--ac id,id] [--spec REF] [--description TEXT]");
+      process.exit(1);
+    }
+    const ac = flag("ac");
+    const store = await openStore(dbPath);
+    console.log(JSON.stringify(await store.createTask({
+      title,
+      template: flag("template"),
+      type: flag("type"),
+      spec_ref: flag("spec"),
+      description: flag("description"),
+      ac_ids: ac ? ac.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+      created_by: flag("by") ?? "cli",
+    }), null, 2));
+    await store.close();
+    break;
+  }
+
+  case "templates": {
+    const store = await openStore(dbPath);
+    console.log(JSON.stringify(await store.listTemplates(), null, 2));
     await store.close();
     break;
   }
@@ -110,6 +145,8 @@ Usage:
   underwright serve --http H:P   MCP server over HTTP at host:port (/mcp) — shared across machines.
   underwright run                Execute queued jobs locally (test/build/deploy/review).
   underwright board              Print the task board.
+  underwright create             Create a task, optionally from a template (--template feature).
+  underwright templates          List task templates (builtin + policy-defined).
 
 Env:
   UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)`);

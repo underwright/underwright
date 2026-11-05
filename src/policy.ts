@@ -13,6 +13,7 @@ export interface DodRule {
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
+  templates?: TaskTemplate[];
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -94,4 +95,93 @@ export function evaluateDoD(args: {
   const ok = missing.length === 0;
   if (!ok && policy.enforcement === "observe") warnings.push(...missing);
   return { ok: ok || policy.enforcement !== "block", blocked: !ok && policy.enforcement === "block", missing, warnings };
+}
+
+// Task templates: PRD/spec/scaffold prompts that seed a task's structure —
+// AC scaffold, type, and the DoR checklist the triager must fill. Builtins
+// cover the common shapes; a policy `templates` array adds or overrides by id.
+
+export interface TaskTemplate {
+  id: string;
+  type?: string;
+  description?: string;       // PRD/spec scaffold (markdown)
+  ac_ids?: string[];          // acceptance-criteria scaffold ids
+  dor_checklist?: string[];   // DoR items the triager completes before claiming
+  prompt?: string;            // scaffold prompt for the agent picking the task up
+}
+
+export const BUILTIN_TEMPLATES: TaskTemplate[] = [
+  {
+    id: "feature",
+    type: "feature",
+    description: "## Problem\n\n\n## Proposed change\n\n\n## Out of scope\n",
+    ac_ids: ["scope", "tests", "review"],
+    dor_checklist: ["Problem statement is specific and bounded", "Acceptance criteria are testable", "Out-of-scope is explicit"],
+  },
+  {
+    id: "bug",
+    type: "bug",
+    description: "## Steps to reproduce\n\n\n## Expected\n\n\n## Actual\n",
+    ac_ids: ["repro", "fix", "regression"],
+    dor_checklist: ["Reproduction is minimal and deterministic", "Expected vs actual stated", "Regression test identified"],
+  },
+  {
+    id: "architecture",
+    type: "architecture",
+    description: "## Context\n\n\n## Decision\n\n\n## Consequences\n",
+    ac_ids: ["context", "decision", "review"],
+    dor_checklist: ["Forces and constraints listed", "Options considered with trade-offs", "Decision and consequences recorded"],
+  },
+  {
+    id: "tdd",
+    type: "tdd",
+    description: "## Behaviour to implement\n",
+    ac_ids: ["red", "green", "refactor"],
+    dor_checklist: ["A failing test can be written first", "Success is observable", "Refactor target identified"],
+  },
+];
+
+/** Builtin templates overlaid by policy-defined ones (policy wins on id). */
+export function listTemplates(policy: Policy): TaskTemplate[] {
+  const byId = new Map<string, TaskTemplate>();
+  for (const t of BUILTIN_TEMPLATES) byId.set(t.id, t);
+  for (const t of policy.templates ?? []) if (t?.id) byId.set(t.id, t);
+  return [...byId.values()];
+}
+
+export function getTemplate(id: string, policy: Policy): TaskTemplate | undefined {
+  return listTemplates(policy).find((t) => t.id === id);
+}
+
+export interface TemplateSeedArgs {
+  template?: string;
+  description?: string;
+  ac_ids?: string[];
+  type?: string;
+}
+
+/** Expand a named template into the task fields it seeds. Caller-supplied
+ *  values win: an explicit ac_ids list or type is never overwritten. */
+export function expandTemplate<T extends TemplateSeedArgs>(args: T, policy: Policy): { args: T; error?: string } {
+  if (!args.template) return { args };
+  const t = getTemplate(args.template, policy);
+  if (!t) return { args, error: `unknown template: ${args.template}` };
+
+  const parts: string[] = [];
+  if (args.description) parts.push(args.description);
+  if (t.description) parts.push(t.description.trimEnd());
+  if (t.dor_checklist?.length) {
+    parts.push(["## Definition of Ready", ...t.dor_checklist.map((c) => `- [ ] ${c}`)].join("\n"));
+  }
+  if (t.prompt) parts.push(`> ${t.prompt}`);
+
+  return {
+    args: {
+      ...args,
+      type: args.type ?? t.type,
+      ac_ids: args.ac_ids?.length ? args.ac_ids : [...(t.ac_ids ?? [])],
+      description: parts.join("\n\n"),
+    },
+    error: undefined,
+  };
 }
