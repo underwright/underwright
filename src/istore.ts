@@ -14,10 +14,12 @@ export interface CreateTaskArgs {
   type?: TaskType;
   severity?: "low" | "normal" | "high" | "critical";
   estimate?: "S" | "M" | "L" | "";
+  template?: string;   // task template id — expands AC scaffold, type, DoR checklist
 }
 
 export interface IStore {
   createTask(a: CreateTaskArgs): Awaitable<any>;
+  listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;
   setTaskStatus(id: string, status: TaskStatus, actor: string): Awaitable<any>;
   linkTask(id: string, spec_ref: string): Awaitable<any>;

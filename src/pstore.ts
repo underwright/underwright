@@ -1,7 +1,7 @@
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
 import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
 
 const DDL = `
@@ -183,8 +183,10 @@ export class PgStore implements IStore {
     }
   }
 
-  async createTask(a: CreateTaskArgs) {
-    return this.dependencyTransaction(store => store.createTaskAtomic(a));
+  async createTask(args: CreateTaskArgs) {
+    const { args: seeded, error } = expandTemplate(args, loadPolicy());
+    if (error) return { error };
+    return this.dependencyTransaction(store => store.createTaskAtomic(seeded));
   }
 
   private async createTaskAtomic(a: CreateTaskArgs) {
@@ -200,6 +202,10 @@ export class PgStore implements IStore {
     await this.replaceDependencies(id, a.blocked_by ?? []);
     await this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
+  }
+
+  async listTemplates() {
+    return allTemplates(loadPolicy());
   }
 
   async getTask(id: string) {

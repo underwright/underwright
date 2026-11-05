@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
 import type { IStore, CreateTaskArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
@@ -146,12 +146,14 @@ export class SqliteStore implements IStore {
   }
 
   createTask(args: CreateTaskArgs) {
-    return this.db.transaction(() => this.createTaskAtomic(args)).immediate();
+    const { args: seeded, error } = expandTemplate(args, loadPolicy());
+    if (error) return { error };
+    return this.db.transaction(() => this.createTaskAtomic(seeded)).immediate();
   }
 
-  private createTaskAtomic(args: CreateTaskArgs) {
-    const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
-    const invalid = this.validateDependencies(id, args.blocked_by ?? []);
+  private createTaskAtomic(a: CreateTaskArgs) {
+    const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const invalid = this.validateDependencies(id, a.blocked_by ?? []);
     if (invalid) return { error: invalid };
     this.db
       .prepare(
@@ -159,14 +161,18 @@ export class SqliteStore implements IStore {
          VALUES (?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
-        id, args.title, args.description ?? "", args.spec_ref ?? null,
-        JSON.stringify(args.ac_ids ?? []), args.priority ?? 2,
-        JSON.stringify(args.ownership ?? {}), args.created_by ?? "human",
-        args.type ?? "feature", args.severity ?? "normal", args.estimate ?? ""
+        id, a.title, a.description ?? "", a.spec_ref ?? null,
+        JSON.stringify(a.ac_ids ?? []), a.priority ?? 2,
+        JSON.stringify(a.ownership ?? {}), a.created_by ?? "human",
+        a.type ?? "feature", a.severity ?? "normal", a.estimate ?? ""
       );
-    this.replaceDependencies(id, args.blocked_by ?? []);
-    this.log("task", id, "created", args.created_by ?? "human", args);
+    this.replaceDependencies(id, a.blocked_by ?? []);
+    this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
+  }
+
+  listTemplates() {
+    return allTemplates(loadPolicy());
   }
 
   getTask(id: string) {
