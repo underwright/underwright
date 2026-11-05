@@ -5,6 +5,7 @@ import { createServer as createHttpServer } from "node:http";
 import { z } from "zod";
 import { openStore } from "./store.js";
 import type { IStore } from "./istore.js";
+import { indexWorkspace } from "./codeindex.js";
 
 const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
@@ -117,8 +118,34 @@ Rules of engagement:
 
   server.tool("search_context", "Search shared knowledge: helpers, specs, handoffs, prior decisions. Call before writing new shared code.", {
     query: z.string(),
-    kinds: z.array(z.enum(["helper", "artifact", "evidence"])).optional(),
+    kinds: z.array(z.enum(["helper", "artifact", "evidence", "symbol"])).optional(),
   }, async ({ query, kinds }) => text(await store.searchContext(query, kinds)));
+
+  const codeStore = () => {
+    const c = store as any;
+    if (typeof c.searchSymbols !== "function") throw new Error("code index is only available on the SQLite store");
+    return c;
+  };
+
+  server.tool("index_code", "Build or refresh the tree-sitter code index for a directory. Incremental: only files whose content changed are reparsed.", {
+    root: z.string().optional().describe("directory to index (default: server working directory)"),
+    agent_id: z.string().optional(),
+  }, async ({ root, agent_id }) => text(await indexWorkspace(codeStore(), root ?? process.cwd(), agent_id ?? "indexer")));
+
+  server.tool("search_symbols", "Find symbol definitions (functions, classes, methods, types…) by name in the code index.", {
+    query: z.string(),
+    kind: z.enum(["function", "class", "method", "interface", "type", "enum", "variable"]).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+  }, async ({ query, kind, limit }) => text(codeStore().searchSymbols(query, kind, limit)));
+
+  server.tool("find_references", "List where a symbol name is referenced (calls, new, type uses, imports) in the code index.", {
+    name: z.string(),
+  }, async ({ name }) => text(codeStore().findReferences(name)));
+
+  server.tool("blast_radius", "Transitive callers/users of a symbol: what could break if it changes. Name-based over-approximation.", {
+    name: z.string(),
+    depth: z.number().int().min(1).max(10).optional(),
+  }, async ({ name, depth }) => text(codeStore().blastRadius(name, depth)));
 
   server.tool("register_helper", "Publish a reusable helper (utility, pattern, config, fixture) so other agents reuse it instead of duplicating.", {
     agent_id: z.string(),

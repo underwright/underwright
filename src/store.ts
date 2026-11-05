@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
 import type { IStore, CreateTaskArgs } from "./istore.js";
+import type { SymbolRec, RefRec } from "./codeindex.js";
 
 export type { TaskStatus } from "./istore.js";
 import type { TaskStatus } from "./istore.js";
@@ -354,15 +355,110 @@ export class SqliteStore implements IStore {
     return { id };
   }
 
-  /** Pre-flight: what already exists? Search helpers + artifacts. */
+  /** Pre-flight: what already exists? Search helpers + artifacts + indexed code symbols. */
   searchContext(query: string, kinds?: string[]) {
-    const rows = this.db
+    const wantsSymbols = !kinds?.length || kinds.includes("symbol");
+    const ftsKinds = kinds?.filter((k) => k !== "symbol");
+    let rows: any[] = [];
+    if (!kinds?.length || ftsKinds!.length) {
+      rows = this.db
+        .prepare(
+          `SELECT entity_type, entity_id, title, snippet(search_idx, 3, '>>>', '<<<', '…', 20) AS snippet
+           FROM search_idx WHERE search_idx MATCH ? ORDER BY rank LIMIT 20`
+        )
+        .all(query) as any[];
+      if (ftsKinds?.length) rows = rows.filter((r) => ftsKinds.includes(r.entity_type));
+    }
+    if (wantsSymbols) {
+      for (const s of this.searchSymbols(query, undefined, 10)) {
+        rows.push({
+          entity_type: "symbol", entity_id: `${s.path}:${s.line}`, title: s.name,
+          snippet: `${s.kind}${s.exported ? " (exported)" : ""} ${s.path}:${s.line}-${s.end_line}`,
+        });
+      }
+    }
+    return rows;
+  }
+
+  // ---- code index (tree-sitter; see codeindex.ts) ----
+
+  codeFileHashes(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const r of this.db.prepare("SELECT path, hash FROM code_files").all() as any[]) out[r.path] = r.hash;
+    return out;
+  }
+
+  /** Replace everything known about one file atomically (incremental update unit). */
+  upsertCodeFile(path: string, hash: string, symbols: SymbolRec[], refs: RefRec[], actor: string) {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM code_files WHERE path=?").run(path); // cascades symbols/refs
+      this.db.prepare("INSERT INTO code_files (path, hash) VALUES (?,?)").run(path, hash);
+      const si = this.db.prepare("INSERT INTO code_symbols (path,name,kind,line,end_line,exported) VALUES (?,?,?,?,?,?)");
+      for (const s of symbols) si.run(path, s.name, s.kind, s.line, s.end_line, s.exported ? 1 : 0);
+      const ri = this.db.prepare("INSERT INTO code_refs (path,name,line,container) VALUES (?,?,?,?)");
+      for (const r of refs) ri.run(path, r.name, r.line, r.container);
+      this.log("code_file", path, "indexed", actor, { symbols: symbols.length, refs: refs.length });
+    })();
+  }
+
+  removeCodeFile(path: string, actor: string) {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM code_files WHERE path=?").run(path);
+      this.log("code_file", path, "removed", actor);
+    })();
+  }
+
+  /** Symbol definitions by name: exact matches first, then prefix, then substring. */
+  searchSymbols(query: string, kind?: string, limit = 20) {
+    const q = query.trim();
+    if (!q) return [];
+    const esc = q.replace(/[\\%_]/g, "\\$&");
+    return this.db
       .prepare(
-        `SELECT entity_type, entity_id, title, snippet(search_idx, 3, '>>>', '<<<', '…', 20) AS snippet
-         FROM search_idx WHERE search_idx MATCH ? ORDER BY rank LIMIT 20`
+        `SELECT name, kind, path, line, end_line, exported FROM code_symbols
+         WHERE name LIKE ? ESCAPE '\\' ${kind ? "AND kind = ?" : ""}
+         ORDER BY (name = ?) DESC, (name LIKE ? ESCAPE '\\') DESC, exported DESC, length(name), path, line
+         LIMIT ?`
       )
-      .all(query) as any[];
-    return kinds?.length ? rows.filter((r) => kinds.includes(r.entity_type)) : rows;
+      .all(...[`%${esc}%`, ...(kind ? [kind] : []), q, `${esc}%`, limit])
+      .map((r: any) => ({ ...r, exported: !!r.exported }));
+  }
+
+  /** Every place an identifier is referenced (calls, `new`, type uses, imports). */
+  findReferences(name: string) {
+    return this.db
+      .prepare("SELECT path, line, container FROM code_refs WHERE name=? ORDER BY path, line")
+      .all(name) as any[];
+  }
+
+  /**
+   * Blast radius: transitive callers/users of `name`, breadth-first to `depth`.
+   * Name-based, so same-named symbols are conflated — an over-approximation by design.
+   */
+  blastRadius(name: string, depth = 3) {
+    const defs = this.db.prepare("SELECT path, line, kind FROM code_symbols WHERE name=?").all(name) as any[];
+    const levels: { depth: number; symbol: string; path: string }[] = [];
+    const visited = new Set<string>([name]);
+    const files = new Set<string>(defs.map((d) => d.path));
+    let frontier = [name];
+    for (let d = 1; d <= depth && frontier.length; d++) {
+      const next: string[] = [];
+      for (const n of frontier) {
+        const rows = this.db
+          .prepare("SELECT DISTINCT path, container FROM code_refs WHERE name=?")
+          .all(n) as any[];
+        for (const r of rows) {
+          files.add(r.path);
+          const key = r.container || `<top-level>@${r.path}`;
+          if (visited.has(key)) continue;
+          visited.add(key);
+          levels.push({ depth: d, symbol: r.container || "<top-level>", path: r.path });
+          if (r.container) next.push(r.container);
+        }
+      }
+      frontier = next;
+    }
+    return { symbol: name, definitions: defs, impacted: levels, files: [...files].sort() };
   }
 
   submitJob(args: { task_id?: string; agent_id: string; type: string; command: string }) {

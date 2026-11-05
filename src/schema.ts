@@ -97,6 +97,33 @@ CREATE TABLE IF NOT EXISTS watches (
   PRIMARY KEY (agent_id, task_id)
 );
 
+-- Code index (tree-sitter): symbol definitions + name references, per file.
+CREATE TABLE IF NOT EXISTS code_files (
+  path        TEXT PRIMARY KEY,
+  hash        TEXT NOT NULL,             -- sha256 of content; unchanged hash = skip reparse
+  indexed_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS code_symbols (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  path      TEXT NOT NULL REFERENCES code_files(path) ON DELETE CASCADE,
+  name      TEXT NOT NULL,
+  kind      TEXT NOT NULL,               -- function|class|method|interface|type|enum|variable
+  line      INTEGER NOT NULL,
+  end_line  INTEGER NOT NULL,
+  exported  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS code_symbols_name ON code_symbols(name);
+CREATE INDEX IF NOT EXISTS code_symbols_path ON code_symbols(path);
+CREATE TABLE IF NOT EXISTS code_refs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  path       TEXT NOT NULL REFERENCES code_files(path) ON DELETE CASCADE,
+  name       TEXT NOT NULL,              -- referenced identifier
+  line       INTEGER NOT NULL,
+  container  TEXT NOT NULL DEFAULT ''    -- enclosing symbol name ('' = top level)
+);
+CREATE INDEX IF NOT EXISTS code_refs_name ON code_refs(name);
+CREATE INDEX IF NOT EXISTS code_refs_path ON code_refs(path);
+
 -- Append-only audit log: every mutation lands here.
 CREATE TABLE IF NOT EXISTS events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
