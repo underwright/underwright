@@ -6,6 +6,7 @@ import { z } from "zod";
 import { openStore } from "./store.js";
 import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
+import { startLeaseSweeper } from "./sweeper.js";
 
 const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
@@ -188,13 +189,30 @@ Rules of engagement:
 }
 
 export async function serve(dbPath: string) {
-  const { server } = createServer(await openStore(dbPath));
-  await server.connect(new StdioServerTransport());
+  const { server, store } = createServer(await openStore(dbPath));
+  const stopSweeper = startLeaseSweeper(store);
+  const onEnd = () => { void server.close(); };
+  server.server.onclose = () => {
+    process.stdin.off("end", onEnd);
+    void stopSweeper().then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
+  };
+  process.stdin.once("end", onEnd);
+  try {
+    await server.connect(new StdioServerTransport());
+  } catch (error) {
+    process.stdin.off("end", onEnd);
+    await stopSweeper();
+    await store.close();
+    throw error;
+  }
+  return server;
 }
 
 /** Shared control plane over HTTP — agents on any machine connect to /mcp.
  *  Bearer auth required when UNDERWRIGHT_TOKEN is set; /health stays open. */
 export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
+  const store = await openStore(dbPath);
+  const stopSweeper = startLeaseSweeper(store);
   const http = createHttpServer(async (req, res) => {
     if (token && req.url === "/mcp") {
       const auth = req.headers.authorization;
@@ -206,7 +224,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     if (req.url === "/mcp") {
       // Stateless mode: fresh transport + server per request — all shared
       // state lives in the store, so any agent can call any tool anytime.
-      const { server } = createServer(await openStore(dbPath));
+      const { server } = createServer(store);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); server.close(); });
       await server.connect(transport);
@@ -219,6 +237,22 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     }
     res.writeHead(404).end();
   });
-  await new Promise<void>((resolve) => http.listen(port, host, resolve));
+  http.once("close", () => {
+    void stopSweeper().then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      http.once("error", reject);
+      http.listen(port, host, () => {
+        http.off("error", reject);
+        resolve();
+      });
+    });
+  } catch (error) {
+    await stopSweeper();
+    await store.close();
+    throw error;
+  }
   console.error(`[underwright] MCP over HTTP at http://${host}:${port}/mcp (stateless${token ? ", bearer-auth" : ", NO AUTH — set UNDERWRIGHT_TOKEN for shared use"})`);
+  return http;
 }

@@ -260,6 +260,28 @@ export class PgStore implements IStore {
     return { task_id: taskId, lease_expires: expires.toISOString() };
   }
 
+  async sweepExpiredClaims() {
+    return this.sql.begin(async sql => {
+      // DELETE locks the expired rows: a concurrent renewal/reclaim is checked
+      // before deletion, and another sweeper cannot publish the same expiry.
+      const expired = await sql`DELETE FROM claims WHERE lease_expires <= now() RETURNING *`;
+      for (const claim of expired) {
+        const reopened = await sql`
+          UPDATE tasks SET status='open', updated_at=now()
+          WHERE id=${claim.task_id} AND status='claimed' RETURNING id`;
+        await sql`
+          INSERT INTO events (entity_type, entity_id, action, actor, data)
+          VALUES ('task',${claim.task_id},'lease_expired','lease-sweeper',
+            ${sql.json({ agent_id: claim.agent_id, lease_expires: claim.lease_expires, reopened: reopened.length > 0 })})`;
+        const body = `task ${claim.task_id} lease expired (${claim.agent_id})${reopened.length ? " → open" : ""}`;
+        await sql`
+          INSERT INTO messages (to_agent, from_agent, task_id, body)
+          SELECT agent_id, 'underwright', task_id, ${body} FROM watches WHERE task_id=${claim.task_id}`;
+      }
+      return { reclaimed: expired.map(claim => claim.task_id as string) };
+    });
+  }
+
   async postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
     const id = `art-${randomUUID().slice(0, 8)}`;
     await this.sql`INSERT INTO artifacts (id, task_id, agent_id, kind, title, content)
