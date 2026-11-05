@@ -61,6 +61,10 @@ underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
 `Authorization: Bearer <token>` (`/health` stays open).
 
+How to point Claude Code, Cursor, Cline, OpenCode, Codex, Kimi, Grok,
+Command Code, and agy at one shared server — and how not to open a private
+database by mistake — is in [docs/multi-harness.md](docs/multi-harness.md).
+
 Docker (ghcr.io/underwright/underwright, published on tags):
 
 ```bash
