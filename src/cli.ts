@@ -2,7 +2,13 @@
 import { execSync } from "node:child_process";
 import { serve, serveHttp } from "./server.js";
 import { openStore } from "./store.js";
-import { syncIssues, postEvidenceComment } from "./github.js";
+import {
+  syncIssues,
+  syncPRs,
+  checkPRGate,
+  linkPR,
+  postEvidenceComment,
+} from "./github.js";
 
 const [cmd, ...args] = process.argv.slice(2);
 const dbPath = process.env.UNDERWRIGHT_DB ?? "underwright.db";
@@ -55,28 +61,43 @@ switch (cmd) {
     const sub = args[0];
     const repo = args[args.indexOf("--repo") + 1];
     if (!repo) {
-      console.error("usage: underwright github sync|post-evidence --repo owner/name [--task ID]");
+      console.error("usage: underwright github sync|sync-prs|gate|post-evidence|link-pr --repo owner/name [--task ID] [--pr NUM]");
       process.exit(1);
     }
     const store = await openStore(dbPath);
     if (sub === "sync") {
       const wIdx = args.indexOf("--watch");
+      const prsFlag = args.includes("--prs");
       if (wIdx !== -1) {
         const interval = Number(args[wIdx + 1] ?? 60) * 1000;
         console.error(`[underwright] watching ${repo} every ${interval / 1000}s`);
         for (;;) {
           try {
             console.error(new Date().toISOString(), JSON.stringify(await syncIssues(store, repo)));
+            if (prsFlag) {
+              console.error(new Date().toISOString(), JSON.stringify(await syncPRs(store, repo)));
+            }
           } catch (e: any) {
             console.error("sync error:", e.message);
           }
           await new Promise((r) => setTimeout(r, interval));
         }
       }
-      console.log(JSON.stringify(await syncIssues(store, repo), null, 2));
+      const issueRes = await syncIssues(store, repo);
+      const prRes = prsFlag ? await syncPRs(store, repo) : null;
+      console.log(JSON.stringify(prsFlag ? { issues: issueRes, prs: prRes } : issueRes, null, 2));
+    } else if (sub === "sync-prs") {
+      console.log(JSON.stringify(await syncPRs(store, repo), null, 2));
+    } else if (sub === "gate" || sub === "check-gate") {
+      const task = args[args.indexOf("--task") + 1];
+      console.log(JSON.stringify(await checkPRGate(store, repo, task), null, 2));
     } else if (sub === "post-evidence") {
       const task = args[args.indexOf("--task") + 1];
       console.log(JSON.stringify(await postEvidenceComment(store, repo, task)));
+    } else if (sub === "link-pr") {
+      const task = args[args.indexOf("--task") + 1];
+      const pr = args[args.indexOf("--pr") + 1];
+      console.log(JSON.stringify(await linkPR(store, task, pr, repo)));
     }
     await store.close();
     break;
