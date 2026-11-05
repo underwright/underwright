@@ -10,7 +10,8 @@ const defaultGhRunner: GhRunner = (args: string, input?: string) => {
   if (input !== undefined) {
     return execSync(`gh ${args}`, { encoding: "utf8", input });
   }
-  return JSON.parse(execSync(`gh ${args}`, { encoding: "utf8" }));
+  const out = execSync(`gh ${args}`, { encoding: "utf8" });
+  return args.includes("--json") ? JSON.parse(out) : out;
 };
 
 export type Issue = {
