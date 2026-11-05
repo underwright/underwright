@@ -69,6 +69,10 @@ such as `in_review`, `blocked`, and `done` are preserved. Sweeps are transaction
 and safe to run from multiple server processes; failed sweeps are logged to
 stderr and retried on the next interval.
 
+How to point Claude Code, Cursor, Cline, OpenCode, Codex, Kimi, Grok,
+Command Code, and agy at one shared server — and how not to open a private
+database by mistake — is in [docs/multi-harness.md](docs/multi-harness.md).
+
 Docker (ghcr.io/underwright/underwright, published on tags):
 
 ```bash
