@@ -1,4 +1,15 @@
 // Underwright control-plane schema. Local-first: one SQLite file per workspace.
+// Portable edge DDL used by both backends and applied on existing databases.
+export const TASK_DEPENDENCIES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  blocker_id TEXT NOT NULL REFERENCES tasks(id),
+  PRIMARY KEY (task_id, blocker_id),
+  CHECK (task_id <> blocker_id)
+);
+CREATE INDEX IF NOT EXISTS task_dependencies_blocker ON task_dependencies(blocker_id);
+`;
+
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
@@ -17,6 +28,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+${TASK_DEPENDENCIES_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS claims (
   task_id        TEXT PRIMARY KEY REFERENCES tasks(id),

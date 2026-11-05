@@ -61,6 +61,18 @@ underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
 `Authorization: Bearer <token>` (`/health` stays open).
 
+Tasks can declare `blocked_by: [task_ids]` in `create_task` or `update_task`.
+Updating this field replaces the dependency list; `[]` clears it, while omitting
+it preserves existing edges. Task reads, lists, and the board expose `blocked_by`,
+reverse `blocks`, and `unfinished_blockers`. Open tasks with unfinished blockers
+appear as `blocked`, and cannot be claimed until every blocker is `done`, even
+without a DoR policy. Missing blockers, self-dependencies, and cycles are rejected.
+Each blocker completion records a progress event and notifies dependent task
+watchers. When the last blocker finishes, the dependent becomes open and an `unblocked`
+audit event and watcher notification are recorded. Edges remain for traceability;
+reopening a blocker blocks its open dependents again. Manually blocked tasks
+keep their status until explicitly changed.
+
 Both server modes sweep expired task claims on startup and every 60 seconds.
 Each expiration removes the claim, reopens the task if it is still `claimed`,
 records a `lease_expired` audit event with the former holder and expiry, and

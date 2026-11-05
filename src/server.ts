@@ -34,6 +34,7 @@ Rules of engagement:
     title: z.string(),
     description: z.string().optional(),
     spec_ref: z.string().optional().describe("path or URI of the governing spec"),
+    blocked_by: z.array(z.string()).optional().describe("task ids that must be done before claiming; update replaces the list, [] clears it"),
     ac_ids: z.array(z.string()).optional().describe("acceptance criterion ids this task must prove"),
     priority: z.number().int().min(0).max(4).optional(),
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
@@ -51,6 +52,7 @@ Rules of engagement:
     title: z.string().optional(),
     description: z.string().optional(),
     spec_ref: z.string().optional(),
+    blocked_by: z.array(z.string()).optional().describe("task ids that must be done before claiming; update replaces the list, [] clears it"),
     ac_ids: z.array(z.string()).optional(),
     type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage"]).optional(),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),

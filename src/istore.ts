@@ -10,6 +10,7 @@ export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | 
 export interface CreateTaskArgs {
   title: string; description?: string; spec_ref?: string; ac_ids?: string[];
   priority?: number; ownership?: object; created_by?: string; id?: string;
+  blocked_by?: string[];
   type?: TaskType;
   severity?: "low" | "normal" | "high" | "critical";
   estimate?: "S" | "M" | "L" | "";

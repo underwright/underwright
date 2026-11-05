@@ -141,6 +141,18 @@ async function matrix(token) {
     assert.equal((await call('inbox', { agent_id: other, unread_only: false })).length, 1);
     assert.equal((await call('watch_task', { agent_id: other, task_id })).watching, task_id);
 
+    // Dependency fields must survive MCP validation and be visible to another client.
+    const dependent = await call('create_task', { title: 'Dependent HTTP task', blocked_by: [task_id] });
+    assert.equal(dependent.status, 'blocked');
+    assert.deepEqual(dependent.blocked_by, [task_id]);
+    assert.deepEqual((await call('get_task', { task_id }, second)).blocks, [dependent.id]);
+    assert((await call('list_tasks', { status: 'blocked' }, second)).some(t => t.id === dependent.id));
+    assert.equal((await call('board', {}, second)).tasks.find(t => t.id === dependent.id).status, 'blocked');
+    assert.match((await call('claim_task', { task_id: dependent.id, agent_id: other }, second)).error, /blocked by/);
+    assert.equal((await call('update_task', { task_id: dependent.id, actor: agent, blocked_by: [] })).status, 'open');
+    await call('update_task', { task_id: dependent.id, actor: agent, blocked_by: [task_id] });
+    await call('watch_task', { task_id: dependent.id, agent_id: other }, second);
+
     const job = await call('submit_job', { task_id, agent_id: agent, type: 'test', command: 'echo contract' });
     assert.equal(job.status, 'queued');
     const status = await call('job_status', { job_id: job.id }, second);
@@ -152,6 +164,11 @@ async function matrix(token) {
       command: 'HTTP matrix', exit_code: 0, output: 'verified', ac_ids: ['http-ac'] })).id, /^ev-/);
     assert.match((await call('complete_task', { task_id, agent_id: other })).error, /claimed by/);
     assert.equal((await call('complete_task', { task_id, agent_id: agent })).completed, task_id);
+    assert.equal((await call('get_task', { task_id: dependent.id }, second)).status, 'open');
+    const notifications = await call('inbox', { agent_id: other }, second);
+    assert.equal(notifications.filter(m => m.task_id === dependent.id && m.body.includes('unblocked')).length, 1);
+    assert((await call('audit_log', { limit: 100 })).some(e => e.entity_id === dependent.id && e.action === 'unblocked'));
+    assert.equal((await call('claim_task', { task_id: dependent.id, agent_id: other }, second)).agent_id, other);
     const completed = await call('get_task', { task_id }, second);
     assert.equal(completed.status, 'done');
     assert.equal(completed.claim, null);

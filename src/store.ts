@@ -103,8 +103,56 @@ export class SqliteStore implements IStore {
       .run(entityType, entityId, title, content);
   }
 
+  private dependencies(id: string, status: TaskStatus) {
+    const blockers = this.db.prepare(`SELECT t.id, t.status FROM task_dependencies d
+      JOIN tasks t ON t.id=d.blocker_id WHERE d.task_id=? ORDER BY t.id`).all(id) as any[];
+    const blocks = this.db.prepare("SELECT task_id FROM task_dependencies WHERE blocker_id=? ORDER BY task_id").all(id) as any[];
+    const unfinished_blockers = blockers.filter(t => t.status !== "done").map(t => t.id as string);
+    return { blocked_by: blockers.map(t => t.id as string), blocks: blocks.map(t => t.task_id as string),
+      unfinished_blockers, status: status === "open" && unfinished_blockers.length ? "blocked" : status };
+  }
+
+  private validateDependencies(id: string, blockers: string[]) {
+    for (const blocker of new Set(blockers)) {
+      if (blocker === id) return `task ${id} cannot depend on itself`;
+      if (!this.db.prepare("SELECT 1 FROM tasks WHERE id=?").get(blocker)) return `blocker ${blocker} not found`;
+      const cycle = this.db.prepare(`WITH RECURSIVE ancestors(id) AS (
+        SELECT blocker_id FROM task_dependencies WHERE task_id=?
+        UNION SELECT d.blocker_id FROM task_dependencies d JOIN ancestors a ON d.task_id=a.id
+      ) SELECT 1 FROM ancestors WHERE id=?`).get(blocker, id);
+      if (cycle) return `dependency on ${blocker} would create a cycle`;
+    }
+  }
+
+  private replaceDependencies(id: string, blockers: string[]) {
+    this.db.prepare("DELETE FROM task_dependencies WHERE task_id=?").run(id);
+    const insert = this.db.prepare("INSERT INTO task_dependencies (task_id, blocker_id) VALUES (?,?)");
+    for (const blocker of new Set(blockers)) insert.run(id, blocker);
+  }
+
+  private unblockDependents(blockerId: string, actor: string) {
+    const dependents = this.db.prepare(`SELECT t.id, t.status FROM task_dependencies d
+      JOIN tasks t ON t.id=d.task_id WHERE d.blocker_id=?`).all(blockerId) as any[];
+    for (const t of dependents) {
+      if (t.status === "done") continue;
+      const remaining = this.dependencies(t.id, t.status).unfinished_blockers;
+      const unblocked = t.status === "open" && remaining.length === 0;
+      this.log("task", t.id, unblocked ? "unblocked" : "blocker_completed", actor,
+        { blocker_id: blockerId, unfinished_blockers: remaining });
+      this.notifyWatchers(t.id, unblocked
+        ? `task ${t.id} unblocked: all blockers done (completed ${blockerId})`
+        : `task ${t.id}: blocker ${blockerId} completed; remaining blockers: ${remaining.join(", ") || "none"}`);
+    }
+  }
+
   createTask(args: CreateTaskArgs) {
+    return this.db.transaction(() => this.createTaskAtomic(args)).immediate();
+  }
+
+  private createTaskAtomic(args: CreateTaskArgs) {
     const id = args.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const invalid = this.validateDependencies(id, args.blocked_by ?? []);
+    if (invalid) return { error: invalid };
     this.db
       .prepare(
         `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
@@ -116,6 +164,7 @@ export class SqliteStore implements IStore {
         JSON.stringify(args.ownership ?? {}), args.created_by ?? "human",
         args.type ?? "feature", args.severity ?? "normal", args.estimate ?? ""
       );
+    this.replaceDependencies(id, args.blocked_by ?? []);
     this.log("task", id, "created", args.created_by ?? "human", args);
     return this.getTask(id);
   }
@@ -124,20 +173,30 @@ export class SqliteStore implements IStore {
     const t = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as any;
     if (!t) return null;
     const claim = this.db.prepare("SELECT * FROM claims WHERE task_id = ?").get(id) ?? null;
-    return { ...t, ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim };
+    return { ...t, ...this.dependencies(id, t.status), ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim };
   }
 
   setTaskStatus(id: string, status: TaskStatus, actor: string) {
+    return this.db.transaction(() => this.setTaskStatusAtomic(id, status, actor)).immediate();
+  }
+
+  private setTaskStatusAtomic(id: string, status: TaskStatus, actor: string) {
     const t = this.getTask(id);
     if (!t) return { error: `task ${id} not found` };
-    if (t.status === status) return { id, status };
+    const raw = this.db.prepare("SELECT status FROM tasks WHERE id=?").get(id) as any;
+    if (raw.status === status) return { id, status };
     this.db.prepare("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?").run(status, id);
     this.log("task", id, `status:${status}`, actor);
     this.notifyWatchers(id, `task ${id} → ${status}`);
+    if (status === "done" && t.status !== "done") this.unblockDependents(id, actor);
     return { id, status };
   }
 
   updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
+    return this.db.transaction(() => this.updateTaskAtomic(id, patch, actor)).immediate();
+  }
+
+  private updateTaskAtomic(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
     const t = this.getTask(id);
     if (!t) return { error: `task ${id} not found` };
     const sets: string[] = [];
@@ -146,7 +205,12 @@ export class SqliteStore implements IStore {
       if (patch[k] !== undefined) { sets.push(`${k}=?`); vals.push(patch[k]); }
     }
     if (patch.ac_ids !== undefined) { sets.push("ac_ids=?"); vals.push(JSON.stringify(patch.ac_ids)); }
-    if (!sets.length) return { id, unchanged: true };
+    if (patch.blocked_by !== undefined) {
+      const invalid = this.validateDependencies(id, patch.blocked_by);
+      if (invalid) return { error: invalid };
+      this.replaceDependencies(id, patch.blocked_by);
+    }
+    if (!sets.length && patch.blocked_by === undefined) return { id, unchanged: true };
     sets.push("updated_at=datetime('now')");
     this.db.prepare(`UPDATE tasks SET ${sets.join(",")} WHERE id=?`).run(...vals, id);
     this.log("task", id, "updated", actor, patch);
@@ -162,14 +226,17 @@ export class SqliteStore implements IStore {
   }
 
   listTasks(status?: TaskStatus) {
-    const rows = status
-      ? this.db.prepare("SELECT id, title, status, priority FROM tasks WHERE status = ? ORDER BY priority, created_at").all(status)
-      : this.db.prepare("SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at").all();
-    return rows;
+    const rows = this.db.prepare("SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at").all() as any[];
+    return rows.map(t => ({ ...t, ...this.dependencies(t.id, t.status) }))
+      .filter(t => !status || t.status === status);
   }
 
   /** Atomic claim with lease. Returns the claim or an error string. */
   claimTask(taskId: string, agentId: string, ttlSeconds = 1800, scope: object = {}) {
+    return this.db.transaction(() => this.claimTaskAtomic(taskId, agentId, ttlSeconds, scope)).immediate();
+  }
+
+  private claimTaskAtomic(taskId: string, agentId: string, ttlSeconds = 1800, scope: object = {}) {
     const task = this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
     if (task.status === "done") return { error: `task ${taskId} is already done` };
@@ -178,6 +245,10 @@ export class SqliteStore implements IStore {
     const now = new Date().toISOString();
     if (existing && existing.lease_expires > now && existing.agent_id !== agentId) {
       return { error: `task ${taskId} is claimed by ${existing.agent_id} until ${existing.lease_expires}` };
+    }
+
+    if (task.unfinished_blockers.length) {
+      return { error: `task ${taskId} is blocked by unfinished tasks: ${task.unfinished_blockers.join(", ")}` };
     }
 
     const dor = evaluateDoR(task, loadPolicy());
@@ -323,8 +394,13 @@ export class SqliteStore implements IStore {
 
   /** Close a task. Requires evidence for every declared acceptance criterion. */
   completeTask(taskId: string, agentId: string) {
+    return this.db.transaction(() => this.completeTaskAtomic(taskId, agentId)).immediate();
+  }
+
+  private completeTaskAtomic(taskId: string, agentId: string) {
     const task = this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
+    if (task.status === "done") return { completed: taskId };
     const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id=?").get(taskId) as any;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
 
@@ -350,6 +426,8 @@ export class SqliteStore implements IStore {
     this.db.prepare("UPDATE tasks SET status='done', updated_at=datetime('now') WHERE id=?").run(taskId);
     this.db.prepare("DELETE FROM claims WHERE task_id=?").run(taskId);
     this.log("task", taskId, "completed", agentId, { dod: dod.missing });
+    this.notifyWatchers(taskId, `task ${taskId} → done`);
+    this.unblockDependents(taskId, agentId);
     return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
   }
 
@@ -523,7 +601,7 @@ export class SqliteStore implements IStore {
       .all();
     const jobs = this.db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all();
     const helpers = (this.db.prepare("SELECT COUNT(*) n FROM helpers").get() as any).n;
-    return { tasks, job_counts: jobs, helpers_registered: helpers };
+    return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers };
   }
 
   auditLog(limit = 50) {

@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { TASK_DEPENDENCIES_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR } from "./policy.js";
 import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
@@ -21,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+${TASK_DEPENDENCIES_SCHEMA}
 CREATE TABLE IF NOT EXISTS claims (
   task_id       TEXT PRIMARY KEY REFERENCES tasks(id),
   agent_id      TEXT NOT NULL,
@@ -129,14 +131,73 @@ export class PgStore implements IStore {
     await this.sql`INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES (${entityType},${entityId},${action},${actor},${this.sql.json(data as any)})`;
   }
 
+  private async dependencyTransaction(work: (store: PgStore) => Promise<any>): Promise<any> {
+    return this.sql.begin(async sql => {
+      // Serialize graph edits with claim/completion checks across server instances.
+      await sql`LOCK TABLE task_dependencies IN SHARE ROW EXCLUSIVE MODE`;
+      return work(new PgStore(sql as unknown as postgres.Sql));
+    });
+  }
+
+  private async dependencies(id: string, status: TaskStatus) {
+    const blockers = await this.sql`SELECT t.id, t.status FROM task_dependencies d
+      JOIN tasks t ON t.id=d.blocker_id WHERE d.task_id=${id} ORDER BY t.id`;
+    const blocks = await this.sql`SELECT task_id FROM task_dependencies WHERE blocker_id=${id} ORDER BY task_id`;
+    const unfinished_blockers = blockers.filter(t => t.status !== "done").map(t => t.id as string);
+    return { blocked_by: blockers.map(t => t.id as string), blocks: blocks.map(t => t.task_id as string),
+      unfinished_blockers, status: status === "open" && unfinished_blockers.length ? "blocked" : status };
+  }
+
+  private async validateDependencies(id: string, blockers: string[]) {
+    for (const blocker of new Set(blockers)) {
+      if (blocker === id) return `task ${id} cannot depend on itself`;
+      const found = await this.sql`SELECT 1 FROM tasks WHERE id=${blocker}`;
+      if (!found.length) return `blocker ${blocker} not found`;
+      const cycle = await this.sql`WITH RECURSIVE ancestors(id) AS (
+        SELECT blocker_id FROM task_dependencies WHERE task_id=${blocker}
+        UNION SELECT d.blocker_id FROM task_dependencies d JOIN ancestors a ON d.task_id=a.id
+      ) SELECT 1 FROM ancestors WHERE id=${id}`;
+      if (cycle.length) return `dependency on ${blocker} would create a cycle`;
+    }
+  }
+
+  private async replaceDependencies(id: string, blockers: string[]) {
+    await this.sql`DELETE FROM task_dependencies WHERE task_id=${id}`;
+    for (const blocker of new Set(blockers)) {
+      await this.sql`INSERT INTO task_dependencies (task_id, blocker_id) VALUES (${id},${blocker})`;
+    }
+  }
+
+  private async unblockDependents(blockerId: string, actor: string) {
+    const dependents = await this.sql`SELECT t.id, t.status FROM task_dependencies d
+      JOIN tasks t ON t.id=d.task_id WHERE d.blocker_id=${blockerId}`;
+    for (const t of dependents) {
+      if (t.status === "done") continue;
+      const remaining = (await this.dependencies(t.id, t.status)).unfinished_blockers;
+      const unblocked = t.status === "open" && remaining.length === 0;
+      await this.log("task", t.id, unblocked ? "unblocked" : "blocker_completed", actor,
+        { blocker_id: blockerId, unfinished_blockers: remaining });
+      await this.notifyWatchers(t.id, unblocked
+        ? `task ${t.id} unblocked: all blockers done (completed ${blockerId})`
+        : `task ${t.id}: blocker ${blockerId} completed; remaining blockers: ${remaining.join(", ") || "none"}`);
+    }
+  }
+
   async createTask(a: CreateTaskArgs) {
+    return this.dependencyTransaction(store => store.createTaskAtomic(a));
+  }
+
+  private async createTaskAtomic(a: CreateTaskArgs) {
     const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const invalid = await this.validateDependencies(id, a.blocked_by ?? []);
+    if (invalid) return { error: invalid };
     await this.sql`
       INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
       VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
               ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
               ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"},
               ${a.severity ?? "normal"},${a.estimate ?? ""})`;
+    await this.replaceDependencies(id, a.blocked_by ?? []);
     await this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
   }
@@ -145,20 +206,30 @@ export class PgStore implements IStore {
     const [t] = await this.sql<any[]>`SELECT * FROM tasks WHERE id = ${id}`;
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
-    return { ...t, claim: claim ?? null };
+    return { ...t, ...await this.dependencies(id, t.status), claim: claim ?? null };
   }
 
   async setTaskStatus(id: string, status: TaskStatus, actor: string) {
+    return this.dependencyTransaction(store => store.setTaskStatusAtomic(id, status, actor));
+  }
+
+  private async setTaskStatusAtomic(id: string, status: TaskStatus, actor: string) {
     const t = await this.getTask(id);
     if (!t) return { error: `task ${id} not found` };
-    if (t.status === status) return { id, status };
+    const [raw] = await this.sql`SELECT status FROM tasks WHERE id=${id}`;
+    if (raw.status === status) return { id, status };
     await this.sql`UPDATE tasks SET status=${status}, updated_at=now() WHERE id=${id}`;
     await this.log("task", id, `status:${status}`, actor);
     await this.notifyWatchers(id, `task ${id} → ${status}`);
+    if (status === "done" && t.status !== "done") await this.unblockDependents(id, actor);
     return { id, status };
   }
 
   async updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
+    return this.dependencyTransaction(store => store.updateTaskAtomic(id, patch, actor));
+  }
+
+  private async updateTaskAtomic(id: string, patch: Partial<CreateTaskArgs>, actor: string) {
     const t = await this.getTask(id);
     if (!t) return { error: `task ${id} not found` };
     const sets: string[] = [];
@@ -167,8 +238,13 @@ export class PgStore implements IStore {
       if (patch[k] !== undefined) { sets.push(`${k}=$${vals.length + 2}`); vals.push(patch[k]); }
     }
     if (patch.ac_ids !== undefined) { sets.push(`ac_ids=$${vals.length + 2}`); vals.push(JSON.stringify(patch.ac_ids)); }
-    if (!sets.length) return { id, unchanged: true };
-    await this.sql.unsafe(`UPDATE tasks SET ${sets.join(",")}, updated_at=now() WHERE id=$1`, [id, ...vals]);
+    if (patch.blocked_by !== undefined) {
+      const invalid = await this.validateDependencies(id, patch.blocked_by);
+      if (invalid) return { error: invalid };
+      await this.replaceDependencies(id, patch.blocked_by);
+    }
+    if (!sets.length && patch.blocked_by === undefined) return { id, unchanged: true };
+    await this.sql.unsafe(`UPDATE tasks SET ${[...sets, "updated_at=now()"].join(",")} WHERE id=$1`, [id, ...vals]);
     await this.log("task", id, "updated", actor, patch);
     return this.getTask(id);
   }
@@ -182,18 +258,26 @@ export class PgStore implements IStore {
   }
 
   async listTasks(status?: TaskStatus) {
-    return status
-      ? this.sql`SELECT id, title, status, priority FROM tasks WHERE status=${status} ORDER BY priority, created_at`
-      : this.sql`SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at`;
+    const rows = await this.sql`SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at`;
+    const tasks = await Promise.all(rows.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) })));
+    return tasks.filter(t => !status || t.status === status);
   }
 
   async claimTask(taskId: string, agentId: string, ttlSeconds = 1800, scope: object = {}) {
+    return this.dependencyTransaction(store => store.claimTaskAtomic(taskId, agentId, ttlSeconds, scope));
+  }
+
+  private async claimTaskAtomic(taskId: string, agentId: string, ttlSeconds = 1800, scope: object = {}) {
     const task = await this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
     if (task.status === "done") return { error: `task ${taskId} is already done` };
     const claim = task.claim;
     if (claim && new Date(claim.lease_expires) > new Date() && claim.agent_id !== agentId) {
       return { error: `task ${taskId} is claimed by ${claim.agent_id} until ${claim.lease_expires}` };
+    }
+
+    if (task.unfinished_blockers.length) {
+      return { error: `task ${taskId} is blocked by unfinished tasks: ${task.unfinished_blockers.join(", ")}` };
     }
 
     const dor = evaluateDoR(task, loadPolicy());
@@ -308,8 +392,13 @@ export class PgStore implements IStore {
   }
 
   async completeTask(taskId: string, agentId: string) {
+    return this.dependencyTransaction(store => store.completeTaskAtomic(taskId, agentId));
+  }
+
+  private async completeTaskAtomic(taskId: string, agentId: string) {
     const task = await this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
+    if (task.status === "done") return { completed: taskId };
     const claim = task.claim;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     const rows = await this.getEvidence(taskId);
@@ -336,6 +425,8 @@ export class PgStore implements IStore {
     await this.sql`UPDATE tasks SET status='done', updated_at=now() WHERE id=${taskId}`;
     await this.sql`DELETE FROM claims WHERE task_id=${taskId}`;
     await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
+    await this.notifyWatchers(taskId, `task ${taskId} → done`);
+    await this.unblockDependents(taskId, agentId);
     return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
   }
 
@@ -412,7 +503,7 @@ export class PgStore implements IStore {
       FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`;
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;
-    return { tasks, job_counts, helpers_registered: n };
+    return { tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))), job_counts, helpers_registered: n };
   }
 
   async sendMessage(to: string, from: string, body: string, taskId?: string) {
