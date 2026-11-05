@@ -15,4 +15,5 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm run test:contract
       - run: npm audit --audit-level=high
