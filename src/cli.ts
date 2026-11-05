@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { execSync } from "node:child_process";
-import { serve, serveHttp } from "./server.js";
-import { openStore } from "./store.js";
+import { openStore, serve, serveHttp } from "./server.js";
 import { syncIssues, postEvidenceComment } from "./github.js";
 
 const [cmd, ...args] = process.argv.slice(2);
