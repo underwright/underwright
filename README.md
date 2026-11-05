@@ -100,3 +100,12 @@ docker run -v $(pwd)/.uw:/data -p 8741:8741 \
 Early development. Roadmap: git-platform adapters (GitHub/GitLab/ADO),
 Spec Kit–compatible spec pipeline, code indexing for the helper index,
 hosted multi-repo coordination.
+
+## Validation
+
+Run `npm run build` and `npm test`, then `npm run test:contract` to test the
+compiled CLI over HTTP. The contract matrix boots a scratch server in both
+unauthenticated and bearer-authenticated modes, initializes MCP clients, and
+exercises every advertised tool, shared state, and rejection paths. It uses
+temporary SQLite databases (ignoring `DATABASE_URL` and the workspace policy),
+then stops its servers and removes the temporary files. CI runs all three commands.

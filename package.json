@@ -16,7 +16,8 @@
     "build": "tsc",
     "start": "node dist/cli.js serve",
     "dev": "tsc --watch",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:contract": "node scripts/test-contract.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
