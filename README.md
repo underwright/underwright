@@ -61,6 +61,14 @@ underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
 `Authorization: Bearer <token>` (`/health` stays open).
 
+Both server modes sweep expired task claims on startup and every 60 seconds.
+Each expiration removes the claim, reopens the task if it is still `claimed`,
+records a `lease_expired` audit event with the former holder and expiry, and
+notifies task watchers. Active or renewed leases are left alone, and task states
+such as `in_review`, `blocked`, and `done` are preserved. Sweeps are transactional
+and safe to run from multiple server processes; failed sweeps are logged to
+stderr and retried on the next interval.
+
 Docker (ghcr.io/underwright/underwright, published on tags):
 
 ```bash

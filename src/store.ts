@@ -274,6 +274,26 @@ export class SqliteStore implements IStore {
     return { task_id: taskId, lease_expires: expires };
   }
 
+  /** Reclaim leases and publish their effects atomically, even across servers. */
+  sweepExpiredClaims() {
+    return this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const expired = this.db.prepare("SELECT * FROM claims WHERE lease_expires <= ?").all(now) as any[];
+      const remove = this.db.prepare("DELETE FROM claims WHERE task_id=?");
+      const reopen = this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=? AND status='claimed'");
+      for (const claim of expired) {
+        remove.run(claim.task_id);
+        const reopened = reopen.run(claim.task_id).changes > 0;
+        this.log("task", claim.task_id, "lease_expired", "lease-sweeper", {
+          agent_id: claim.agent_id, lease_expires: claim.lease_expires, reopened,
+        });
+        this.notifyWatchers(claim.task_id,
+          `task ${claim.task_id} lease expired (${claim.agent_id})${reopened ? " → open" : ""}`);
+      }
+      return { reclaimed: expired.map(claim => claim.task_id as string) };
+    }).immediate();
+  }
+
   postArtifact(args: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
     const id = `art-${randomUUID().slice(0, 8)}`;
     this.db

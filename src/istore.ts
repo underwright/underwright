@@ -25,6 +25,7 @@ export interface IStore {
   updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string): Awaitable<any>;
   releaseTask(taskId: string, agentId: string): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
+  sweepExpiredClaims(): Awaitable<{ reclaimed: string[] }>;
   claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds?: number): Awaitable<any>;
   releaseResources(resources: string[], agentId: string): Awaitable<any>;
   checkLocks(resources: string[]): Awaitable<any[]>;
