@@ -128,6 +128,33 @@ describe("definition of done", () => {
     expect(r).toHaveProperty("completed", t.id);
     delete process.env.UNDERWRIGHT_POLICY;
   });
+
+  it("enforces tdd ordering: a failing test_run must precede the passing one", () => {
+    const { mkdtempSync, writeFileSync } = require("node:fs");
+    const dir = mkdtempSync("/tmp/uwpol-");
+    writeFileSync(`${dir}/pol.json`, JSON.stringify({
+      dod: { tdd: { evidence: ["test_run"], tdd: true } },
+      enforcement: "block",
+    }));
+    process.env.UNDERWRIGHT_POLICY = `${dir}/pol.json`;
+    // evidence timestamps are millisecond-precision; separate reports to fix their order.
+    const spin = (ms: number) => { const end = Date.now() + ms; while (Date.now() < end); };
+
+    const greenFirst = store.createTask({ title: "green first", type: "tdd", ac_ids: ["red-before-green"] });
+    store.claimTask(greenFirst.id, "agent-A");
+    store.reportEvidence({ task_id: greenFirst.id, agent_id: "agent-A", kind: "test_run", exit_code: 0, ac_ids: ["red-before-green"] });
+    spin(5);
+    store.reportEvidence({ task_id: greenFirst.id, agent_id: "agent-A", kind: "test_run", exit_code: 1, ac_ids: ["red-before-green"] });
+    expect((store.completeTask(greenFirst.id, "agent-A") as any).error).toContain("tdd ordering violated");
+
+    const redFirst = store.createTask({ title: "red first", type: "tdd", ac_ids: ["red-before-green"] });
+    store.claimTask(redFirst.id, "agent-A");
+    store.reportEvidence({ task_id: redFirst.id, agent_id: "agent-A", kind: "test_run", exit_code: 1, ac_ids: ["red-before-green"] });
+    spin(5);
+    store.reportEvidence({ task_id: redFirst.id, agent_id: "agent-A", kind: "test_run", exit_code: 0, ac_ids: ["red-before-green"] });
+    expect(store.completeTask(redFirst.id, "agent-A")).toHaveProperty("completed", redFirst.id);
+    delete process.env.UNDERWRIGHT_POLICY;
+  });
 });
 
 describe("definition of ready", () => {

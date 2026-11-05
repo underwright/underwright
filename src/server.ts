@@ -35,7 +35,7 @@ Rules of engagement:
     priority: z.number().int().min(0).max(4).optional(),
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("file globs / symbols this task owns"),
-    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "triage"]).optional()
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage"]).optional()
       .describe("task type — drives Definition-of-Done requirements at completion"),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional().describe("effort in agent-sessions"),
@@ -49,7 +49,7 @@ Rules of engagement:
     description: z.string().optional(),
     spec_ref: z.string().optional(),
     ac_ids: z.array(z.string()).optional(),
-    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "triage"]).optional(),
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage"]).optional(),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional(),
   }, async (a) => {

@@ -5,7 +5,7 @@ type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
 
-export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | string;
+export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | "tdd" | string;
 
 export interface CreateTaskArgs {
   title: string; description?: string; spec_ref?: string; ac_ids?: string[];
