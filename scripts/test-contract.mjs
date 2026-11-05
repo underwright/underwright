@@ -130,6 +130,11 @@ async function matrix(token) {
       symbol: 'matrixhelper', kind: 'fixture', summary: 'matrixhelper HTTP fixture' })).id, /^hlp-/);
     assert((await call('search_context', { query: 'matrixhelper', kinds: ['helper'] })).some(h => h.entity_type === 'helper'));
 
+    await call('index_code', { root: join(root, 'src'), agent_id: agent });
+    assert((await call('search_symbols', { query: 'indexWorkspace' })).some(s => s.name === 'indexWorkspace'));
+    assert((await call('find_references', { name: 'indexWorkspace' })).length > 0);
+    await call('blast_radius', { name: 'indexWorkspace', depth: 1 });
+
     assert.equal((await call('send_message', { to: other, from: agent, body: 'HTTP handoff', task_id })).sent, other);
     assert.equal((await call('inbox', { agent_id: other }, second))[0].body, 'HTTP handoff');
     assert.deepEqual(await call('inbox', { agent_id: other }, second), []);
