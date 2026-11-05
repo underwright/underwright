@@ -312,10 +312,11 @@ export class SqliteStore implements IStore {
     const id = `ev-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
-        "INSERT INTO evidence (id, task_id, agent_id, kind, command, exit_code, output, ac_ids) VALUES (?,?,?,?,?,?,?,?)"
+        "INSERT INTO evidence (id, task_id, agent_id, kind, command, exit_code, output, ac_ids, created_at) VALUES (?,?,?,?,?,?,?,?,?)"
       )
       .run(id, args.task_id, args.agent_id, args.kind, args.command ?? "",
-        args.exit_code ?? null, args.output ?? "", JSON.stringify(args.ac_ids ?? []));
+        args.exit_code ?? null, args.output ?? "", JSON.stringify(args.ac_ids ?? []),
+        new Date().toISOString());
     this.log("evidence", id, "reported", args.agent_id, { task_id: args.task_id, kind: args.kind });
     return { id };
   }

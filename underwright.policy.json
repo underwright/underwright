@@ -5,6 +5,7 @@
     "deploy":       { "evidence": ["deploy", "smoke_test"] },
     "architecture": { "artifacts": ["design"], "evidence": ["review"] },
     "docs":         { "evidence": ["review"] },
+    "tdd":          { "evidence": ["test_run"], "tdd": true },
     "default":      { "evidence": ["test_run"] }
   },
   "enforcement": "warn",
