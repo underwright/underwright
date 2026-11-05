@@ -8,6 +8,9 @@ import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
 
+// cli.ts reaches the store through this module so the edge stays cli → server → store.
+export { openStore };
+
 const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
 });
