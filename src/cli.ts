@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
@@ -20,6 +21,14 @@ const flag = (name: string) => {
 };
 
 switch (cmd) {
+  case "--version":
+  case "-v":
+  case "version": {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    console.log(pkg.version);
+    break;
+  }
+
   case "serve": {
     const httpIdx = args.indexOf("--http");
     if (httpIdx !== -1) {
