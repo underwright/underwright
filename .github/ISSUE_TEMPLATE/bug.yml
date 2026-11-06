@@ -1,0 +1,51 @@
+name: Bug
+description: A defect in the control plane, CLI, or docs
+title: "bug: "
+labels: ["bug", "type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Acceptance-criterion ids you list here are what an agent must cite with `report_evidence` before the task can be completed. Security reports go to a [private advisory](https://github.com/underwright/underwright/security/advisories/new), not this form.
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, deterministic steps. Redact tokens and omit database files.
+      placeholder: |
+        1. underwright serve --http 127.0.0.1:8741
+        2. Call claim_task on an open task
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+    validations:
+      required: true
+  - type: input
+    id: ac-ids
+    attributes:
+      label: Acceptance criteria ids
+      description: Comma-separated ids the fix must prove.
+      placeholder: repro,fix,regression
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - low
+        - normal
+        - high
+        - critical
+    validations:
+      required: true
