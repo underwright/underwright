@@ -6,6 +6,27 @@ const escapeHtml = (value: unknown): string =>
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" } as Record<string, string>
   )[ch]);
 
+function eventPayload(event: any): Record<string, unknown> {
+  const raw = event?.data;
+  if (!raw) return {};
+  if (typeof raw === "object") return raw as Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(String(raw));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Dependency-blocked tasks and escalation artifacts (kind blocked) share one highlight. */
+function isBlockedTask(task: any): boolean {
+  return task?.status === "blocked" || Number(task?.blocked_artifacts) > 0;
+}
+
+function isBlockedEvent(event: any): boolean {
+  return event?.action === "blocked" || eventPayload(event).kind === "blocked";
+}
+
 export type DashboardData = {
   tasks?: any[];
   locks?: any[];
@@ -18,6 +39,7 @@ export type DashboardData = {
 export function renderDashboard(data: DashboardData, opts: { refreshSeconds?: number } = {}): string {
   const refresh = opts.refreshSeconds ?? 5;
   const tasks = data.tasks ?? [];
+  const escalations = tasks.filter((task) => Number(task.blocked_artifacts) > 0);
   const locks = data.locks ?? [];
   const jobs = data.jobs ?? [];
   const events = data.events ?? [];
@@ -52,6 +74,9 @@ td code{color:#7dd3fc}
 .title{color:#d6dae2}
 .cmd{color:#c3cad6;word-break:break-all}
 .empty{color:#566070;font-style:italic}
+tr.blocked{background:#3a2416}
+tr.blocked td,tr.blocked .title{color:#f6c27a}
+.badge-blocked{display:inline-block;margin-left:6px;padding:0 6px;border:1px solid #a16207;border-radius:999px;color:#f6c27a;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
 </style>
 </head>
 <body>
@@ -66,7 +91,19 @@ td code{color:#7dd3fc}
 <table>
 <thead><tr><th>Task</th><th>Status</th><th>Priority</th><th>Claimed by</th><th>Lease expires</th></tr></thead>
 <tbody>
-${rows(tasks, 5, (t) => `<tr><td><code>${escapeHtml(t.id)}</code> <span class="title">${escapeHtml(t.title)}</span></td>${cell(t.status)}${cell(t.priority)}${cell(t.claimed_by ?? "—")}${cell(t.lease_expires ?? "—")}</tr>`)}
+${rows(tasks, 5, (t) => {
+  const escalated = Number(t.blocked_artifacts) > 0;
+  const badge = escalated ? ` <span class="badge-blocked">escalation</span>` : "";
+  return `<tr${isBlockedTask(t) ? ' class="blocked"' : ""}><td><code>${escapeHtml(t.id)}</code> <span class="title">${escapeHtml(t.title)}</span>${badge}</td>${cell(t.status)}${cell(t.priority)}${cell(t.claimed_by ?? "—")}${cell(t.lease_expires ?? "—")}</tr>`;
+})}
+</tbody>
+</table>
+
+<h2>Blocked escalations <span class="count">${escalations.length}</span></h2>
+<table>
+<thead><tr><th>Task</th><th>Status</th><th>Claimed by</th><th>Escalations</th></tr></thead>
+<tbody>
+${rows(escalations, 4, (t) => `<tr class="blocked"><td><code>${escapeHtml(t.id)}</code> <span class="title">${escapeHtml(t.title)}</span></td>${cell(t.status)}${cell(t.claimed_by ?? "—")}${cell(t.blocked_artifacts)}</tr>`)}
 </tbody>
 </table>
 
@@ -90,7 +127,7 @@ ${rows(jobs, 7, (j) => `<tr><td><code>${escapeHtml(j.id)}</code></td>${cell(j.ty
 <table>
 <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th></tr></thead>
 <tbody>
-${rows(events, 4, (e) => `<tr>${cell(e.created_at)}${cell(e.actor)}${cell(e.action)}<td><code>${escapeHtml(e.entity_type)}</code> ${escapeHtml(e.entity_id)}</td></tr>`)}
+${rows(events, 4, (e) => `<tr${isBlockedEvent(e) ? ' class="blocked"' : ""}>${cell(e.created_at)}${cell(e.actor)}${cell(e.action)}<td><code>${escapeHtml(e.entity_type)}</code> ${escapeHtml(e.entity_id)}</td></tr>`)}
 </tbody>
 </table>
 </main>

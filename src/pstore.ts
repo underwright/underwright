@@ -1,5 +1,5 @@
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   id         TEXT PRIMARY KEY,
   task_id    TEXT REFERENCES tasks(id),
   agent_id   TEXT NOT NULL,
-  kind       TEXT NOT NULL CHECK (kind IN ('spec','design','handoff','note','review')),
+  kind       TEXT NOT NULL CHECK (kind IN (${ARTIFACT_KIND_SQL})),
   title      TEXT NOT NULL DEFAULT '',
   content    TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -125,6 +125,7 @@ export class PgStore implements IStore {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
     await sql.unsafe(PG_JOBS_MIGRATION);
+    await sql.unsafe(PG_ARTIFACTS_MIGRATION);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
@@ -216,7 +217,7 @@ export class PgStore implements IStore {
     const [t] = await this.sql<any[]>`SELECT * FROM tasks WHERE id = ${id}`;
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
-    return { ...t, ...await this.dependencies(id, t.status), claim: claim ?? null };
+    return { ...t, ...await this.dependencies(id, t.status), claim: claim ?? null, artifacts: await this.listArtifacts(id) };
   }
 
   async setTaskStatus(id: string, status: TaskStatus, actor: string) {
@@ -385,10 +386,16 @@ export class PgStore implements IStore {
   }
 
   async postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
+    if (!isArtifactKind(a.kind)) return { error: `unknown artifact kind: ${a.kind}` };
     const id = `art-${randomUUID().slice(0, 8)}`;
     await this.sql`INSERT INTO artifacts (id, task_id, agent_id, kind, title, content)
       VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.kind},${a.title ?? ""},${a.content})`;
-    await this.log("artifact", id, "posted", a.agent_id, { task_id: a.task_id, kind: a.kind });
+    const action = a.kind === "blocked" ? "blocked" : "posted";
+    await this.log("artifact", id, action, a.agent_id, { task_id: a.task_id, kind: a.kind });
+    if (a.kind === "blocked" && a.task_id) {
+      await this.log("task", a.task_id, "blocked", a.agent_id, { artifact_id: id });
+      await this.notifyWatchers(a.task_id, `task ${a.task_id} escalation: blocked artifact ${id}`);
+    }
     return { id };
   }
 
@@ -684,7 +691,8 @@ export class PgStore implements IStore {
 
   async board() {
     const tasks = await this.sql`
-      SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires
+      SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
+             (SELECT COUNT(*)::int FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
       FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`;
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;

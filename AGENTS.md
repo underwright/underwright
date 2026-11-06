@@ -35,6 +35,17 @@ tasks one agent is given (completions plus active claims; `0` means no cap).
 reassigns that task if it is still unclaimed, or logs `dispatch_idle` when
 nobody else can take it.
 
+## Anti-escalation
+
+Escalation is a last resort and goes through the mailbox. Never stop silently.
+
+Before escalating:
+
+1. Call `search_context` for helpers, specs, and prior decisions.
+2. Check artifacts and handoffs already posted on the task. `get_task` returns them.
+3. Try the alternate harness CLI path (claude, codex, grok, agy, or cmdc; see `docs/multi-harness.md`).
+4. If still blocked, `post_artifact` with kind `blocked` recording what was tried, `send_message` the human, then `release_task` so the dispatcher assigns the next task. Read `inbox` and continue. Do not go idle.
+
 ## Stack
 
 - TypeScript, Node 18+, ESM (`Node16` modules — import with `.js` extensions)

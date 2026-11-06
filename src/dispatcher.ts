@@ -4,6 +4,10 @@
 export const DISPATCHER_AGENT = "dispatcher";
 export const NEXT_TASK_PREFIX = "your next task: ";
 
+/** Fleet launch prompt. Placeholders: task_id, agent_id, host, job_id. */
+export const LAUNCH_PROMPT =
+  "You are {{agent_id}} on {{host}}. Read AGENTS.md strictly and work the board until idle. Before escalating, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact kind=blocked with what was tried, send_message to the human, then release_task and read inbox for your next task — do not idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}.";
+
 const SYSTEM_ACTORS = new Set([
   DISPATCHER_AGENT,
   "lease-sweeper",

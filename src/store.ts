@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { SCHEMA, JOBS_SCHEMA } from "./schema.js";
+import { SCHEMA, JOBS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -94,6 +94,27 @@ export class SqliteStore implements IStore {
           SELECT id,task_id,agent_id,type,CASE WHEN status='running' THEN 'queued' ELSE status END,
           command,result,created_at,started_at,finished_at FROM jobs_v5`);
         this.db.exec("DROP TABLE jobs_v5; PRAGMA user_version = 6;");
+      })();
+    }
+    if (v < 7) {
+      // v7: artifacts.kind gains 'blocked' for escalation records.
+      this.db.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE artifacts_v7 (
+            id          TEXT PRIMARY KEY,
+            task_id     TEXT REFERENCES tasks(id),
+            agent_id    TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN (${ARTIFACT_KIND_SQL})),
+            title       TEXT NOT NULL DEFAULT '',
+            content     TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+          );
+          INSERT INTO artifacts_v7 (id, task_id, agent_id, kind, title, content, created_at)
+            SELECT id, task_id, agent_id, kind, title, content, created_at FROM artifacts;
+          DROP TABLE artifacts;
+          ALTER TABLE artifacts_v7 RENAME TO artifacts;
+          PRAGMA user_version = 7;
+        `);
       })();
     }
   }
@@ -192,7 +213,11 @@ export class SqliteStore implements IStore {
     const t = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as any;
     if (!t) return null;
     const claim = this.db.prepare("SELECT * FROM claims WHERE task_id = ?").get(id) ?? null;
-    return { ...t, ...this.dependencies(id, t.status), ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim };
+    return {
+      ...t, ...this.dependencies(id, t.status),
+      ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
+      artifacts: this.listArtifacts(id),
+    };
   }
 
   setTaskStatus(id: string, status: TaskStatus, actor: string) {
@@ -389,12 +414,18 @@ export class SqliteStore implements IStore {
   }
 
   postArtifact(args: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
+    if (!isArtifactKind(args.kind)) return { error: `unknown artifact kind: ${args.kind}` };
     const id = `art-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare("INSERT INTO artifacts (id, task_id, agent_id, kind, title, content) VALUES (?,?,?,?,?,?)")
       .run(id, args.task_id ?? null, args.agent_id, args.kind, args.title ?? "", args.content);
     this.index("artifact", id, args.title ?? args.kind, args.content);
-    this.log("artifact", id, "posted", args.agent_id, { task_id: args.task_id, kind: args.kind });
+    const action = args.kind === "blocked" ? "blocked" : "posted";
+    this.log("artifact", id, action, args.agent_id, { task_id: args.task_id, kind: args.kind });
+    if (args.kind === "blocked" && args.task_id) {
+      this.log("task", args.task_id, "blocked", args.agent_id, { artifact_id: id });
+      this.notifyWatchers(args.task_id, `task ${args.task_id} escalation: blocked artifact ${id}`);
+    }
     return { id };
   }
 
@@ -784,7 +815,8 @@ export class SqliteStore implements IStore {
   board() {
     const tasks = this.db
       .prepare(
-        `SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires
+        `SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
+                (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
          FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`
       )
       .all();
