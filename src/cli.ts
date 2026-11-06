@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
+import { formatInitResult, initWorkspace } from "./init.js";
 import {
   syncIssues,
   syncPRs,
@@ -26,6 +27,28 @@ switch (cmd) {
   case "version": {
     const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
     console.log(pkg.version);
+    break;
+  }
+
+  case "init": {
+    // underwright init [--remote http://host:8741] [--force] [--no-seed]
+    const remote = flag("remote");
+    if (remote !== undefined && !remote) {
+      console.error("usage: underwright init [--remote http://host:8741] [--force] [--no-seed]");
+      process.exit(1);
+    }
+    const store = await openStore(dbPath);
+    try {
+      const result = await initWorkspace(store, {
+        cwd: process.cwd(),
+        remote,
+        force: args.includes("--force"),
+        seed: !args.includes("--no-seed"),
+      });
+      console.log(formatInitResult(result));
+    } finally {
+      await store.close();
+    }
     break;
   }
 
@@ -186,6 +209,8 @@ switch (cmd) {
     console.log(`underwright — control plane for agentic software development
 
 Usage:
+  underwright init               Scaffold AGENTS.md, .mcp.json, policy, .gitignore and the triage task.
+                                 [--remote http://host:8741] writes the http client variant; [--force] overwrites.
   underwright serve              MCP server over stdio (local agent config).
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
