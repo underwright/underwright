@@ -15,6 +15,18 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run depcruise
-      - run: npm test
+      - run: npm run test:coverage
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 7
+      - name: Report coverage evidence
+        run: npm run report:coverage
+        env:
+          UNDERWRIGHT_URL: ${{ secrets.UNDERWRIGHT_URL }}
+          UNDERWRIGHT_TOKEN: ${{ secrets.UNDERWRIGHT_TOKEN }}
+          UNDERWRIGHT_TASK_ID: ${{ secrets.UNDERWRIGHT_TASK_ID }}
       - run: npm run test:contract
       - run: npm audit --audit-level=high

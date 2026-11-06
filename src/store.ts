@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { parseCoverage } from "./coverage.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
@@ -410,7 +411,11 @@ export class SqliteStore implements IStore {
         args.exit_code ?? null, args.output ?? "", JSON.stringify(args.ac_ids ?? []),
         new Date().toISOString());
     this.log("evidence", id, "reported", args.agent_id, { task_id: args.task_id, kind: args.kind });
-    return { id };
+    if (args.kind !== "coverage") return { id };
+    const coverage = parseCoverage(args.output ?? "");
+    return coverage
+      ? { id, coverage }
+      : { id, warning: "coverage output could not be parsed (expected vitest table, JSON summary, or a percentage)" };
   }
 
   /** Close a task. Requires evidence for every declared acceptance criterion. */
@@ -457,9 +462,10 @@ export class SqliteStore implements IStore {
   }
 
   getEvidence(taskId: string) {
-    return this.db
+    const rows = this.db
       .prepare("SELECT * FROM evidence WHERE task_id=? ORDER BY created_at")
       .all(taskId) as any[];
+    return rows.map((r) => (r.kind === "coverage" ? { ...r, coverage: parseCoverage(r.output ?? "") } : r));
   }
 
   registerHelper(args: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {

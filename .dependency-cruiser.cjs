@@ -19,14 +19,14 @@ module.exports = {
       name: "not-to-server",
       severity: "error",
       comment: "server.ts sits under cli. Inner modules and the GitHub adapter must not import it.",
-      from: { path: "^src/(store|schema|policy|pstore|istore|codeindex|sweeper|github|speckit)\\.ts$" },
+      from: { path: "^src/(store|schema|policy|coverage|pstore|istore|codeindex|sweeper|github|speckit)\\.ts$" },
       to: { path: "^src/server\\.ts$" },
     },
     {
       name: "not-to-store",
       severity: "error",
       comment: "store.ts sits under server. schema and modules under the store must not import it. The GitHub adapter must not import the concrete store.",
-      from: { path: "^src/(schema|policy|istore|codeindex|github|speckit)\\.ts$" },
+      from: { path: "^src/(schema|policy|coverage|istore|codeindex|github|speckit)\\.ts$" },
       to: { path: "^src/store\\.ts$" },
     },
     {

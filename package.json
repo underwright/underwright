@@ -18,6 +18,8 @@
     "start": "node dist/cli.js serve",
     "dev": "tsc --watch",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "report:coverage": "node scripts/report-coverage.mjs",
     "test:contract": "node scripts/test-contract.mjs",
     "depcruise": "depcruise --config .dependency-cruiser.cjs src"
   },
@@ -32,6 +34,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.7.0",
+    "@vitest/coverage-v8": "^5.1.0",
     "dependency-cruiser": "^18.7.2",
     "typescript": "^5.6.0",
     "vitest": "^5.1.0"

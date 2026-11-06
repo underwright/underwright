@@ -180,13 +180,13 @@ Rules of engagement:
     summary: z.string(),
   }, async (a) => text(await store.registerHelper(a)));
 
-  server.tool("report_evidence", "Attach proof of work to a task: a test run, CI check, review, or coverage result, citing which acceptance criteria it proves.", {
+  server.tool("report_evidence", "Attach proof of work to a task: a test run, CI check, review, or coverage result, citing which acceptance criteria it proves. Coverage output is parsed into structured lines/statements/branches/functions percentages.", {
     task_id: z.string(),
     agent_id: z.string(),
     kind: z.enum(["test_run", "ci_check", "review", "coverage", "deploy", "contract_test", "security_scan", "smoke_test", "mutation"]),
     command: z.string().optional(),
     exit_code: z.number().int().optional(),
-    output: z.string().optional(),
+    output: z.string().optional().describe("raw output; for kind=coverage pass the vitest text table or coverage-summary.json"),
     ac_ids: z.array(z.string()).optional(),
   }, async (a) => text(await store.reportEvidence(a)));
 

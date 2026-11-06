@@ -2,6 +2,7 @@ import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { parseCoverage } from "./coverage.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 
@@ -392,7 +393,11 @@ export class PgStore implements IStore {
     await this.sql`INSERT INTO evidence (id, task_id, agent_id, kind, command, exit_code, output, ac_ids)
       VALUES (${id},${a.task_id},${a.agent_id},${a.kind},${a.command ?? ""},${a.exit_code ?? null},${a.output ?? ""},${this.sql.json(a.ac_ids ?? [])})`;
     await this.log("evidence", id, "reported", a.agent_id, { task_id: a.task_id, kind: a.kind });
-    return { id };
+    if (a.kind !== "coverage") return { id };
+    const coverage = parseCoverage(a.output ?? "");
+    return coverage
+      ? { id, coverage }
+      : { id, warning: "coverage output could not be parsed (expected vitest table, JSON summary, or a percentage)" };
   }
 
   async listArtifacts(taskId: string) {
@@ -400,7 +405,8 @@ export class PgStore implements IStore {
   }
 
   async getEvidence(taskId: string) {
-    return this.sql`SELECT * FROM evidence WHERE task_id=${taskId} ORDER BY created_at`;
+    const rows = await this.sql<any[]>`SELECT * FROM evidence WHERE task_id=${taskId} ORDER BY created_at`;
+    return rows.map((r) => (r.kind === "coverage" ? { ...r, coverage: parseCoverage(r.output ?? "") } : r));
   }
 
   async completeTask(taskId: string, agentId: string) {

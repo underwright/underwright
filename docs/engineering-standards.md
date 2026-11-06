@@ -33,9 +33,13 @@ applies it. Enforcement is progressive: `observe → warn → block`.
 - **Standard**: unit tests for domain logic; coverage floor on changed code
   (diff coverage ≥80%), not global vanity percentages; mutation testing on
   the policy/store core.
-- **Control plane**: `report_evidence(kind:"coverage", output:"<pct>")`;
-  DoD policy can require coverage evidence for task type `feature`.
-- **This repo**: vitest + coverage on PR; stryker later for `store.ts`.
+- **Control plane**: `report_evidence(kind:"coverage", output:"<pct-or-vitest-output>")`
+  parses into structured lines/statements/branches/functions; DoD policy
+  `min_coverage` sets numeric floors per task type (number = lines, or an
+  object of per-metric thresholds).
+- **This repo**: `npm run test:coverage` on PR uploads the `coverage` artifact;
+  `npm run report:coverage` posts it to the task linked by `uw:<task-id>` in the
+  PR body or the branch name. Stryker later for `store.ts`.
 
 ## 4. Integration & contract tests
 

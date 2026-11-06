@@ -1,5 +1,6 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { parseCoverage, checkCoverage, type CoverageRequirement, type CoverageSummary } from "./coverage.js";
 
 // Definition-of-Done policy: per task-type requirements evaluated at completion.
 // Enforcement is progressive: "observe" and "warn" annotate results; "block" refuses.
@@ -8,6 +9,7 @@ export interface DodRule {
   evidence?: string[];   // required evidence kinds
   artifacts?: string[];  // required artifact kinds
   tdd?: boolean;         // require failing test_run before passing one
+  min_coverage?: CoverageRequirement;  // number = line %, or per-metric thresholds
 }
 
 export interface AutoMergeRule {
@@ -96,6 +98,19 @@ export function evaluateDoD(args: {
   const kinds = new Set(evidence.map((e) => e.kind));
   for (const k of rule.evidence ?? []) {
     if (!kinds.has(k)) missing.push(`missing evidence kind: ${k}`);
+  }
+
+  // Numeric coverage floor: the latest coverage report must meet the threshold.
+  if (rule.min_coverage !== undefined) {
+    const summaries = evidence
+      .filter((e) => e.kind === "coverage")
+      .map((e) => (e.coverage as CoverageSummary | undefined) ?? parseCoverage(String(e.output ?? "")))
+      .filter((s): s is CoverageSummary => !!s);
+    if (!summaries.length) {
+      missing.push("missing parseable coverage evidence for min_coverage");
+    } else {
+      missing.push(...checkCoverage(summaries[summaries.length - 1], rule.min_coverage));
+    }
   }
 
   const artKinds = new Set(artifacts.map((a) => a.kind));
