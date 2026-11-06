@@ -1,0 +1,26 @@
+name: Documentation
+description: A fix or addition to docs, templates, or contributor guidance
+title: "docs: "
+labels: ["documentation", "type:docs"]
+body:
+  - type: textarea
+    id: gap
+    attributes:
+      label: What is missing or wrong
+      description: Name the page or the workflow that fails.
+    validations:
+      required: true
+  - type: textarea
+    id: change
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: input
+    id: ac-ids
+    attributes:
+      label: Acceptance criteria ids
+      description: Comma-separated ids a docs change must prove.
+      placeholder: contributing,security,templates
+    validations:
+      required: true
