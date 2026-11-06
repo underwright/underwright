@@ -247,6 +247,10 @@ async function matrix(token) {
     assert.equal(board.tasks.find(t => t.id === task_id).status, 'done');
     assert.equal(board.helpers_registered, 1);
     assert(board.job_counts.some(j => j.status === 'queued' && j.n === 1));
+    const digest = await call('digest', { since: '24h', to_agent: other, from_agent: agent }, first);
+    assert.equal(digest.sent_to, other);
+    assert(digest.counts.tasks_completed >= 1);
+    assert.match(digest.summary, new RegExp(task_id));
     const dashAfter = await (await request(dashPath)).text();
     assert.match(dashAfter, /Updated HTTP matrix/);
     assert.match(dashAfter, /queued/);

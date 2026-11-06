@@ -47,6 +47,19 @@ switch (cmd) {
     break;
   }
 
+  case "digest": {
+    // underwright digest [--since TIMESTAMP] [--to AGENT] [--from AGENT] [--text]
+    const store = await openStore(dbPath);
+    const result = await store.digest({
+      since: flag("since"),
+      to_agent: flag("to") ?? flag("to-agent"),
+      from_agent: flag("from") ?? flag("from-agent"),
+    });
+    console.log(args.includes("--text") ? result.summary : JSON.stringify(result, null, 2));
+    await store.close();
+    break;
+  }
+
   case "create": {
     // underwright create --template feature --title ... [--type T] [--ac a,b] [--spec REF]
     const title = flag("title");
@@ -177,6 +190,7 @@ Usage:
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
   underwright board              Print the task board.
+  underwright digest             Summarize board delta since --since TS [--to AGENT] [--text].
   underwright create             Create a task, optionally from a template (--template feature).
   underwright templates          List task templates (builtin + policy-defined).
   underwright speckit import     Import Spec Kit markdown (constitution/spec/plan/tasks) and link ac_ids.

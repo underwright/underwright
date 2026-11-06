@@ -63,6 +63,7 @@ underwright serve              # MCP server over stdio (local agent)
 underwright serve --http H:P   # shared MCP over HTTP (/mcp) — multi-machine
 underwright run                # execute queued jobs locally
 underwright board              # print the task board
+underwright digest --since 24h # standup summary of board delta [--to AGENT] [--text]
 underwright create --template feature --title "Add search"   # create a task from a template
 underwright templates          # list builtin + policy-defined templates
 underwright speckit import --path .specify --task TASK_ID    # import Spec Kit docs & link ac_ids
@@ -127,6 +128,7 @@ git push origin main --follow-tags
 | Tool | Purpose |
 |---|---|
 | `board` | Task board: statuses, claim holders, job counts |
+| `digest` | Summarize board delta since a timestamp (`--since`, optional `to_agent` mailbox delivery) |
 | `create_task` / `list_tasks` / `get_task` | Task lifecycle |
 | `list_templates` | Builtin + policy-defined task templates (AC scaffold, DoR checklist) |
 | `claim_task` / `release_task` / `renew_lease` | Atomic claims with expiring leases |
@@ -272,3 +274,25 @@ WantedBy=default.target
 
 Runners execute commands with the host user's permissions. Use the existing
 bearer-token HTTP authentication and TLS setup when connecting across hosts.
+
+### Cross-machine digest & human webhook notifications
+
+Summarize board activity since a timestamp (ISO8601 or relative shorthand like `24h`, `30m`, `7d`) from the CLI or the `digest` MCP tool, and optionally deliver the standup summary into an agent's mailbox:
+
+```bash
+underwright digest --since 24h --to lead@laptop --text
+```
+
+To push real-time notifications to Slack, Discord, or any generic webhook when tasks are completed or expired claims are reclaimed, configure `human_notify` (or `human-notify` / `notifications`) in `underwright.policy.json`:
+
+```json
+{
+  "human_notify": {
+    "enabled": true,
+    "webhook_url": "https://hooks.slack.com/services/T000/B000/X000",
+    "events": ["task_completed", "claim_reclaimed"]
+  }
+}
+```
+
+Each POST sends JSON containing `text` (Slack), `content` (Discord), and structured fields (`event`, `task_id`, `title`, `agent_id`, `timestamp`).

@@ -33,6 +33,12 @@ Rules of engagement:
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
     async () => text(await store.board()));
 
+  server.tool("digest", "Summarize board delta since a timestamp (standup digest) and optionally send the summary to an agent's mailbox.", {
+    since: z.string().optional().describe("ISO8601 timestamp or relative window like 24h, 30m (default: 24h ago)"),
+    to_agent: z.string().optional().describe("if set, send the formatted digest summary to this agent's mailbox"),
+    from_agent: z.string().optional().describe("sender agent id when to_agent is set (default: underwright)"),
+  }, async (a) => text(await store.digest(a)));
+
   server.tool("create_task", "Create a task on the board. Reference the spec and list its acceptance criterion ids.", {
     title: z.string(),
     description: z.string().optional(),

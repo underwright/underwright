@@ -27,6 +27,43 @@ export interface SubmitJobArgs {
   host?: string; target_agent_id?: string; agent?: AgentJobSpec;
 }
 
+export interface DigestArgs {
+  since?: string;
+  to_agent?: string;
+  to?: string;
+  from_agent?: string;
+}
+
+export interface DigestResult {
+  since: string;
+  generated_at: string;
+  counts: {
+    tasks_created: number;
+    tasks_completed: number;
+    tasks_claimed: number;
+    tasks_released: number;
+    claims_reclaimed: number;
+    tasks_unblocked: number;
+    jobs_submitted: number;
+    jobs_finished: number;
+    artifacts_posted: number;
+    evidence_reported: number;
+    messages_sent: number;
+    total_events: number;
+  };
+  tasks_created: { id: string; title: string; actor: string; created_at: string }[];
+  tasks_completed: { id: string; title: string; actor: string; created_at: string }[];
+  tasks_claimed: { id: string; title: string; actor: string; created_at: string }[];
+  tasks_released: { id: string; title: string; actor: string; created_at: string }[];
+  claims_reclaimed: { id: string; title: string; agent_id: string; reopened: boolean; created_at: string }[];
+  tasks_unblocked: { id: string; title: string; actor: string; blocker_id?: string; created_at: string }[];
+  active_claims: { task_id: string; title: string; agent_id: string; lease_expires: string }[];
+  board_totals: { open: number; claimed: number; in_review: number; blocked: number; done: number; total: number };
+  events: any[];
+  summary: string;
+  sent_to: string | null;
+}
+
 export interface IStore {
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
@@ -72,6 +109,7 @@ export interface IStore {
   renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
+  digest(args?: string | DigestArgs): Awaitable<DigestResult>;
   dashboard(eventsLimit?: number): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;
   close(): Awaitable<void>;

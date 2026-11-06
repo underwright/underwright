@@ -4,8 +4,9 @@ import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
+import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -363,14 +364,16 @@ export class PgStore implements IStore {
   }
 
   async sweepExpiredClaims() {
-    return this.sql.begin(async sql => {
+    const { reclaimed, notifications } = await this.sql.begin(async sql => {
       // DELETE locks the expired rows: a concurrent renewal/reclaim is checked
       // before deletion, and another sweeper cannot publish the same expiry.
       const expired = await sql`DELETE FROM claims WHERE lease_expires <= now() RETURNING *`;
+      const notes: { task_id: string; title: string; agent_id: string; reopened: boolean; lease_expires: string | Date }[] = [];
       for (const claim of expired) {
         const reopened = await sql`
           UPDATE tasks SET status='open', updated_at=now()
           WHERE id=${claim.task_id} AND status='claimed' RETURNING id`;
+        const [taskRow] = await sql<{ title: string }[]>`SELECT title FROM tasks WHERE id=${claim.task_id}`;
         await sql`
           INSERT INTO events (entity_type, entity_id, action, actor, data)
           VALUES ('task',${claim.task_id},'lease_expired','lease-sweeper',
@@ -379,9 +382,23 @@ export class PgStore implements IStore {
         await sql`
           INSERT INTO messages (to_agent, from_agent, task_id, body)
           SELECT agent_id, 'underwright', task_id, ${body} FROM watches WHERE task_id=${claim.task_id}`;
+        notes.push({
+          task_id: claim.task_id as string,
+          title: taskRow?.title ?? "",
+          agent_id: claim.agent_id as string,
+          reopened: reopened.length > 0,
+          lease_expires: claim.lease_expires,
+        });
       }
-      return { reclaimed: expired.map(claim => claim.task_id as string) };
+      return { reclaimed: expired.map(claim => claim.task_id as string), notifications: notes };
     });
+    if (notifications.length > 0) {
+      const policy = loadPolicy();
+      for (const n of notifications) {
+        await sendHumanNotification({ event: "claim_reclaimed", ...n }, policy);
+      }
+    }
+    return { reclaimed };
   }
 
   async postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
@@ -419,7 +436,13 @@ export class PgStore implements IStore {
   }
 
   async completeTask(taskId: string, agentId: string) {
-    return this.dependencyTransaction(store => store.completeTaskAtomic(taskId, agentId));
+    const res = await this.dependencyTransaction(store => store.completeTaskAtomic(taskId, agentId));
+    if (res && res._notify) {
+      const { _notify, ...publicRes } = res;
+      await sendHumanNotification(_notify, loadPolicy());
+      return publicRes;
+    }
+    return res;
   }
 
   private async completeTaskAtomic(taskId: string, agentId: string) {
@@ -455,7 +478,17 @@ export class PgStore implements IStore {
     await this.notifyWatchers(taskId, `task ${taskId} → done`);
     await this.unblockDependents(taskId, agentId);
     const dispatched = await this.dispatchNext(agentId, taskId, "complete");
-    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}), ...(dispatched ? { dispatched } : {}) };
+    return {
+      completed: taskId,
+      ...(dod.missing.length ? { warnings: dod.missing } : {}),
+      ...(dispatched ? { dispatched } : {}),
+      _notify: {
+        event: "task_completed" as const,
+        task_id: taskId,
+        title: String(task.title ?? ""),
+        agent_id: agentId,
+      },
+    };
   }
 
   private async dispatchNext(agentId: string, excludeTaskId: string, trigger: "complete" | "release") {
@@ -689,6 +722,22 @@ export class PgStore implements IStore {
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;
     return { tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))), job_counts, helpers_registered: n };
+  }
+
+  async digest(sinceOrArgs?: string | DigestArgs): Promise<DigestResult> {
+    const args = normalizeDigestArgs(sinceOrArgs);
+    const board = await this.board();
+    const events = await this.sql`SELECT * FROM events ORDER BY id ASC`;
+    const built = buildDigest({
+      since: args.since,
+      tasks: board.tasks,
+      events,
+    });
+    const recipient = (args.to_agent ?? args.to)?.trim() || null;
+    if (recipient) {
+      await this.sendMessage(recipient, args.from_agent ?? "underwright", built.summary);
+    }
+    return { ...built, sent_to: recipient };
   }
 
   async sendMessage(to: string, from: string, body: string, taskId?: string) {
