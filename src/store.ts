@@ -96,13 +96,13 @@ export class SqliteStore implements IStore {
     }
   }
 
-  private notifyWatchers(taskId: string, body: string) {
+  notifyWatchers(taskId: string, body: string) {
     const watchers = this.db.prepare("SELECT agent_id FROM watches WHERE task_id=?").all(taskId) as any[];
     const stmt = this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)");
     for (const w of watchers) stmt.run(w.agent_id, "underwright", taskId, body);
   }
 
-  private log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
+  log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
     this.db
       .prepare("INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES (?,?,?,?,?)")
       .run(entityType, entityId, action, actor, JSON.stringify(data));
