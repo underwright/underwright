@@ -21,6 +21,19 @@ agent working in this repo, follow these rules — they are not suggestions.
    attach real output.
 6. **Long work goes to the queue.** `submit_job` for test suites, builds, and
    anything slow. Don't block your context waiting on processes.
+7. **Work the board until idle.** The loop is: complete the task, read
+   `inbox`, claim the assigned task, repeat until the board is empty.
+   A message `your next task: <id>` is the assignment. The dispatcher
+   claims it for your `agent_id` when you are under the policy cap. If
+   you do not hold that claim, `claim_task` it yourself. Stop when no
+   next-task message arrives — you are idle.
+
+Dispatcher policy lives in `underwright.policy.json` under `dispatcher`.
+`enabled` turns assignment on or off. `max_tasks_per_agent` caps how many
+tasks one agent is given (completions plus active claims; `0` means no cap).
+`idle_minutes` is how long a next-task message may sit before the sweeper
+reassigns that task if it is still unclaimed, or logs `dispatch_idle` when
+nobody else can take it.
 
 ## Stack
 

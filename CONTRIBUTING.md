@@ -46,7 +46,8 @@ version, which does not replace that file:
 4. Coordinate through `post_artifact` on the task. Do not use a side channel
    as the record.
 5. `complete_task` refuses until `report_evidence` cites every `ac_id`.
-   Attach real command output.
+   Attach real command output. Then read `inbox` and work the board until idle:
+   claim the task named in `your next task: <id>` and repeat until none arrives.
 6. Put slow builds and test suites on `submit_job` instead of blocking the
    session on them.
 

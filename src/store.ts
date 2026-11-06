@@ -1,7 +1,8 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
+import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
@@ -346,13 +347,16 @@ export class SqliteStore implements IStore {
   }
 
   releaseTask(taskId: string, agentId: string) {
-    const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id = ?").get(taskId) as any;
-    if (!claim) return { error: `task ${taskId} is not claimed` };
-    if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
-    this.db.prepare("DELETE FROM claims WHERE task_id = ?").run(taskId);
-    this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=?").run(taskId);
-    this.log("task", taskId, "released", agentId);
-    return { released: taskId };
+    return this.db.transaction(() => {
+      const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id = ?").get(taskId) as any;
+      if (!claim) return { error: `task ${taskId} is not claimed` };
+      if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
+      this.db.prepare("DELETE FROM claims WHERE task_id = ?").run(taskId);
+      this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=?").run(taskId);
+      this.log("task", taskId, "released", agentId);
+      const dispatched = this.dispatchNext(agentId, taskId, "release");
+      return { released: taskId, ...(dispatched ? { dispatched } : {}) };
+    }).immediate();
   }
 
   renewLease(taskId: string, agentId: string, ttlSeconds = 1800) {
@@ -449,7 +453,143 @@ export class SqliteStore implements IStore {
     this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     this.notifyWatchers(taskId, `task ${taskId} → done`);
     this.unblockDependents(taskId, agentId);
-    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
+    const dispatched = this.dispatchNext(agentId, taskId, "complete");
+    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}), ...(dispatched ? { dispatched } : {}) };
+  }
+
+  /** Assign the next open, unblocked task to the agent who just finished one. */
+  private dispatchNext(agentId: string, excludeTaskId: string, trigger: "complete" | "release") {
+    const policy = getDispatcherPolicy(loadPolicy());
+    if (!policy.enabled) return null;
+    const workload = this.agentWorkload(agentId);
+    if (overCap(workload, policy.max_tasks_per_agent)) {
+      this.log("task", excludeTaskId, "dispatch_capped", DISPATCHER_AGENT, {
+        agent_id: agentId, workload, max: policy.max_tasks_per_agent, trigger,
+      });
+      return null;
+    }
+    for (const taskId of this.dispatchCandidates(excludeTaskId)) {
+      const claimed = this.claimTaskAtomic(taskId, agentId) as { error?: string };
+      if (claimed.error) continue;
+      this.sendMessage(agentId, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
+      this.log("task", taskId, "dispatched", DISPATCHER_AGENT, { agent_id: agentId, trigger, from_task: excludeTaskId });
+      return { task_id: taskId, agent_id: agentId };
+    }
+    return null;
+  }
+
+  private agentWorkload(agentId: string) {
+    const claims = (this.db.prepare("SELECT COUNT(*) AS n FROM claims WHERE agent_id=?").get(agentId) as any).n as number;
+    const done = (this.db.prepare(
+      "SELECT COUNT(DISTINCT entity_id) AS n FROM events WHERE entity_type='task' AND action='completed' AND actor=?"
+    ).get(agentId) as any).n as number;
+    return Number(claims) + Number(done);
+  }
+
+  private dispatchCandidates(excludeTaskId: string) {
+    const now = new Date().toISOString();
+    const rows = this.db.prepare(`
+      SELECT t.id FROM tasks t
+      WHERE t.status = 'open' AND t.id <> ?
+        AND NOT EXISTS (
+          SELECT 1 FROM task_dependencies d
+          JOIN tasks b ON b.id = d.blocker_id
+          WHERE d.task_id = t.id AND b.status <> 'done'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM claims c WHERE c.task_id = t.id AND c.lease_expires > ?
+        )
+      ORDER BY t.priority ASC, t.created_at ASC, t.id ASC
+    `).all(excludeTaskId, now) as { id: string }[];
+    return rows.map((row) => row.id);
+  }
+
+  private staleNextTasks(idleMinutes: number) {
+    const rows = this.db.prepare(`
+      SELECT id, to_agent, task_id, body FROM messages
+      WHERE from_agent = ?
+        AND body LIKE 'your next task: %'
+        AND created_at <= datetime('now', ?)
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.entity_type = 'message'
+            AND e.entity_id = CAST(messages.id AS TEXT)
+            AND e.action IN ('dispatch_idle', 'reassigned')
+        )
+      ORDER BY id
+    `).all(DISPATCHER_AGENT, `-${idleMinutes} minutes`) as any[];
+    return rows.flatMap((row) => {
+      const taskId = (row.task_id as string | null) || taskIdFromNextTaskMessage(row.body);
+      if (!taskId) return [];
+      return [{ messageId: String(row.id), assignee: row.to_agent as string, taskId }];
+    });
+  }
+
+  private rawClaim(taskId: string) {
+    const row = this.db.prepare(`
+      SELECT t.status AS status, c.agent_id AS claim_agent, c.lease_expires AS lease_expires
+      FROM tasks t LEFT JOIN claims c ON c.task_id = t.id WHERE t.id = ?
+    `).get(taskId) as any;
+    if (!row) return null;
+    return {
+      status: row.status as string,
+      claimAgent: (row.claim_agent ?? null) as string | null,
+      leaseExpires: row.lease_expires ?? null,
+    };
+  }
+
+  private knownAgentWorkloads() {
+    const rows = this.db.prepare(`
+      SELECT DISTINCT actor AS id FROM events
+      WHERE entity_type = 'task' AND action IN ('claimed', 'completed', 'released')
+    `).all() as { id: string }[];
+    return rows
+      .filter((row) => row.id && !isSystemActor(row.id))
+      .map((row) => ({ id: row.id, workload: this.agentWorkload(row.id) }));
+  }
+
+  /** Mailbox "your next task" older than idle_minutes, task no longer held → reassign or log once. */
+  sweepIdleDispatches() {
+    const policy = getDispatcherPolicy(loadPolicy());
+    if (!policy.enabled) return { reassigned: [], logged: [] };
+    return this.db.transaction(() => this.sweepIdleAtomic(policy)).immediate();
+  }
+
+  private sweepIdleAtomic(policy: DispatcherPolicy) {
+    const reassigned: string[] = [];
+    const logged: string[] = [];
+    for (const row of this.staleNextTasks(policy.idle_minutes)) {
+      const task = this.rawClaim(row.taskId);
+      const mark = (reason: string, extra: object = {}) => {
+        this.log("message", row.messageId, "dispatch_idle", DISPATCHER_AGENT, {
+          task_id: row.taskId, agent_id: row.assignee, reason, ...extra,
+        });
+        logged.push(row.taskId);
+      };
+      if (!task) { mark("missing_task"); continue; }
+      if (leaseActive(task.leaseExpires) && task.claimAgent) continue;
+      if (task.status !== "open" && task.status !== "claimed") {
+        mark("not_open", { status: task.status });
+        continue;
+      }
+      const next = chooseReassignAgent({
+        assignee: row.assignee,
+        agents: this.knownAgentWorkloads(),
+        max: policy.max_tasks_per_agent,
+      });
+      if (!next) { mark("no_alternate_agent"); continue; }
+      const claimed = this.claimTaskAtomic(row.taskId, next) as { error?: string };
+      if (claimed.error) { mark("claim_failed", { error: claimed.error }); continue; }
+      this.sendMessage(next, DISPATCHER_AGENT, nextTaskMessage(row.taskId), row.taskId);
+      this.log("message", row.messageId, "reassigned", DISPATCHER_AGENT, {
+        task_id: row.taskId, from: row.assignee, to: next,
+      });
+      this.log("task", row.taskId, "dispatched", DISPATCHER_AGENT, {
+        agent_id: next, trigger: "idle_sweep", from_agent: row.assignee,
+      });
+      reassigned.push(row.taskId);
+    }
+    return { reassigned, logged };
   }
 
   listArtifacts(taskId: string) {

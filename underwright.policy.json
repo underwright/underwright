@@ -14,5 +14,10 @@
     "require_ac_ids": true,
     "require_estimate": true,
     "require_description": false
+  },
+  "dispatcher": {
+    "enabled": true,
+    "max_tasks_per_agent": 0,
+    "idle_minutes": 15
   }
 }

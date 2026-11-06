@@ -16,11 +16,27 @@ export interface AutoMergeRule {
   delete_branch?: boolean;
 }
 
+/** Micro-manager. Absent or enabled:false leaves complete/release unchanged. */
+export interface DispatcherRule {
+  enabled?: boolean;
+  /** Completions by the agent plus their active claims. 0 or omitted means no cap. */
+  max_tasks_per_agent?: number;
+  /** How long a "your next task" message may sit while that task is unclaimed. */
+  idle_minutes?: number;
+}
+
+export interface DispatcherPolicy {
+  enabled: boolean;
+  max_tasks_per_agent: number;
+  idle_minutes: number;
+}
+
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
   templates?: TaskTemplate[];
   automerge?: boolean | string[] | Record<string, boolean | AutoMergeRule>;
+  dispatcher?: DispatcherRule;
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -48,6 +64,21 @@ export function getAutoMergePolicy(
     }
   }
   return def;
+}
+
+/** Missing block stays off so callers that ship no policy do not auto-assign. */
+export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPolicy {
+  const raw = policy.dispatcher;
+  if (!raw || typeof raw !== "object") {
+    return { enabled: false, max_tasks_per_agent: 0, idle_minutes: 15 };
+  }
+  const max = Number(raw.max_tasks_per_agent);
+  const idle = Number(raw.idle_minutes);
+  return {
+    enabled: raw.enabled === true,
+    max_tasks_per_agent: Number.isFinite(max) && max > 0 ? Math.floor(max) : 0,
+    idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
+  };
 }
 
 export function loadPolicy(path?: string): Policy {

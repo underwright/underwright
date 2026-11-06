@@ -339,19 +339,28 @@ clients do not need the server build locally; they need the URL and the token.
 
 Run these from the checkout, with `UNDERWRIGHT_TOKEN` exported and the HTTP
 server configured for that harness. The prompt carries the `agent_id` and
-points at `AGENTS.md`. The harness still has to follow it: call `board`,
-claim, then work.
+points at `AGENTS.md`. The harness works the board until idle: call `board`,
+claim, implement, report evidence, complete, then read `inbox` and claim the
+assigned task. A message `your next task: <id>` is that assignment. Repeat
+until no next task arrives.
+
+The same line belongs on a fleet agent job. The runner does not claim the
+task; the launched harness does, then keeps going:
+
+```json
+"prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md and work the board until idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}."
+```
 
 ```bash
-claude -p "You are claude@minipc. Read AGENTS.md and follow it. Call board before editing."
+claude -p "You are claude@minipc. Read AGENTS.md and follow it. Work the board until idle."
 
-codex exec "You are codex@laptop-2. Read AGENTS.md and follow it. Call board before editing."
+codex exec "You are codex@laptop-2. Read AGENTS.md and follow it. Work the board until idle."
 
-grok --single "You are grok@alandesktop. Read AGENTS.md and follow it. Call board before editing."
+grok --single "You are grok@alandesktop. Read AGENTS.md and follow it. Work the board until idle."
 
-cmdc -p --yolo "You are cmdc@winbox. Read AGENTS.md and follow it. Call board before editing."
+cmdc -p --yolo "You are cmdc@winbox. Read AGENTS.md and follow it. Work the board until idle."
 
-agy --print "You are agy@alandesktop. Read AGENTS.md and follow it. Call board before editing."
+agy --print "You are agy@alandesktop. Read AGENTS.md and follow it. Work the board until idle."
 ```
 
 `claude -p` is Claude Code's non-interactive print mode.
