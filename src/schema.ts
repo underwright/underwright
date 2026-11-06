@@ -1,5 +1,15 @@
 // Underwright control-plane schema. Local-first: one SQLite file per workspace.
 // Portable edge DDL used by both backends and applied on existing databases.
+
+/** Artifact kinds. `blocked` is an escalation record, not a dependency edge. */
+export const ARTIFACT_KINDS = ["spec", "design", "handoff", "note", "review", "blocked"] as const;
+
+export const ARTIFACT_KIND_SQL = ARTIFACT_KINDS.map((kind) => `'${kind}'`).join(",");
+
+export function isArtifactKind(kind: string): boolean {
+  return (ARTIFACT_KINDS as readonly string[]).includes(kind);
+}
+
 export const TASK_DEPENDENCIES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -65,7 +75,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   id          TEXT PRIMARY KEY,
   task_id     TEXT REFERENCES tasks(id),
   agent_id    TEXT NOT NULL,
-  kind        TEXT NOT NULL CHECK (kind IN ('spec','design','handoff','note','review')),
+  kind        TEXT NOT NULL CHECK (kind IN (${ARTIFACT_KIND_SQL})),
   title       TEXT NOT NULL DEFAULT '',
   content     TEXT NOT NULL,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -176,4 +186,22 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS agent_spec TEXT;
 UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL;
+`;
+
+// Widen artifacts.kind on databases created before the blocked escalation kind.
+export const PG_ARTIFACTS_MIGRATION = `
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN
+    SELECT con.conname
+    FROM pg_constraint con
+    JOIN pg_class rel ON rel.oid = con.conrelid
+    WHERE rel.relname = 'artifacts' AND con.contype = 'c'
+      AND pg_get_constraintdef(con.oid) ILIKE '%kind%'
+  LOOP
+    EXECUTE format('ALTER TABLE artifacts DROP CONSTRAINT %I', r.conname);
+  END LOOP;
+END $$;
+ALTER TABLE artifacts ADD CONSTRAINT artifacts_kind_check CHECK (kind IN (${ARTIFACT_KIND_SQL}));
 `;

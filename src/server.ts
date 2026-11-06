@@ -27,7 +27,8 @@ Rules of engagement:
 3. Coordinate through artifacts posted to tasks, never through side channels.
 4. Done requires evidence: report_evidence citing the task's acceptance criteria before complete_task.
 5. Prefer submit_job for long-running work (tests, builds) over running it in-context.
-6. Work the board until idle. After complete_task or release_task, read inbox. A message "your next task: <id>" is your assignment — claim it if you do not hold it, then repeat until no next task arrives.` }
+6. Work the board until idle. After complete_task or release_task, read inbox. A message "your next task: <id>" is your assignment — claim it if you do not hold it, then repeat until no next task arrives.
+7. Anti-escalation: before asking a human, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact with kind "blocked" recording what was tried, send_message to the human, release_task, then read inbox and take the next dispatcher assignment. Do not go idle and do not stop silently.` }
   );
 
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
@@ -122,10 +123,10 @@ Rules of engagement:
     agent_id: z.string(), task_id: z.string(),
   }, async (a) => text(await store.watchTask(a.agent_id, a.task_id)));
 
-  server.tool("post_artifact", "Post a durable artifact (spec, design, handoff, note, review) — the only inter-agent communication channel.", {
+  server.tool("post_artifact", "Post a durable artifact (spec, design, handoff, note, review, blocked) — the only inter-agent communication channel. kind blocked records an escalation after self-recovery fails.", {
     task_id: z.string().optional(),
     agent_id: z.string(),
-    kind: z.enum(["spec", "design", "handoff", "note", "review"]),
+    kind: z.enum(["spec", "design", "handoff", "note", "review", "blocked"]),
     title: z.string().optional(),
     content: z.string(),
   }, async (a) => text(await store.postArtifact(a)));

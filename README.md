@@ -130,7 +130,7 @@ git push origin main --follow-tags
 | `create_task` / `list_tasks` / `get_task` | Task lifecycle |
 | `list_templates` | Builtin + policy-defined task templates (AC scaffold, DoR checklist) |
 | `claim_task` / `release_task` / `renew_lease` | Atomic claims with expiring leases |
-| `post_artifact` | Specs, designs, handoffs, reviews — durable, searchable |
+| `post_artifact` | Specs, designs, handoffs, reviews, and blocked escalations — durable, searchable |
 | `import_speckit` | Import Spec Kit `constitution.md`/`spec.md`/`plan.md`/`tasks.md` as spec artifacts and link `ac_ids` |
 | `search_context` | FTS over helpers + artifacts — call before writing shared code |
 | `register_helper` | Publish a reusable util/pattern/config |
@@ -234,7 +234,7 @@ Agent jobs pass a prompt directly to a harness CLI without shell expansion:
   "agent": {
     "executable": "codex",
     "args": ["exec", "{{prompt}}"],
-    "prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md and work the board until idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}."
+    "prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md strictly and work the board until idle. Before escalating, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact kind=blocked with what was tried, send_message to the human, then release_task and read inbox for your next task — do not idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}."
   }
 }
 ```
