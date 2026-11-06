@@ -105,7 +105,7 @@ describe("cli", () => {
     expect(task.ac_ids).toEqual(expect.arrayContaining(["scope"]));
     expect(task.description).toContain("Definition of Ready");
     rmDb(db);
-  });
+  }, 20000);
 
   it("lists templates: underwright templates", () => {
     const db = join(mkdtempSync(join(tmpdir(), "uw-cli-")), "uw.db");

@@ -33,7 +33,8 @@ describe("dashboard data", () => {
     const t = store.createTask({ title: "x", ac_ids: ["a"], type: "triage", estimate: "S" });
     store.claimResources(["expired.ts"], "agent-A", t.id, -1);
     const job = store.submitJob({ agent_id: "agent-A", task_id: t.id, type: "test", command: "true" });
-    store.finishJob(job.id, "done", "ok");
+    const leased = store.nextJob("runner-A");
+    store.finishJob(leased.id, "done", "ok", "runner-A", leased.lease_token);
 
     const d = store.dashboard();
     expect(d.locks).toEqual([]);

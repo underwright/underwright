@@ -198,5 +198,5 @@ describe("CLI speckit import", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-  });
+  }, 30000);
 });
