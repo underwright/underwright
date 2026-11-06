@@ -6,8 +6,9 @@ import {
   postEvidenceComment,
   linkPR,
   evidencePack,
+  autoMergePR,
 } from "../src/github.js";
-import { rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 
 const DB = "/tmp/uw-test-github.db";
 let store: SqliteStore;
@@ -237,5 +238,272 @@ describe("evidence-comment: postEvidenceComment", () => {
     // Check evidence-comment was proven
     const completion = store.completeTask("task-comm-1", "agent-1");
     expect(completion).toHaveProperty("completed", "task-comm-1");
+  });
+});
+
+describe("automerge: PR green + independent review -> merge to main", () => {
+  const greenRollup = {
+    statusCheckRollup: [
+      {
+        __typename: "CheckRun",
+        name: "test",
+        status: "COMPLETED",
+        conclusion: "SUCCESS",
+        detailsUrl: "https://ci/test",
+      },
+      {
+        __typename: "CheckRun",
+        name: "build",
+        status: "COMPLETED",
+        conclusion: "SUCCESS",
+        detailsUrl: "https://ci/build",
+      },
+    ],
+  };
+
+  function usePolicy(pol: object) {
+    const dir = mkdtempSync("/tmp/uw-automerge-pol-");
+    const file = `${dir}/policy.json`;
+    writeFileSync(file, JSON.stringify(pol));
+    process.env.UNDERWRIGHT_POLICY = file;
+    return dir;
+  }
+
+  it("policy: skips automerge unless repo is opted in via policy file", async () => {
+    const dir = usePolicy({ automerge: { "other/repo": true } });
+    try {
+      const task = store.createTask({
+        id: "task-am-skip",
+        title: "Unopted repo PR",
+        spec_ref: "https://github.com/org/repo/pull/70",
+      });
+      store.claimTask(task.id, "agent-author");
+      store.reportEvidence({ task_id: task.id, agent_id: "agent-reviewer", kind: "review", exit_code: 0 });
+
+      const cmds: string[] = [];
+      const runner = (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.startsWith("pr list")) {
+          return [{
+            number: 70,
+            title: "Unopted PR",
+            body: "uw:task-am-skip",
+            url: "https://github.com/org/repo/pull/70",
+            state: "OPEN",
+            labels: [],
+            headRefName: "feat/am-skip",
+          }];
+        }
+        return greenRollup;
+      };
+
+      const res = await syncPRs(store, "org/repo", "automerge-bot", { runner });
+      expect(res.merged).toEqual([]);
+      expect(cmds.some((c) => c.startsWith("pr merge"))).toBe(false);
+      expect(store.getTask(task.id).status).toBe("claimed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("automerge & policy: merges via gh when checks green and independent review exists, recording audit event", async () => {
+    const dir = usePolicy({
+      automerge: {
+        "org/repo": { enabled: true, method: "squash", delete_branch: true },
+      },
+    });
+    try {
+      const task = store.createTask({
+        id: "task-am-pass",
+        title: "Ready to merge",
+        ac_ids: ["automerge"],
+      });
+      store.claimTask(task.id, "agent-author");
+      store.reportEvidence({
+        task_id: task.id,
+        agent_id: "agent-author",
+        kind: "test_run",
+        command: "npm test",
+        exit_code: 0,
+      });
+      store.reportEvidence({
+        task_id: task.id,
+        agent_id: "agent-reviewer",
+        kind: "review",
+        output: "LGTM",
+        exit_code: 0,
+      });
+
+      const cmds: string[] = [];
+      const runner = (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.startsWith("pr list")) {
+          return [{
+            number: 71,
+            title: "Auto-merge ready PR",
+            body: "Implements feature\n\nuw:task-am-pass",
+            url: "https://github.com/org/repo/pull/71",
+            state: "OPEN",
+            labels: [],
+            headRefName: "feat/am-pass",
+          }];
+        }
+        if (cmd.includes("pr view 71")) return greenRollup;
+        if (cmd.startsWith("pr merge 71")) return "Merged PR #71";
+        throw new Error(`Unexpected command: ${cmd}`);
+      };
+
+      const res = await syncPRs(store, "org/repo", "automerge-bot", { runner });
+      expect(res.merged).toEqual([{ taskId: "task-am-pass", pr: 71 }]);
+      expect(cmds).toContain("pr merge 71 --repo org/repo --squash --delete-branch");
+      expect(store.getTask("task-am-pass").status).toBe("done");
+
+      const events = store.auditLog(50).filter((e: any) => e.entity_id === "task-am-pass" && e.action === "automerge");
+      expect(events).toHaveLength(1);
+      expect(events[0].actor).toBe("automerge-bot");
+      const data = typeof events[0].data === "string" ? JSON.parse(events[0].data) : events[0].data;
+      expect(data).toMatchObject({
+        repo: "org/repo",
+        pr: 71,
+        method: "squash",
+        merged_by: "automerge-bot",
+        reviewer: "agent-reviewer",
+        author: "agent-author",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("automerge: refuses to merge on self-review or missing review or failing checks", async () => {
+    const dir = usePolicy({ automerge: { "org/repo": true } });
+    try {
+      const task = store.createTask({
+        id: "task-am-self",
+        title: "Self-reviewed PR",
+        spec_ref: "https://github.com/org/repo/pull/72",
+      });
+      store.claimTask(task.id, "agent-author");
+      // Self-review from the same agent_id as claim holder
+      store.reportEvidence({
+        task_id: task.id,
+        agent_id: "agent-author",
+        kind: "review",
+        output: "Self LGTM",
+        exit_code: 0,
+      });
+
+      const cmds: string[] = [];
+      const runner = (cmd: string) => {
+        cmds.push(cmd);
+        if (cmd.includes("pr view 72")) return greenRollup;
+        throw new Error(`Unexpected command: ${cmd}`);
+      };
+
+      const resSelf = await autoMergePR(store, "org/repo", "task-am-self", {
+        actor: "automerge-bot",
+        runner,
+      });
+      expect(resSelf.merged).toBe(false);
+      expect(resSelf.reason).toBe("self_review");
+      expect(cmds.some((c) => c.startsWith("pr merge"))).toBe(false);
+
+      // Now add independent review, but make CI checks fail
+      store.reportEvidence({
+        task_id: task.id,
+        agent_id: "agent-reviewer",
+        kind: "review",
+        output: "Independent LGTM",
+        exit_code: 0,
+      });
+      const resFailChecks = await autoMergePR(store, "org/repo", "task-am-self", {
+        actor: "automerge-bot",
+        runner: (cmd: string) => {
+          if (cmd.includes("pr view 72")) {
+            return {
+              statusCheckRollup: [
+                { __typename: "CheckRun", name: "test", status: "COMPLETED", conclusion: "FAILURE" },
+              ],
+            };
+          }
+          throw new Error(`Unexpected command: ${cmd}`);
+        },
+      });
+      expect(resFailChecks.merged).toBe(false);
+      expect(resFailChecks.reason).toBe("checks_not_green");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("conflict-handling: on merge conflict, comments on PR, notifies watchers, and leaves task to agent", async () => {
+    const dir = usePolicy({ automerge: { "org/repo": true } });
+    try {
+      const task = store.createTask({
+        id: "task-am-conflict",
+        title: "Conflicting PR",
+      });
+      store.claimTask(task.id, "agent-author");
+      store.watchTask("watcher-1", task.id);
+      store.watchTask("agent-author", task.id);
+      store.reportEvidence({
+        task_id: task.id,
+        agent_id: "agent-reviewer",
+        kind: "review",
+        output: "Approved",
+        exit_code: 0,
+      });
+
+      let commentCmd = "";
+      let commentBody = "";
+      const runner = (cmd: string, input?: string) => {
+        if (cmd.startsWith("pr list")) {
+          return [{
+            number: 73,
+            title: "Conflicting PR",
+            body: "uw:task-am-conflict",
+            url: "https://github.com/org/repo/pull/73",
+            state: "OPEN",
+            labels: [],
+            headRefName: "feat/am-conflict",
+          }];
+        }
+        if (cmd.includes("pr view 73")) return greenRollup;
+        if (cmd.startsWith("pr merge 73")) {
+          throw new Error("GraphQL: Pull Request is not mergeable: merge conflict (mergePullRequest)");
+        }
+        if (cmd.startsWith("pr comment 73")) {
+          commentCmd = cmd;
+          commentBody = input ?? "";
+          return "";
+        }
+        throw new Error(`Unexpected command: ${cmd}`);
+      };
+
+      const res = await syncPRs(store, "org/repo", "automerge-bot", { runner });
+      expect(res.merged).toEqual([]);
+      expect(res.conflicts).toEqual([{ taskId: "task-am-conflict", pr: 73 }]);
+
+      // Commented on PR
+      expect(commentCmd).toContain("pr comment 73 --repo org/repo");
+      expect(commentBody).toMatch(/conflict/i);
+
+      // Notified task watchers
+      const watcherMsgs = store.inbox("watcher-1");
+      expect(watcherMsgs).toHaveLength(1);
+      expect(watcherMsgs[0].body).toMatch(/conflict/i);
+      expect(watcherMsgs[0].body).toContain("73");
+
+      const authorMsgs = store.inbox("agent-author");
+      expect(authorMsgs).toHaveLength(1);
+      expect(authorMsgs[0].body).toMatch(/conflict/i);
+
+      // Left to agent: still claimed by agent-author, not marked done
+      const updated = store.getTask("task-am-conflict");
+      expect(updated.status).toBe("claimed");
+      expect(updated.claim?.agent_id).toBe("agent-author");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

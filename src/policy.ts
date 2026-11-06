@@ -10,13 +10,45 @@ export interface DodRule {
   tdd?: boolean;         // require failing test_run before passing one
 }
 
+export interface AutoMergeRule {
+  enabled?: boolean;
+  method?: "merge" | "squash" | "rebase";
+  delete_branch?: boolean;
+}
+
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
   templates?: TaskTemplate[];
+  automerge?: boolean | string[] | Record<string, boolean | AutoMergeRule>;
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
+
+export function getAutoMergePolicy(
+  repo: string,
+  policy: Policy = loadPolicy()
+): { enabled: boolean; method: "merge" | "squash" | "rebase"; delete_branch: boolean } {
+  const def = { enabled: false, method: "merge" as const, delete_branch: false };
+  const am = policy.automerge;
+  if (!am) return def;
+  if (am === true) return { ...def, enabled: true };
+  if (Array.isArray(am)) {
+    return { ...def, enabled: am.includes(repo) || am.includes("*") };
+  }
+  if (typeof am === "object") {
+    const entry = am[repo] ?? am["*"];
+    if (entry === true) return { ...def, enabled: true };
+    if (entry && typeof entry === "object") {
+      return {
+        enabled: entry.enabled ?? true,
+        method: entry.method ?? "merge",
+        delete_branch: entry.delete_branch ?? false,
+      };
+    }
+  }
+  return def;
+}
 
 export function loadPolicy(path?: string): Policy {
   const p = path ?? process.env.UNDERWRIGHT_POLICY ?? resolve(process.cwd(), "underwright.policy.json");

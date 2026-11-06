@@ -35,6 +35,8 @@ export interface IStore {
   sendMessage(to: string, from: string, body: string, taskId?: string): Awaitable<any>;
   inbox(agentId: string, unreadOnly?: boolean): Awaitable<any[]>;
   watchTask(agentId: string, taskId: string): Awaitable<any>;
+  notifyWatchers(taskId: string, body: string): Awaitable<void>;
+  log(entityType: string, entityId: string, action: string, actor: string, data?: unknown): Awaitable<void>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;
   listArtifacts(taskId: string): Awaitable<any[]>;
   reportEvidence(a: {

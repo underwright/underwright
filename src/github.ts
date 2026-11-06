@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
 import type { IStore, TaskStatus } from "./istore.js";
+import { getAutoMergePolicy, loadPolicy, type Policy } from "./policy.js";
 
 // GitHub adapter v1: issue & PR sync + review gates via the `gh` CLI.
 // Requires `gh` to be installed and authenticated — no token plumbing here.
@@ -128,14 +129,17 @@ export async function syncIssues(
 }
 
 /** Import and map PRs to tasks; link PRs with marker or branch references;
- *  report pr-link evidence when acceptance criteria require it. */
+ *  report pr-link evidence when acceptance criteria require it;
+ *  evaluate auto-merge when repo is opted in via policy. */
 export async function syncPRs(
   store: IStore,
   repo: string,
   actor = "github-pr-sync",
-  options: { runner?: GhRunner } = {}
+  options: { runner?: GhRunner; policy?: Policy } = {}
 ) {
   const runner = options.runner ?? defaultGhRunner;
+  const policy = options.policy ?? loadPolicy();
+  const amPolicy = getAutoMergePolicy(repo, policy);
   const prs = (await runner(
     `pr list --repo ${repo} --state all --limit 200 --json number,title,body,url,state,labels,headRefName,baseRefName,mergedAt`
   )) as PullRequest[];
@@ -144,12 +148,14 @@ export async function syncPRs(
     imported: 0,
     linked: [] as { taskId: string; pr: number }[],
     closed_tasks: [] as string[],
+    merged: [] as { taskId: string; pr: number }[],
+    conflicts: [] as { taskId: string; pr: number }[],
     skipped: 0,
   };
 
   for (const pr of prs) {
     const bodyMarker = pr.body?.match(/uw:([\w-]+)/)?.[1];
-    const branchMarker = pr.headRefName?.match(/(?:feat\/|fix\/)?(task-[a-f0-9]+)/)?.[1];
+    const branchMarker = pr.headRefName?.match(/(?:feat\/|fix\/)?((?:task-[a-f0-9]+|gh-\d+))/)?.[1];
     const marker = bodyMarker ?? branchMarker;
 
     if (marker) {
@@ -182,6 +188,21 @@ export async function syncPRs(
         if ((pr.state === "MERGED" || pr.state === "CLOSED") && task.status !== "done") {
           await store.setTaskStatus(marker, "done", actor);
           out.closed_tasks.push(marker);
+        } else if (pr.state === "OPEN" && amPolicy.enabled) {
+          const mRes = await autoMergePR(store, repo, marker, {
+            actor,
+            runner,
+            policy,
+            prNumber: pr.number,
+            mergeable: (pr as any).mergeable,
+            mergeStateStatus: (pr as any).mergeStateStatus,
+          });
+          if (mRes.merged) {
+            out.merged.push({ taskId: marker, pr: pr.number });
+            out.closed_tasks.push(marker);
+          } else if (mRes.conflict) {
+            out.conflicts.push({ taskId: marker, pr: pr.number });
+          }
         }
         continue;
       }
@@ -214,6 +235,23 @@ export async function syncPRs(
     if ((pr.state === "MERGED" || pr.state === "CLOSED") && task.status !== "done") {
       await store.setTaskStatus(id, "done", actor);
       out.closed_tasks.push(id);
+    } else if (pr.state === "OPEN" && amPolicy.enabled) {
+      const mRes = await autoMergePR(store, repo, id, {
+        actor,
+        runner,
+        policy,
+        prNumber: pr.number,
+        mergeable: (pr as any).mergeable,
+        mergeStateStatus: (pr as any).mergeStateStatus,
+      });
+      if (mRes.merged) {
+        out.merged.push({ taskId: id, pr: pr.number });
+        out.closed_tasks.push(id);
+      } else if (mRes.conflict) {
+        out.conflicts.push({ taskId: id, pr: pr.number });
+      } else {
+        out.skipped++;
+      }
     } else {
       out.skipped++;
     }
@@ -444,4 +482,156 @@ export async function postEvidenceComment(
   }
 
   return { posted: `${target}#${number}` };
+}
+
+export interface AutoMergeResult {
+  merged: boolean;
+  skipped?: boolean;
+  conflict?: boolean;
+  reason?: string;
+  pr?: number;
+  taskId?: string;
+  gate?: CheckGateResult;
+  error?: string;
+}
+
+/** Evaluate PR gate and independent review evidence for a task's linked PR;
+ *  when opted-in per repo via policy and both pass, merge via `gh pr merge`.
+ *  On merge conflict, comment on the PR, notify task watchers, and leave to agent. */
+export async function autoMergePR(
+  store: IStore,
+  repo: string,
+  taskId: string,
+  options: {
+    actor?: string;
+    runner?: GhRunner;
+    policy?: Policy;
+    prNumber?: number | string;
+    mergeable?: string;
+    mergeStateStatus?: string;
+  } = {}
+): Promise<AutoMergeResult> {
+  const actor = options.actor ?? "automerge-bot";
+  const runner = options.runner ?? defaultGhRunner;
+  const policy = options.policy ?? loadPolicy();
+  const amPolicy = getAutoMergePolicy(repo, policy);
+
+  if (!amPolicy.enabled) {
+    return { merged: false, skipped: true, reason: "policy_disabled", taskId };
+  }
+
+  const task = await store.getTask(taskId);
+  if (!task) {
+    return { merged: false, reason: "task_not_found", taskId, error: `task ${taskId} not found` };
+  }
+
+  const m = options.prNumber
+    ? [String(options.prNumber), String(options.prNumber)]
+    : String(task.spec_ref ?? "").match(/\/pull\/(\d+)/);
+  if (!m) {
+    return {
+      merged: false,
+      reason: "no_pr_linked",
+      taskId,
+      error: `task ${taskId} has no linked pull request`,
+    };
+  }
+  const prNumber = Number(m[1]);
+
+  const gate = await checkPRGate(store, repo, taskId, { actor, runner });
+  if (!gate.ok) {
+    return { merged: false, reason: "checks_not_green", pr: prNumber, taskId, gate };
+  }
+
+  const evidence = await store.getEvidence(taskId);
+  const systemActors = new Set(["github-adapter", "github-pr-sync", "github-sync", actor]);
+  const nonReviewAuthor = evidence.find(
+    (e: any) => e.kind !== "review" && e.kind !== "ci_check" && e.agent_id && !systemActors.has(e.agent_id)
+  )?.agent_id;
+  const createdByAuthor =
+    task.created_by && !["human", "github-sync", "github-pr-sync", "cli"].includes(task.created_by)
+      ? task.created_by
+      : null;
+  const authorAgent: string | null = task.claim?.agent_id ?? nonReviewAuthor ?? createdByAuthor ?? null;
+
+  const reviews = evidence.filter(
+    (e: any) =>
+      e.kind === "review" &&
+      (e.exit_code === null || e.exit_code === undefined || e.exit_code === 0)
+  );
+  if (reviews.length === 0) {
+    return { merged: false, reason: "missing_review", pr: prNumber, taskId, gate };
+  }
+
+  const independentReview = reviews.find((e: any) => !authorAgent || e.agent_id !== authorAgent);
+  if (!independentReview) {
+    return { merged: false, reason: "self_review", pr: prNumber, taskId, gate };
+  }
+
+  const handleConflict = async (errMsg: string): Promise<AutoMergeResult> => {
+    const comment = `Auto-merge aborted for PR #${prNumber} (task \`${taskId}\`): merge conflict detected (${errMsg}). Leaving to assigned agent to resolve.`;
+    await runner(`pr comment ${prNumber} --repo ${repo} --body-file -`, comment);
+    await store.notifyWatchers(
+      taskId,
+      `task ${taskId}: PR #${prNumber} (${repo}) auto-merge failed due to merge conflict — left to agent`
+    );
+    await store.log("task", taskId, "automerge_conflict", actor, {
+      repo,
+      pr: prNumber,
+      task_id: taskId,
+      author: authorAgent,
+      reviewer: independentReview.agent_id,
+      error: errMsg,
+    });
+    return {
+      merged: false,
+      conflict: true,
+      reason: "merge_conflict",
+      pr: prNumber,
+      taskId,
+      gate,
+      error: errMsg,
+    };
+  };
+
+  if (options.mergeable === "CONFLICTING" || options.mergeStateStatus === "DIRTY") {
+    return handleConflict("PR is CONFLICTING / DIRTY");
+  }
+
+  const mergeCmd = `pr merge ${prNumber} --repo ${repo} --${amPolicy.method}${
+    amPolicy.delete_branch ? " --delete-branch" : ""
+  }`;
+  try {
+    await runner(mergeCmd);
+  } catch (err: any) {
+    return handleConflict(err?.message ?? String(err));
+  }
+
+  await store.log("task", taskId, "automerge", actor, {
+    repo,
+    pr: prNumber,
+    task_id: taskId,
+    method: amPolicy.method,
+    merged_by: actor,
+    reviewer: independentReview.agent_id,
+    author: authorAgent,
+  });
+
+  if (task.ac_ids && (task.ac_ids as string[]).includes("automerge")) {
+    await store.reportEvidence({
+      task_id: taskId,
+      agent_id: actor,
+      kind: "ci_check",
+      command: `gh ${mergeCmd}`,
+      exit_code: 0,
+      output: `Auto-merged PR #${prNumber} (${repo}) after green checks and independent review by ${independentReview.agent_id}`,
+      ac_ids: ["automerge"],
+    });
+  }
+
+  if (task.status !== "done") {
+    await store.setTaskStatus(taskId, "done", actor);
+  }
+
+  return { merged: true, pr: prNumber, taskId, gate };
 }
