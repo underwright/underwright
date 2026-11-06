@@ -57,6 +57,7 @@ underwright run                # execute queued jobs locally
 underwright board              # print the task board
 underwright create --template feature --title "Add search"   # create a task from a template
 underwright templates          # list builtin + policy-defined templates
+underwright speckit import --path .specify --task TASK_ID    # import Spec Kit docs & link ac_ids
 underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 ```
 
@@ -103,6 +104,7 @@ docker run -v $(pwd)/.uw:/data -p 8741:8741 \
 | `list_templates` | Builtin + policy-defined task templates (AC scaffold, DoR checklist) |
 | `claim_task` / `release_task` / `renew_lease` | Atomic claims with expiring leases |
 | `post_artifact` | Specs, designs, handoffs, reviews — durable, searchable |
+| `import_speckit` | Import Spec Kit `constitution.md`/`spec.md`/`plan.md`/`tasks.md` as spec artifacts and link `ac_ids` |
 | `search_context` | FTS over helpers + artifacts — call before writing shared code |
 | `register_helper` | Publish a reusable util/pattern/config |
 | `report_evidence` | Attach test/CI/review proof citing acceptance criteria |

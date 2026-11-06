@@ -36,6 +36,13 @@ export interface IStore {
   inbox(agentId: string, unreadOnly?: boolean): Awaitable<any[]>;
   watchTask(agentId: string, taskId: string): Awaitable<any>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;
+  importSpecKit(a: {
+    path?: string;
+    task_id?: string;
+    agent_id: string;
+    create_tasks?: boolean;
+    documents?: { doc_type?: "constitution" | "spec" | "plan" | "tasks"; title?: string; content: string }[];
+  }): Awaitable<any>;
   listArtifacts(taskId: string): Awaitable<any[]>;
   reportEvidence(a: {
     task_id: string; agent_id: string; kind: string; command?: string;

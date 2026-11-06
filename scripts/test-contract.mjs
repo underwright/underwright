@@ -133,6 +133,15 @@ async function matrix(token) {
     assert.match((await call('post_artifact', { task_id, agent_id: agent, kind: 'design',
       title: 'matrixartifact', content: 'HTTP contract design matrixartifact' })).id, /^art-/);
     assert((await call('search_context', { query: 'matrixartifact', kinds: ['artifact'] })).some(h => h.entity_type === 'artifact'));
+    const speckitRes = await call('import_speckit', {
+      task_id,
+      agent_id: agent,
+      documents: [
+        { doc_type: 'spec', title: 'specs/http/spec.md', content: '# Spec\n\n## Acceptance Criteria\n- [ ] http-ac: contract tested\n' },
+      ],
+    });
+    assert.equal(speckitRes.artifacts.length, 1);
+    assert(speckitRes.ac_ids.includes('http-ac'));
     assert.match((await call('register_helper', { agent_id: agent, path: 'contract/helper.ts',
       symbol: 'matrixhelper', kind: 'fixture', summary: 'matrixhelper HTTP fixture' })).id, /^hlp-/);
     assert((await call('search_context', { query: 'matrixhelper', kinds: ['helper'] })).some(h => h.entity_type === 'helper'));
