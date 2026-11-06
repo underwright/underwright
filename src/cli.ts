@@ -142,12 +142,15 @@ switch (cmd) {
 
 Usage:
   underwright serve              MCP server over stdio (local agent config).
-  underwright serve --http H:P   MCP server over HTTP at host:port (/mcp) — shared across machines.
+  underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook).
   underwright run                Execute queued jobs locally (test/build/deploy/review).
   underwright board              Print the task board.
   underwright create             Create a task, optionally from a template (--template feature).
   underwright templates          List task templates (builtin + policy-defined).
 
 Env:
-  UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)`);
+  UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)
+  UNDERWRIGHT_GITHUB_WEBHOOK_SECRET
+                      HMAC secret for POST /github/webhook.
+                      GITHUB_WEBHOOK_SECRET is the fallback. See docs/webhook.md.`);
 }
