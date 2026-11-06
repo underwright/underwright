@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
@@ -390,6 +391,10 @@ export class SqliteStore implements IStore {
     this.index("artifact", id, args.title ?? args.kind, args.content);
     this.log("artifact", id, "posted", args.agent_id, { task_id: args.task_id, kind: args.kind });
     return { id };
+  }
+
+  importSpecKit(args: ImportSpecKitArgs) {
+    return importSpecKit(this, args);
   }
 
   reportEvidence(args: {

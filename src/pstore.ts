@@ -2,6 +2,7 @@ import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 
 const DDL = `
@@ -379,6 +380,10 @@ export class PgStore implements IStore {
       VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.kind},${a.title ?? ""},${a.content})`;
     await this.log("artifact", id, "posted", a.agent_id, { task_id: a.task_id, kind: a.kind });
     return { id };
+  }
+
+  async importSpecKit(a: ImportSpecKitArgs) {
+    return importSpecKit(this, a);
   }
 
   async reportEvidence(a: { task_id: string; agent_id: string; kind: string; command?: string; exit_code?: number; output?: string; ac_ids?: string[] }) {

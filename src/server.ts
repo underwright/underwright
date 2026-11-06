@@ -128,6 +128,18 @@ Rules of engagement:
     content: z.string(),
   }, async (a) => text(await store.postArtifact(a)));
 
+  server.tool("import_speckit", "Import Spec Kit markdown (constitution/spec/plan/tasks) as spec artifacts and link extracted ac_ids to task.ac_ids.", {
+    path: z.string().optional().describe("path to a Spec Kit directory (.specify/specs) or markdown file"),
+    task_id: z.string().optional().describe("existing task id to attach artifacts and link extracted ac_ids to"),
+    agent_id: z.string(),
+    create_tasks: z.boolean().optional().describe("when true, create board tasks from tasks.md items with linked ac_ids"),
+    documents: z.array(z.object({
+      doc_type: z.enum(["constitution", "spec", "plan", "tasks"]).optional(),
+      title: z.string().optional(),
+      content: z.string(),
+    })).optional().describe("inline Spec Kit markdown documents"),
+  }, async (a) => text(await store.importSpecKit(a)));
+
   server.tool("search_context", "Search shared knowledge: helpers, specs, handoffs, prior decisions. Call before writing new shared code.", {
     query: z.string(),
     kinds: z.array(z.enum(["helper", "artifact", "evidence", "symbol"])).optional(),

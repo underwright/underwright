@@ -67,6 +67,24 @@ switch (cmd) {
     break;
   }
 
+  case "speckit": {
+    // underwright speckit [import] --path DIR_OR_FILE [--task ID] [--create-tasks] [--by AGENT]
+    const path = flag("path") ?? (args[0] && !args[0].startsWith("--") && args[0] !== "import" ? args[0] : undefined);
+    if (!path) {
+      console.error("usage: underwright speckit import --path DIR_OR_FILE [--task ID] [--create-tasks] [--by AGENT]");
+      process.exit(1);
+    }
+    const store = await openStore(dbPath);
+    console.log(JSON.stringify(await store.importSpecKit({
+      path,
+      task_id: flag("task"),
+      agent_id: flag("by") ?? "cli",
+      create_tasks: args.includes("--create-tasks"),
+    }), null, 2));
+    await store.close();
+    break;
+  }
+
   case "run": {
     // Local job runner: executes queued jobs one at a time, records results.
     // This is the "agents wait on processes" half of the loop.
@@ -152,6 +170,7 @@ Usage:
   underwright board              Print the task board.
   underwright create             Create a task, optionally from a template (--template feature).
   underwright templates          List task templates (builtin + policy-defined).
+  underwright speckit import     Import Spec Kit markdown (constitution/spec/plan/tasks) and link ac_ids.
 
 Env:
   UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)`);
