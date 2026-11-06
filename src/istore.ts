@@ -39,6 +39,8 @@ export interface IStore {
   releaseTask(taskId: string, agentId: string): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   sweepExpiredClaims(): Awaitable<{ reclaimed: string[] }>;
+  /** Reassign dispatcher "your next task" mail whose task is still unclaimed. */
+  sweepIdleDispatches(): Awaitable<{ reassigned: string[]; logged: string[] }>;
   claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds?: number): Awaitable<any>;
   releaseResources(resources: string[], agentId: string): Awaitable<any>;
   checkLocks(resources: string[]): Awaitable<any[]>;

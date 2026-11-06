@@ -221,7 +221,7 @@ Agent jobs pass a prompt directly to a harness CLI without shell expansion:
   "agent": {
     "executable": "codex",
     "args": ["exec", "{{prompt}}"],
-    "prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md, claim {{task_id}}, implement it, and report evidence. Job: {{job_id}}."
+    "prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md and work the board until idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}."
   }
 }
 ```
@@ -231,6 +231,8 @@ or `"executable": "agy", "args": ["--print"]`. The expanded prompt is appended
 as one argument when `{{prompt}}` is absent. Only `{{task_id}}`, `{{agent_id}}`,
 `{{host}}`, and `{{job_id}}` inside the prompt are expanded. The launched harness
 is responsible for claiming its task; a job lease does not claim that task.
+After `complete_task`, read inbox. A message `your next task: <id>` is the
+next assignment. Work the board until idle.
 
 A host can supervise the process with systemd (set the workspace, executable
 path, and URL for your installation; put `UNDERWRIGHT_TOKEN` in the environment

@@ -142,6 +142,28 @@ describe("background lease sweeper", () => {
     expect(sweep).toHaveBeenCalledTimes(3);
   });
 
+  it("sweeps idle dispatcher assignments after reclaiming leases", async () => {
+    vi.useFakeTimers();
+    const sweepExpiredClaims = vi.fn().mockResolvedValue({ reclaimed: ["t1"] });
+    const sweepIdleDispatches = vi.fn().mockResolvedValue({ reassigned: [], logged: [] });
+    const stop = startLeaseSweeper({ sweepExpiredClaims, sweepIdleDispatches }, 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sweepExpiredClaims).toHaveBeenCalledTimes(1);
+    expect(sweepIdleDispatches).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
+  it("reports lease and idle sweep failures separately", async () => {
+    vi.useFakeTimers();
+    const sweepExpiredClaims = vi.fn().mockRejectedValue(new Error("lease down"));
+    const sweepIdleDispatches = vi.fn().mockRejectedValue(new Error("idle down"));
+    const onError = vi.fn();
+    const stop = startLeaseSweeper({ sweepExpiredClaims, sweepIdleDispatches }, 60_000, onError);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(onError.mock.calls.map(c => c[0].message)).toEqual(["lease down", "idle down"]);
+    await stop();
+  });
+
   it("waits for an in-flight sweep before shutdown", async () => {
     vi.useFakeTimers();
     let finish!: () => void;

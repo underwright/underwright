@@ -1,8 +1,9 @@
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
+import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 
@@ -336,13 +337,21 @@ export class PgStore implements IStore {
   }
 
   async releaseTask(taskId: string, agentId: string) {
+    return this.sql.begin(async sql => {
+      const tx = new PgStore(sql as unknown as postgres.Sql);
+      return tx.releaseTaskAtomic(taskId, agentId);
+    });
+  }
+
+  private async releaseTaskAtomic(taskId: string, agentId: string) {
     const [claim] = await this.sql<any[]>`SELECT agent_id FROM claims WHERE task_id=${taskId}`;
     if (!claim) return { error: `task ${taskId} is not claimed` };
     if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     await this.sql`DELETE FROM claims WHERE task_id=${taskId}`;
     await this.sql`UPDATE tasks SET status='open', updated_at=now() WHERE id=${taskId}`;
     await this.log("task", taskId, "released", agentId);
-    return { released: taskId };
+    const dispatched = await this.dispatchNext(agentId, taskId, "release");
+    return { released: taskId, ...(dispatched ? { dispatched } : {}) };
   }
 
   async renewLease(taskId: string, agentId: string, ttlSeconds = 1800) {
@@ -445,7 +454,146 @@ export class PgStore implements IStore {
     await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     await this.notifyWatchers(taskId, `task ${taskId} → done`);
     await this.unblockDependents(taskId, agentId);
-    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}) };
+    const dispatched = await this.dispatchNext(agentId, taskId, "complete");
+    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}), ...(dispatched ? { dispatched } : {}) };
+  }
+
+  private async dispatchNext(agentId: string, excludeTaskId: string, trigger: "complete" | "release") {
+    const policy = getDispatcherPolicy(loadPolicy());
+    if (!policy.enabled) return null;
+    const workload = await this.agentWorkload(agentId);
+    if (overCap(workload, policy.max_tasks_per_agent)) {
+      await this.log("task", excludeTaskId, "dispatch_capped", DISPATCHER_AGENT, {
+        agent_id: agentId, workload, max: policy.max_tasks_per_agent, trigger,
+      });
+      return null;
+    }
+    for (const taskId of await this.dispatchCandidates(excludeTaskId)) {
+      const claimed = await this.claimTaskAtomic(taskId, agentId) as { error?: string };
+      if (claimed.error) continue;
+      await this.sendMessage(agentId, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
+      await this.log("task", taskId, "dispatched", DISPATCHER_AGENT, { agent_id: agentId, trigger, from_task: excludeTaskId });
+      return { task_id: taskId, agent_id: agentId };
+    }
+    return null;
+  }
+
+  private async agentWorkload(agentId: string) {
+    const [row] = await this.sql<[{ n: number }]>`
+      SELECT (
+        (SELECT COUNT(*)::int FROM claims WHERE agent_id = ${agentId}) +
+        (SELECT COUNT(DISTINCT entity_id)::int FROM events
+          WHERE entity_type = 'task' AND action = 'completed' AND actor = ${agentId})
+      ) AS n`;
+    return Number(row?.n ?? 0);
+  }
+
+  private async dispatchCandidates(excludeTaskId: string) {
+    const now = new Date();
+    const rows = await this.sql<{ id: string }[]>`
+      SELECT t.id FROM tasks t
+      WHERE t.status = 'open' AND t.id <> ${excludeTaskId}
+        AND NOT EXISTS (
+          SELECT 1 FROM task_dependencies d
+          JOIN tasks b ON b.id = d.blocker_id
+          WHERE d.task_id = t.id AND b.status <> 'done'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM claims c WHERE c.task_id = t.id AND c.lease_expires > ${now}
+        )
+      ORDER BY t.priority ASC, t.created_at ASC, t.id ASC`;
+    return rows.map((row) => row.id);
+  }
+
+  private async staleNextTasks(idleMinutes: number) {
+    const rows = await this.sql<any[]>`
+      SELECT m.id, m.to_agent, m.task_id, m.body FROM messages m
+      WHERE m.from_agent = ${DISPATCHER_AGENT}
+        AND m.body LIKE 'your next task: %'
+        AND m.created_at <= now() - make_interval(mins => ${idleMinutes}::int)
+        AND NOT EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.entity_type = 'message'
+            AND e.entity_id = m.id::text
+            AND e.action IN ('dispatch_idle', 'reassigned')
+        )
+      ORDER BY m.id
+      FOR UPDATE OF m SKIP LOCKED`;
+    return rows.flatMap((row) => {
+      const taskId = (row.task_id as string | null) || taskIdFromNextTaskMessage(row.body);
+      if (!taskId) return [];
+      return [{ messageId: String(row.id), assignee: row.to_agent as string, taskId }];
+    });
+  }
+
+  private async rawClaim(taskId: string) {
+    const [row] = await this.sql<any[]>`
+      SELECT t.status AS status, c.agent_id AS claim_agent, c.lease_expires AS lease_expires
+      FROM tasks t LEFT JOIN claims c ON c.task_id = t.id WHERE t.id = ${taskId}`;
+    if (!row) return null;
+    return {
+      status: row.status as string,
+      claimAgent: (row.claim_agent ?? null) as string | null,
+      leaseExpires: row.lease_expires ?? null,
+    };
+  }
+
+  private async knownAgentWorkloads() {
+    const rows = await this.sql<{ id: string }[]>`
+      SELECT DISTINCT actor AS id FROM events
+      WHERE entity_type = 'task' AND action IN ('claimed', 'completed', 'released')`;
+    const out: { id: string; workload: number }[] = [];
+    for (const row of rows) {
+      if (!row.id || isSystemActor(row.id)) continue;
+      out.push({ id: row.id, workload: await this.agentWorkload(row.id) });
+    }
+    return out;
+  }
+
+  async sweepIdleDispatches() {
+    const policy = getDispatcherPolicy(loadPolicy());
+    if (!policy.enabled) return { reassigned: [] as string[], logged: [] as string[] };
+    return this.sql.begin(async sql => {
+      const tx = new PgStore(sql as unknown as postgres.Sql);
+      return tx.sweepIdleAtomic(policy);
+    });
+  }
+
+  private async sweepIdleAtomic(policy: DispatcherPolicy) {
+    const reassigned: string[] = [];
+    const logged: string[] = [];
+    for (const row of await this.staleNextTasks(policy.idle_minutes)) {
+      const task = await this.rawClaim(row.taskId);
+      const mark = async (reason: string, extra: object = {}) => {
+        await this.log("message", row.messageId, "dispatch_idle", DISPATCHER_AGENT, {
+          task_id: row.taskId, agent_id: row.assignee, reason, ...extra,
+        });
+        logged.push(row.taskId);
+      };
+      if (!task) { await mark("missing_task"); continue; }
+      if (leaseActive(task.leaseExpires) && task.claimAgent) continue;
+      if (task.status !== "open" && task.status !== "claimed") {
+        await mark("not_open", { status: task.status });
+        continue;
+      }
+      const next = chooseReassignAgent({
+        assignee: row.assignee,
+        agents: await this.knownAgentWorkloads(),
+        max: policy.max_tasks_per_agent,
+      });
+      if (!next) { await mark("no_alternate_agent"); continue; }
+      const claimed = await this.claimTaskAtomic(row.taskId, next) as { error?: string };
+      if (claimed.error) { await mark("claim_failed", { error: claimed.error }); continue; }
+      await this.sendMessage(next, DISPATCHER_AGENT, nextTaskMessage(row.taskId), row.taskId);
+      await this.log("message", row.messageId, "reassigned", DISPATCHER_AGENT, {
+        task_id: row.taskId, from: row.assignee, to: next,
+      });
+      await this.log("task", row.taskId, "dispatched", DISPATCHER_AGENT, {
+        agent_id: next, trigger: "idle_sweep", from_agent: row.assignee,
+      });
+      reassigned.push(row.taskId);
+    }
+    return { reassigned, logged };
   }
 
   async registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {

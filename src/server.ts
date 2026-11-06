@@ -26,7 +26,8 @@ Rules of engagement:
 2. Claim a task before working on it; renew the lease on long work.
 3. Coordinate through artifacts posted to tasks, never through side channels.
 4. Done requires evidence: report_evidence citing the task's acceptance criteria before complete_task.
-5. Prefer submit_job for long-running work (tests, builds) over running it in-context.` }
+5. Prefer submit_job for long-running work (tests, builds) over running it in-context.
+6. Work the board until idle. After complete_task or release_task, read inbox. A message "your next task: <id>" is your assignment — claim it if you do not hold it, then repeat until no next task arrives.` }
   );
 
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
