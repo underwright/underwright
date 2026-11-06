@@ -33,12 +33,32 @@ export interface DispatcherPolicy {
   idle_minutes: number;
 }
 
+export type HumanNotifyEventKind = "task_completed" | "claim_reclaimed";
+
+export interface HumanNotifyRule {
+  enabled?: boolean;
+  webhook_url?: string;
+  url?: string;
+  events?: string[];
+}
+
+export interface HumanNotifyPolicy {
+  enabled: boolean;
+  webhook_url: string | null;
+  events: HumanNotifyEventKind[];
+}
+
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
   templates?: TaskTemplate[];
   automerge?: boolean | string[] | Record<string, boolean | AutoMergeRule>;
   dispatcher?: DispatcherRule;
+  human_notify?: string | HumanNotifyRule;
+  "human-notify"?: string | HumanNotifyRule;
+  notifications?: string | HumanNotifyRule;
+  notify?: string | HumanNotifyRule;
+  webhook_url?: string;
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -82,6 +102,66 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
     idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
   };
 }
+
+const DEFAULT_NOTIFY_EVENTS: HumanNotifyEventKind[] = ["task_completed", "claim_reclaimed"];
+
+function normalizeNotifyEvent(raw: string): HumanNotifyEventKind | null {
+  const v = raw.trim().toLowerCase();
+  if (v === "task_completed" || v === "completed" || v === "task.completed" || v === "task-completed") {
+    return "task_completed";
+  }
+  if (
+    v === "claim_reclaimed" ||
+    v === "claim-reclaimed" ||
+    v === "reclaimed" ||
+    v === "lease_expired" ||
+    v === "claim.reclaimed"
+  ) {
+    return "claim_reclaimed";
+  }
+  return null;
+}
+
+/** Optional human webhook notifications on task completed / claim-reclaimed events. */
+export function getHumanNotifyPolicy(policy: Policy = loadPolicy()): HumanNotifyPolicy {
+  const raw =
+    policy.human_notify ??
+    policy["human-notify"] ??
+    policy.notifications ??
+    policy.notify ??
+    policy.webhook_url;
+  if (!raw) {
+    return { enabled: false, webhook_url: null, events: [...DEFAULT_NOTIFY_EVENTS] };
+  }
+  if (typeof raw === "string") {
+    const url = raw.trim();
+    return {
+      enabled: url.length > 0,
+      webhook_url: url || null,
+      events: [...DEFAULT_NOTIFY_EVENTS],
+    };
+  }
+  if (typeof raw === "object") {
+    const url = (
+      typeof raw.webhook_url === "string"
+        ? raw.webhook_url
+        : typeof raw.url === "string"
+          ? raw.url
+          : ""
+    ).trim();
+    const events = Array.isArray(raw.events)
+      ? [...new Set(raw.events.map((e) => normalizeNotifyEvent(String(e))).filter((e): e is HumanNotifyEventKind => !!e))]
+      : [...DEFAULT_NOTIFY_EVENTS];
+    return {
+      enabled: (raw.enabled ?? true) && url.length > 0 && events.length > 0,
+      webhook_url: url || null,
+      events,
+    };
+  }
+  return { enabled: false, webhook_url: null, events: [...DEFAULT_NOTIFY_EVENTS] };
+}
+
+export const getNotifyPolicy = getHumanNotifyPolicy;
 
 export function loadPolicy(path?: string): Policy {
   const p = path ?? process.env.UNDERWRIGHT_POLICY ?? resolve(process.cwd(), "underwright.policy.json");

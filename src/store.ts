@@ -4,8 +4,9 @@ import { SCHEMA, JOBS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
+import type { IStore, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
 export type { TaskStatus } from "./istore.js";
@@ -127,8 +128,8 @@ export class SqliteStore implements IStore {
 
   log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
     this.db
-      .prepare("INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES (?,?,?,?,?)")
-      .run(entityType, entityId, action, actor, JSON.stringify(data));
+      .prepare("INSERT INTO events (entity_type, entity_id, action, actor, data, created_at) VALUES (?,?,?,?,?,?)")
+      .run(entityType, entityId, action, actor, JSON.stringify(data), new Date().toISOString());
   }
 
   private index(entityType: string, entityId: string, title: string, content: string) {
@@ -395,22 +396,39 @@ export class SqliteStore implements IStore {
 
   /** Reclaim leases and publish their effects atomically, even across servers. */
   sweepExpiredClaims() {
-    return this.db.transaction(() => {
+    const { reclaimed, notifications } = this.db.transaction(() => {
       const now = new Date().toISOString();
       const expired = this.db.prepare("SELECT * FROM claims WHERE lease_expires <= ?").all(now) as any[];
       const remove = this.db.prepare("DELETE FROM claims WHERE task_id=?");
       const reopen = this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=? AND status='claimed'");
+      const taskTitle = this.db.prepare("SELECT title FROM tasks WHERE id=?");
+      const notes: { task_id: string; title: string; agent_id: string; reopened: boolean; lease_expires: string }[] = [];
       for (const claim of expired) {
         remove.run(claim.task_id);
         const reopened = reopen.run(claim.task_id).changes > 0;
+        const row = taskTitle.get(claim.task_id) as { title?: string } | undefined;
         this.log("task", claim.task_id, "lease_expired", "lease-sweeper", {
           agent_id: claim.agent_id, lease_expires: claim.lease_expires, reopened,
         });
         this.notifyWatchers(claim.task_id,
           `task ${claim.task_id} lease expired (${claim.agent_id})${reopened ? " → open" : ""}`);
+        notes.push({
+          task_id: claim.task_id as string,
+          title: row?.title ?? "",
+          agent_id: claim.agent_id as string,
+          reopened,
+          lease_expires: claim.lease_expires as string,
+        });
       }
-      return { reclaimed: expired.map(claim => claim.task_id as string) };
+      return { reclaimed: expired.map(claim => claim.task_id as string), notifications: notes };
     }).immediate();
+    if (notifications.length > 0) {
+      const policy = loadPolicy();
+      for (const n of notifications) {
+        void sendHumanNotification({ event: "claim_reclaimed", ...n }, policy);
+      }
+    }
+    return { reclaimed };
   }
 
   postArtifact(args: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }) {
@@ -455,7 +473,13 @@ export class SqliteStore implements IStore {
 
   /** Close a task. Requires evidence for every declared acceptance criterion. */
   completeTask(taskId: string, agentId: string) {
-    return this.db.transaction(() => this.completeTaskAtomic(taskId, agentId)).immediate();
+    const res = this.db.transaction(() => this.completeTaskAtomic(taskId, agentId)).immediate() as any;
+    if (res && res._notify) {
+      const { _notify, ...publicRes } = res;
+      void sendHumanNotification(_notify, loadPolicy());
+      return publicRes;
+    }
+    return res;
   }
 
   private completeTaskAtomic(taskId: string, agentId: string) {
@@ -490,7 +514,17 @@ export class SqliteStore implements IStore {
     this.notifyWatchers(taskId, `task ${taskId} → done`);
     this.unblockDependents(taskId, agentId);
     const dispatched = this.dispatchNext(agentId, taskId, "complete");
-    return { completed: taskId, ...(dod.missing.length ? { warnings: dod.missing } : {}), ...(dispatched ? { dispatched } : {}) };
+    return {
+      completed: taskId,
+      ...(dod.missing.length ? { warnings: dod.missing } : {}),
+      ...(dispatched ? { dispatched } : {}),
+      _notify: {
+        event: "task_completed" as const,
+        task_id: taskId,
+        title: String(task.title ?? ""),
+        agent_id: agentId,
+      },
+    };
   }
 
   /** Assign the next open, unblocked task to the agent who just finished one. */
@@ -823,6 +857,23 @@ export class SqliteStore implements IStore {
     const jobs = this.db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all();
     const helpers = (this.db.prepare("SELECT COUNT(*) n FROM helpers").get() as any).n;
     return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers };
+  }
+
+  /** Standup-style summary of board delta since a timestamp, optionally sent to an agent's mailbox. */
+  digest(sinceOrArgs?: string | DigestArgs): DigestResult {
+    const args = normalizeDigestArgs(sinceOrArgs);
+    const board = this.board();
+    const events = this.db.prepare("SELECT * FROM events ORDER BY id ASC").all();
+    const built = buildDigest({
+      since: args.since,
+      tasks: board.tasks,
+      events,
+    });
+    const recipient = (args.to_agent ?? args.to)?.trim() || null;
+    if (recipient) {
+      this.sendMessage(recipient, args.from_agent ?? "underwright", built.summary);
+    }
+    return { ...built, sent_to: recipient };
   }
 
   /** Everything the read-only web dashboard needs in one round trip. */
