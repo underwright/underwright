@@ -1,8 +1,8 @@
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
-import type { IStore, TaskStatus, CreateTaskArgs } from "./istore.js";
+import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -121,6 +121,7 @@ export class PgStore implements IStore {
   static async connect(url: string) {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
+    await sql.unsafe(PG_JOBS_MIGRATION);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
@@ -473,28 +474,47 @@ export class PgStore implements IStore {
     return out;
   }
 
-  async submitJob(a: { task_id?: string; agent_id: string; type: string; command: string }) {
+  async submitJob(a: SubmitJobArgs) {
+    if (a.type === "agent" ? !a.agent?.executable || !a.agent.prompt : !a.command)
+      return { error: "command required, or executable and prompt for agent jobs" };
     const id = `job-${randomUUID().slice(0, 8)}`;
-    await this.sql`INSERT INTO jobs (id, task_id, agent_id, type, command) VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.type},${a.command})`;
+    await this.sql`INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec)
+      VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.type},${a.command ?? ""},${a.host ?? null},
+      ${a.target_agent_id ?? null},${a.agent ? JSON.stringify(a.agent) : null})`;
     await this.log("job", id, "submitted", a.agent_id, a);
     return { id, status: "queued" };
   }
 
-  async nextJob(agentId?: string) {
+  async nextJob(agentId: string, host?: string, ttlSeconds = 60) {
+    const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000);
     const [job] = await this.sql<any[]>`
-      UPDATE jobs SET status='running', started_at=now()
-      WHERE id = (SELECT id FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED)
-      RETURNING *`;
+      UPDATE jobs SET status='running', started_at=now(), finished_at=NULL, result='',
+      runner_id=${agentId}, lease_token=${randomUUID()}, lease_expires=${expires}
+      WHERE id = (SELECT id FROM jobs WHERE (status='queued' OR (status='running' AND lease_expires<=now()))
+      AND (host IS NULL OR host=${host ?? null}) AND (target_agent_id IS NULL OR target_agent_id=${agentId})
+      ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`;
     if (!job) return null;
-    await this.log("job", job.id, "started", agentId ?? "runner");
+    await this.log("job", job.id, "started", agentId, { host, lease_expires: expires });
     return job;
   }
 
-  async finishJob(jobId: string, status: "done" | "failed", result: string) {
-    await this.sql`UPDATE jobs SET status=${status}, result=${result}, finished_at=now() WHERE id=${jobId}`;
-    await this.log("job", jobId, status, "runner", { result: result.slice(0, 500) });
-    const job = await this.getJob(jobId);
-    if (job?.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
+  async renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+    const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000);
+    const [job] = await this.sql`UPDATE jobs SET lease_expires=${expires}, result=COALESCE(${result?.slice(-64000) ?? null},result)
+      WHERE id=${jobId} AND status='running' AND runner_id=${agentId} AND lease_token=${token}
+      AND lease_expires>now() RETURNING id`;
+    if (!job) return { error: "job lease not owned or expired" };
+    await this.log("job", jobId, "renewed", agentId);
+    return { id: jobId, lease_expires: expires.toISOString() };
+  }
+
+  async finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+    const [job] = await this.sql`UPDATE jobs SET status=${status}, result=${result.slice(-64000)},
+      finished_at=now(), lease_expires=NULL WHERE id=${jobId} AND status='running'
+      AND runner_id=${agentId} AND lease_token=${token} AND lease_expires>now() RETURNING *`;
+    if (!job) return { error: "job lease not owned or expired" };
+    await this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
+    if (job.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
   }
 

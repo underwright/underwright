@@ -76,7 +76,7 @@ describe("jobs", () => {
     const j = store.submitJob({ agent_id: "a", type: "test", command: "echo hi" });
     const started = store.nextJob("runner");
     expect(started.id).toBe(j.id);
-    store.finishJob(j.id, "done", "hi");
+    store.finishJob(j.id, "done", "hi", "runner", started.lease_token);
     expect(store.getJob(j.id).status).toBe("done");
   });
 });

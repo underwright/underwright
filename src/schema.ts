@@ -10,6 +10,28 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 CREATE INDEX IF NOT EXISTS task_dependencies_blocker ON task_dependencies(blocker_id);
 `;
 
+export const JOBS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS jobs (
+  id           TEXT PRIMARY KEY,
+  task_id      TEXT REFERENCES tasks(id),
+  agent_id     TEXT NOT NULL,
+  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review','agent')),
+  status       TEXT NOT NULL DEFAULT 'queued'
+               CHECK (status IN ('queued','running','done','failed')),
+  command      TEXT NOT NULL,
+  host         TEXT,
+  target_agent_id TEXT,
+  runner_id    TEXT,
+  lease_token  TEXT,
+  lease_expires TEXT,
+  agent_spec   TEXT,
+  result       TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  started_at   TEXT,
+  finished_at  TEXT
+);
+`;
+
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
@@ -72,19 +94,7 @@ CREATE TABLE IF NOT EXISTS helpers (
   UNIQUE (path, symbol)
 );
 
-CREATE TABLE IF NOT EXISTS jobs (
-  id           TEXT PRIMARY KEY,
-  task_id      TEXT REFERENCES tasks(id),
-  agent_id     TEXT NOT NULL,
-  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review')),
-  status       TEXT NOT NULL DEFAULT 'queued'
-               CHECK (status IN ('queued','running','done','failed')),
-  command      TEXT NOT NULL,
-  result       TEXT NOT NULL DEFAULT '',
-  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  started_at   TEXT,
-  finished_at  TEXT
-);
+${JOBS_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS locks (
   resource      TEXT PRIMARY KEY,       -- file glob, folder, or entity ref (e.g. "src/db/**", "gh-3")
@@ -153,4 +163,17 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(
   entity_type, entity_id, title, content,
   tokenize = 'porter unicode61'
 );
+`;
+
+// Additive Postgres migration; keep the job shape beside the SQLite source.
+export const PG_JOBS_MIGRATION = `
+ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check;
+ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('test','build','deploy','review','agent'));
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS host TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_agent_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS runner_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS agent_spec TEXT;
+UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL;
 `;

@@ -17,6 +17,16 @@ export interface CreateTaskArgs {
   template?: string;   // task template id — expands AC scaffold, type, DoR checklist
 }
 
+export interface AgentJobSpec {
+  executable: string;
+  args: string[];
+  prompt: string; // {{task_id}}, {{agent_id}}, {{host}}, {{job_id}}
+}
+export interface SubmitJobArgs {
+  task_id?: string; agent_id: string; type: string; command?: string;
+  host?: string; target_agent_id?: string; agent?: AgentJobSpec;
+}
+
 export interface IStore {
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
@@ -45,9 +55,10 @@ export interface IStore {
   completeTask(taskId: string, agentId: string): Awaitable<any>;
   registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }): Awaitable<any>;
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
-  submitJob(a: { task_id?: string; agent_id: string; type: string; command: string }): Awaitable<any>;
-  nextJob(agentId?: string): Awaitable<any>;
-  finishJob(jobId: string, status: "done" | "failed", result: string): Awaitable<any>;
+  submitJob(a: SubmitJobArgs): Awaitable<any>;
+  nextJob(agentId: string, host?: string, ttlSeconds?: number): Awaitable<any>;
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string): Awaitable<any>;
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;

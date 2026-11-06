@@ -1,8 +1,8 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { SCHEMA } from "./schema.js";
+import { SCHEMA, JOBS_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates } from "./policy.js";
-import type { IStore, CreateTaskArgs } from "./istore.js";
+import type { IStore, CreateTaskArgs, SubmitJobArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
 export type { TaskStatus } from "./istore.js";
@@ -82,6 +82,16 @@ export class SqliteStore implements IStore {
         }
       }
       this.db.exec("PRAGMA user_version = 5;");
+    }
+    if (v < 6) {
+      this.db.transaction(() => {
+        this.db.exec("ALTER TABLE jobs RENAME TO jobs_v5");
+        this.db.exec(JOBS_SCHEMA);
+        this.db.exec(`INSERT INTO jobs (id,task_id,agent_id,type,status,command,result,created_at,started_at,finished_at)
+          SELECT id,task_id,agent_id,type,CASE WHEN status='running' THEN 'queued' ELSE status END,
+          command,result,created_at,started_at,finished_at FROM jobs_v5`);
+        this.db.exec("DROP TABLE jobs_v5; PRAGMA user_version = 6;");
+      })();
     }
   }
 
@@ -566,32 +576,54 @@ export class SqliteStore implements IStore {
     return { symbol: name, definitions: defs, impacted: levels, files: [...files].sort() };
   }
 
-  submitJob(args: { task_id?: string; agent_id: string; type: string; command: string }) {
+  submitJob(args: SubmitJobArgs) {
+    if (args.type === "agent" ? !args.agent?.executable || !args.agent.prompt : !args.command)
+      return { error: "command required, or executable and prompt for agent jobs" };
     const id = `job-${randomUUID().slice(0, 8)}`;
-    this.db
-      .prepare("INSERT INTO jobs (id, task_id, agent_id, type, command) VALUES (?,?,?,?,?)")
-      .run(id, args.task_id ?? null, args.agent_id, args.type, args.command);
+    this.db.prepare(`INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec)
+      VALUES (?,?,?,?,?,?,?,?)`).run(id, args.task_id ?? null, args.agent_id, args.type,
+        args.command ?? "", args.host ?? null, args.target_agent_id ?? null, args.agent ? JSON.stringify(args.agent) : null);
     this.log("job", id, "submitted", args.agent_id, args);
     return { id, status: "queued" };
   }
 
-  nextJob(agentId?: string) {
-    const job = this.db
-      .prepare("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at LIMIT 1")
-      .get() as any;
-    if (!job) return null;
-    this.db.prepare("UPDATE jobs SET status='running', started_at=datetime('now') WHERE id=?").run(job.id);
-    this.log("job", job.id, "started", agentId ?? "runner");
-    return job;
+  nextJob(agentId: string, host?: string, ttlSeconds = 60) {
+    const now = new Date().toISOString();
+    const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
+    return this.db.transaction(() => {
+      const job = this.db.prepare(`UPDATE jobs SET status='running', started_at=?, finished_at=NULL,
+        result='', runner_id=?, lease_token=?, lease_expires=? WHERE id=(
+        SELECT id FROM jobs WHERE (status='queued' OR (status='running' AND lease_expires<=?))
+        AND (host IS NULL OR host=?) AND (target_agent_id IS NULL OR target_agent_id=?)
+        ORDER BY created_at,id LIMIT 1) RETURNING *`)
+        .get(now, agentId, randomUUID(), expires, now, host ?? null, agentId) as any;
+      if (!job) return null;
+      this.log("job", job.id, "started", agentId, { host, lease_expires: expires });
+      return job;
+    })();
   }
 
-  finishJob(jobId: string, status: "done" | "failed", result: string) {
-    this.db.prepare("UPDATE jobs SET status=?, result=?, finished_at=datetime('now') WHERE id=?")
-      .run(status, result, jobId);
-    this.log("job", jobId, status, "runner", { result: result.slice(0, 500) });
-    const job = this.getJob(jobId) as any;
-    if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
-    return { id: jobId, status };
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+    const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
+    const updated = this.db.prepare(`UPDATE jobs SET lease_expires=?, result=COALESCE(?,result)
+      WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
+      .run(expires, result?.slice(-64000) ?? null, jobId, agentId, token, new Date().toISOString());
+    if (!updated.changes) return { error: "job lease not owned or expired" };
+    this.log("job", jobId, "renewed", agentId);
+    return { id: jobId, lease_expires: expires };
+  }
+
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+    return this.db.transaction(() => {
+      const updated = this.db.prepare(`UPDATE jobs SET status=?, result=?, finished_at=datetime('now'), lease_expires=NULL
+        WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
+        .run(status, result.slice(-64000), jobId, agentId, token, new Date().toISOString());
+      if (!updated.changes) return { error: "job lease not owned or expired" };
+      this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
+      const job = this.getJob(jobId) as any;
+      if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
+      return { id: jobId, status };
+    })();
   }
 
   getJob(id: string) {

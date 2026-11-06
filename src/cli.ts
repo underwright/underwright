@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
+import { hostname } from "node:os";
+import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
 import {
   syncIssues,
@@ -70,24 +71,28 @@ switch (cmd) {
     // Local job runner: executes queued jobs one at a time, records results.
     // This is the "agents wait on processes" half of the loop.
     const store = await openStore(dbPath);
-    let job;
+    const shutdown = new AbortController();
+    const stop = () => shutdown.abort();
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
     let ran = 0;
-    while ((job = await store.nextJob("local-runner"))) {
-      ran++;
-      console.log(`[underwright] running ${job.id}: ${job.command}`);
-      let status: "done" | "failed" = "done";
-      let result: string;
-      try {
-        result = execSync(job.command, { encoding: "utf8", timeout: 10 * 60 * 1000, stdio: ["ignore", "pipe", "pipe"] });
-      } catch (e: any) {
-        status = "failed";
-        result = `${e.stdout ?? ""}\n${e.stderr ?? e.message}`;
+    try {
+      let job;
+      while (!shutdown.signal.aborted && (job = await store.nextJob("local-runner", hostname()))) {
+        ran++;
+        console.log(`[underwright] running ${job.id}: ${job.command}`);
+        const finished = await executeLeasedJob(job, async (name, a) => name === "renew_job"
+          ? store.renewJob(a.job_id as string, a.agent_id as string, a.lease_token as string, a.ttl_seconds as number, a.result as string)
+          : store.finishJob(a.job_id as string, a.status as "done" | "failed", a.result as string, a.agent_id as string, a.lease_token as string),
+          { agentId: "local-runner", host: hostname(), signal: shutdown.signal, output: chunk => process.stdout.write(chunk) });
+        console.log(`[underwright] ${job.id} ${finished?.status ?? "interrupted"}`);
       }
-      await store.finishJob(job.id, status, result.slice(-8000));
-      console.log(`[underwright] ${job.id} ${status}`);
+      if (!ran) console.log("[underwright] no queued jobs");
+    } finally {
+      process.off("SIGTERM", stop);
+      process.off("SIGINT", stop);
+      await store.close();
     }
-    if (!ran) console.log("[underwright] no queued jobs");
-    await store.close();
     break;
   }
 
@@ -143,7 +148,7 @@ switch (cmd) {
 Usage:
   underwright serve              MCP server over stdio (local agent config).
   underwright serve --http H:P   MCP server over HTTP at host:port (/mcp) — shared across machines.
-  underwright run                Execute queued jobs locally (test/build/deploy/review).
+  underwright run                Execute queued jobs locally (including agent jobs).
   underwright board              Print the task board.
   underwright create             Create a task, optionally from a template (--template feature).
   underwright templates          List task templates (builtin + policy-defined).

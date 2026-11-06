@@ -183,9 +183,27 @@ Rules of engagement:
   server.tool("submit_job", "Submit long-running work (test/build/deploy/review) to the job queue and continue other work. Don't poll in-context — check job_status later or let the runner callback.", {
     agent_id: z.string(),
     task_id: z.string().optional(),
-    type: z.enum(["test", "build", "deploy", "review"]),
-    command: z.string(),
+    type: z.enum(["test", "build", "deploy", "review", "agent"]),
+    command: z.string().min(1).optional(),
+    host: z.string().min(1).optional(),
+    target_agent_id: z.string().min(1).optional(),
+    agent: z.object({ executable: z.string().min(1), args: z.array(z.string()), prompt: z.string().min(1) }).optional(),
   }, async (a) => text(await store.submitJob(a)));
+
+  server.tool("next_job", "Atomically lease the next eligible job. Supply the runner identity and host; retain lease_token for heartbeats and completion.", {
+    agent_id: z.string().min(1), host: z.string().min(1),
+    ttl_seconds: z.number().int().min(5).max(3600).optional(),
+  }, async (a) => text(await store.nextJob(a.agent_id, a.host, a.ttl_seconds)));
+
+  server.tool("renew_job", "Renew an owned job lease and upload a bounded live output snapshot.", {
+    job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
+    ttl_seconds: z.number().int().min(5).max(3600).optional(), result: z.string().optional(),
+  }, async (a) => text(await store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result)));
+
+  server.tool("finish_job", "Finish a job only while holding its current lease. Stale or foreign runners are rejected.", {
+    job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
+    status: z.enum(["done", "failed"]), result: z.string(),
+  }, async (a) => text(await store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token)));
 
   server.tool("job_status", "Check a submitted job's status and result.", {
     job_id: z.string(),

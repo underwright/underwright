@@ -166,6 +166,38 @@ async function matrix(token) {
     assert.equal(status.status, 'queued');
     assert.equal(status.command, 'echo contract');
     assert.equal((await call('job_status', { job_id: 'missing' })).error, 'not found');
+    const pinned = await call('submit_job', { agent_id: agent, type: 'test', command: 'echo remote',
+      host: 'host-A', target_agent_id: 'runner-A' });
+    const lease = await call('next_job', { agent_id: 'runner-B', host: 'host-B' }, second);
+    assert.equal(lease.id, job.id); // unpinned work is available to any runner
+    assert.equal(await call('next_job', { agent_id: 'runner-B', host: 'host-B' }, second), null);
+    assert.match((await call('finish_job', { job_id: job.id, agent_id: 'runner-A', lease_token: lease.lease_token,
+      status: 'done', result: 'stolen' })).error, /lease/);
+    await call('renew_job', { job_id: job.id, agent_id: 'runner-B', lease_token: lease.lease_token, result: 'live' }, second);
+    assert.equal((await call('job_status', { job_id: job.id })).result, 'live');
+    await call('finish_job', { job_id: job.id, agent_id: 'runner-B', lease_token: lease.lease_token, status: 'done', result: 'contract' }, second);
+
+    async function runnerOnce() {
+      const runner = spawn(process.execPath, ['dist/uw-runner.js', '--url', `${base}/mcp`, '--host', 'host-A',
+        '--agent-id', 'runner-A', '--once'], { cwd: root, env: { ...process.env, UNDERWRIGHT_TOKEN: token ?? '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let output = '';
+      runner.stdout.on('data', chunk => { output += chunk; });
+      runner.stderr.on('data', chunk => { output += chunk; });
+      const timer = setTimeout(() => runner.kill('SIGKILL'), 15000);
+      try {
+        const [code] = await once(runner, 'exit');
+        assert.equal(code, 0, output);
+        return output;
+      } finally { clearTimeout(timer); }
+    }
+    assert.match(await runnerOnce(), /remote/);
+    assert.equal((await call('job_status', { job_id: pinned.id })).status, 'done');
+    const agentJob = await call('submit_job', { agent_id: agent, type: 'agent', host: 'host-A',
+      agent: { executable: process.execPath, args: ['-e', 'console.log(process.argv[1])'],
+        prompt: 'Harness {{agent_id}} on {{host}} literal $(exit 99)' } });
+    assert.match(await runnerOnce(), /Harness runner-A on host-A literal \$\(exit 99\)/);
+    assert.equal((await call('job_status', { job_id: agentJob.id })).status, 'done');
+    await call('submit_job', { agent_id: agent, type: 'build', command: 'echo queued' });
     assert.match((await call('complete_task', { task_id, agent_id: agent })).error, /http-ac/);
     assert.match((await call('report_evidence', { task_id, agent_id: agent, kind: 'contract_test',
       command: 'HTTP matrix', exit_code: 0, output: 'verified', ac_ids: ['http-ac'] })).id, /^ev-/);

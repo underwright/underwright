@@ -164,3 +164,80 @@ unauthenticated and bearer-authenticated modes, initializes MCP clients, and
 exercises every advertised tool, shared state, and rejection paths. It uses
 temporary SQLite databases (ignoring `DATABASE_URL` and the workspace policy),
 then stops its servers and removes the temporary files. CI runs all three commands.
+
+### Remote fleet runner
+
+Start the shared control plane with `underwright serve --http 0.0.0.0:8741` and
+run a supervisor from each host's workspace directory:
+
+```sh
+UNDERWRIGHT_URL=https://control.example/mcp \
+UNDERWRIGHT_TOKEN=your-token \
+uw-runner --host minipc --agent-id codex-2@minipc
+```
+
+`uw-runner` polls the MCP endpoint, runs one job at a time in its current working
+directory, and reconnects after transport failures. Use `--poll-ms 2000` to set
+the idle interval and `--once` to process at most one job. `SIGINT`/`SIGTERM`
+stops the active process group and reports failure. Execution times out after
+ten minutes. Stdout and stderr stream locally and are uploaded in heartbeat
+snapshots; the final 64,000 characters are retained by `finish_job`.
+
+`submit_job` accepts optional `host` and `target_agent_id` affinity; both must
+match when supplied. `agent_id` remains the submitter identity. Unpinned jobs
+can run on any idle runner. `next_job` atomically claims a 60-second lease
+(configurable `ttl_seconds`), returning `runner_id`, `lease_token`, and
+`lease_expires`. `renew_job` and `finish_job` require that runner identity and
+attempt token. Expired jobs can be reclaimed; stale attempts cannot finish or
+renew them. Supervisors renew during execution and terminate their process
+group if they lose ownership. Leases provide at-least-once execution after
+host failure, so deploy commands should tolerate retries.
+
+Agent jobs pass a prompt directly to a harness CLI without shell expansion:
+
+```json
+{
+  "agent_id": "dispatcher@control",
+  "task_id": "gh-34",
+  "type": "agent",
+  "host": "minipc",
+  "target_agent_id": "codex-2@minipc",
+  "agent": {
+    "executable": "codex",
+    "args": ["exec", "{{prompt}}"],
+    "prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md, claim {{task_id}}, implement it, and report evidence. Job: {{job_id}}."
+  }
+}
+```
+
+For other installed harnesses, use `"executable": "grok", "args": ["--single"]`
+or `"executable": "agy", "args": ["--print"]`. The expanded prompt is appended
+as one argument when `{{prompt}}` is absent. Only `{{task_id}}`, `{{agent_id}}`,
+`{{host}}`, and `{{job_id}}` inside the prompt are expanded. The launched harness
+is responsible for claiming its task; a job lease does not claim that task.
+
+A host can supervise the process with systemd (set the workspace, executable
+path, and URL for your installation; put `UNDERWRIGHT_TOKEN` in the environment
+file):
+
+```ini
+[Unit]
+Description=Underwright fleet runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/alan/code/uw-fleet-runner
+Environment=UNDERWRIGHT_URL=https://control.example/mcp
+EnvironmentFile=/home/alan/.config/underwright/runner.env
+ExecStart=/usr/bin/node /home/alan/code/uw-fleet-runner/dist/uw-runner.js --host minipc --agent-id codex-2@minipc
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
+```
+
+Runners execute commands with the host user's permissions. Use the existing
+bearer-token HTTP authentication and TLS setup when connecting across hosts.

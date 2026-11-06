@@ -5,7 +5,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "underwright": "./dist/cli.js"
+    "underwright": "./dist/cli.js",
+    "uw-runner": "./dist/uw-runner.js"
   },
   "files": [
     "dist/",
