@@ -50,6 +50,7 @@ export interface IStore {
   finishJob(jobId: string, status: "done" | "failed", result: string): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
+  dashboard(eventsLimit?: number): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;
   close(): Awaitable<void>;
 }

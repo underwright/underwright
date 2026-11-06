@@ -7,6 +7,7 @@ import { openStore } from "./store.js";
 import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
+import { renderDashboard } from "./dashboard.js";
 
 // cli.ts reaches the store through this module so the edge stays cli → server → store.
 export { openStore };
@@ -243,6 +244,34 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     }
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
+      return;
+    }
+    // Read-only dashboard. Mutations stay on the MCP surface only.
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "/", "http://underwright.local");
+    } catch {
+      res.writeHead(400).end();
+      return;
+    }
+    if (url.pathname === "/" || url.pathname === "/board") {
+      if (req.method !== "GET") {
+        res.writeHead(405, { allow: "GET" }).end();
+        return;
+      }
+      const authorized = !token
+        || req.headers.authorization === `Bearer ${token}`
+        || url.searchParams.get("token") === token;
+      if (!authorized) {
+        res.writeHead(401, { "www-authenticate": "Bearer" }).end('{"error":"unauthorized"}');
+        return;
+      }
+      const html = renderDashboard(await store.dashboard());
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "x-underwright-dashboard": "read-only",
+      }).end(html);
       return;
     }
     res.writeHead(404).end();

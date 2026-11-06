@@ -539,6 +539,13 @@ export class PgStore implements IStore {
     }
   }
 
+  /** Everything the read-only web dashboard needs in one round trip. */
+  async dashboard(eventsLimit = 25) {
+    const locks = await this.sql`SELECT * FROM locks WHERE lease_expires > now() ORDER BY resource`;
+    const jobs = await this.sql`SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at DESC`;
+    return { ...await this.board(), locks, jobs, events: await this.auditLog(eventsLimit) };
+  }
+
   async auditLog(limit = 50) {
     return this.sql`SELECT * FROM events ORDER BY id DESC LIMIT ${limit}`;
   }
