@@ -174,21 +174,34 @@ confirm() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# WSL interop appends the Windows PATH, so `command -v` can resolve Windows
+# shims under /mnt/c/... that cannot run correctly inside WSL.
+native_bin() {
+  local p
+  p=$(command -v "$1" 2>/dev/null) || return 1
+  case "$p" in /mnt/*) return 1 ;; esac
+  printf '%s\n' "$p"
+}
+
 resolve_bin() {
   case "$1" in
-    codex) command -v codex 2>/dev/null || true ;;
-    claude) command -v claude 2>/dev/null || true ;;
-    antigravity) command -v agy 2>/dev/null || true ;;
-    kimi) command -v kimi 2>/dev/null || true ;;
-    opencode) command -v opencode 2>/dev/null || true ;;
+    codex) native_bin codex 2>/dev/null || true ;;
+    claude) native_bin claude 2>/dev/null || true ;;
+    antigravity) native_bin agy 2>/dev/null || true ;;
+    kimi) native_bin kimi 2>/dev/null || true ;;
+    opencode) native_bin opencode 2>/dev/null || true ;;
     command-code)
-      command -v command-code 2>/dev/null || command -v cmd 2>/dev/null || command -v cmdc 2>/dev/null || true
+      native_bin command-code 2>/dev/null || native_bin cmd 2>/dev/null || native_bin cmdc 2>/dev/null || true
       ;;
-    cline) command -v cline 2>/dev/null || true ;;
-    grok) command -v grok 2>/dev/null || true ;;
-    cursor) command -v agent 2>/dev/null || true ;;
+    cline) native_bin cline 2>/dev/null || true ;;
+    grok) native_bin grok 2>/dev/null || true ;;
+    cursor) native_bin agent 2>/dev/null || true ;;
   esac
 }
+
+# True when a Windows shim exists for the binary even though no usable
+# WSL-native binary does — used to explain "not installed" more clearly.
+windows_shim_exists() { command -v "$1" 2>/dev/null | grep -q '^/mnt/'; }
 
 safe_version() {
   local agent=$1 bin output
@@ -234,14 +247,31 @@ run_official_installer() {
   fi
   chmod 700 "$installer"
   info "Running downloaded installer in a temporary directory (credentials are not involved)."
-  bash "$installer"
+  # Feed blank lines so vendor post-install prompts (e.g. "Start now? [y/N]")
+  # take their defaults instead of hijacking this script's terminal.
+  yes '' | bash "$installer"
   rc=$?
   rm -rf "$tmpdir"
   return "$rc"
 }
 
+# npm --global fails with EACCES when the prefix is a root-owned system dir
+# (/usr/lib, /usr/local). Detect before attempting and give a fix path.
+require_writable_npm_prefix() {
+  local label=$1 prefix
+  prefix=$(npm config get prefix 2>/dev/null || true)
+  if [[ -n $prefix && $prefix != "$HOME"* && ! -w $prefix ]]; then
+    err "$label needs 'npm install -g' but your npm global prefix ($prefix) is not writable by $USER.
+      Fix once, then rerun:
+        npm config set prefix ~/.local        # per-user global installs
+      or remove the existing root-owned install and keep the system prefix:
+        sudo npm rm -g <package>"
+    return 1
+  fi
+}
+
 install_agent() {
-  local agent=$1 label bin
+  local agent=$1 label bin shim_note=1
   label=$(agent_label "$agent")
   section "Install: $label"
   bin=$(resolve_bin "$agent")
@@ -249,6 +279,14 @@ install_agent() {
     safe_version "$agent" || true
     confirm "Run the official installer to update/reinstall $label?" || { info "Skipped $label."; return 0; }
   elif [[ -z $bin ]]; then
+    case "$agent" in
+      command-code) windows_shim_exists command-code || windows_shim_exists cmdc || windows_shim_exists cmd || shim_note=0 ;;
+      cursor) windows_shim_exists agent || shim_note=0 ;;
+      *) windows_shim_exists "$agent" || shim_note=0 ;;
+    esac
+    if (( shim_note )); then
+      warn "Only a Windows shim for $label was found under /mnt/ — it cannot run inside WSL; a native install is needed."
+    fi
     confirm "Install $label?" || { info "Skipped $label."; return 0; }
   fi
 
@@ -260,10 +298,12 @@ install_agent() {
     opencode) run_official_installer "$label" "https://opencode.ai/install" ;;
     command-code)
       require_npm_and_node 22 "$label" || return 1
+      require_writable_npm_prefix "$label" || return 1
       npm install --global command-code@latest
       ;;
     cline)
       require_npm_and_node 20 "$label" || return 1
+      require_writable_npm_prefix "$label" || return 1
       npm install --global cline
       ;;
     grok) run_official_installer "$label" "https://x.ai/cli/install.sh" ;;
