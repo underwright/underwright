@@ -4,6 +4,8 @@
   "description": "Control plane for agentic software development: shared task registry, agent coordination, and evidence-backed completion.",
   "license": "Apache-2.0",
   "type": "module",
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
   "bin": {
     "underwright": "./dist/cli.js",
     "uw-runner": "./dist/uw-runner.js"
@@ -13,8 +15,23 @@
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/underwright/underwright.git"
+  },
+  "homepage": "https://github.com/underwright/underwright#readme",
+  "bugs": {
+    "url": "https://github.com/underwright/underwright/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
+    "preversion": "npm test",
+    "version": "npm run build",
     "start": "node dist/cli.js serve",
     "dev": "tsc --watch",
     "test": "vitest run",
