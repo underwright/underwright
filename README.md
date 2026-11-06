@@ -49,6 +49,19 @@ Point any MCP-capable agent at the server:
 }
 ```
 
+Scaffold a new workspace in one command:
+
+```bash
+underwright init                              # AGENTS.md, .mcp.json, policy, .gitignore + triage task
+underwright init --remote http://host:8741    # http .mcp.json variant (Bearer ${UNDERWRIGHT_TOKEN})
+underwright init --force                      # regenerate files that already exist
+```
+
+`init` skips existing files unless `--force` is passed and is safe to rerun —
+it never duplicates the triage task or repeated ignore entries. The `http`
+variant expects `UNDERWRIGHT_TOKEN` on the server and every agent host; start
+the server with `UNDERWRIGHT_TOKEN=<token> underwright serve --http <host:port>`.
+
 Or build from a local checkout:
 
 ```bash
@@ -59,6 +72,7 @@ npm run build
 Or run the CLI directly:
 
 ```bash
+underwright init               # scaffold a workspace (AGENTS.md, .mcp.json, policy, triage task)
 underwright serve              # MCP server over stdio (local agent)
 underwright serve --http H:P   # shared MCP over HTTP (/mcp) — multi-machine
 underwright run                # execute queued jobs locally
