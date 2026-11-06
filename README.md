@@ -64,11 +64,19 @@ underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
 `Authorization: Bearer <token>` (`/health` stays open).
 
+<<<<<<< HEAD
 Every `serve --http` instance also serves a read-only HTML board at `/board`
 (or `/`): tasks, claims, leases, active resource locks, open jobs, and recent
 events, auto-refreshing every few seconds. It is observability only — all
 mutations stay on `/mcp`. With `UNDERWRIGHT_TOKEN` set, pass the token via
 `Authorization: Bearer` or `?token=`.
+=======
+`serve --http` also exposes `POST /github/webhook`. Set
+`UNDERWRIGHT_GITHUB_WEBHOOK_SECRET` and point a repository webhook at that
+path so check runs, issue edits, and pull-request reviews update tasks and
+evidence without polling. Setup steps are in [docs/webhook.md](docs/webhook.md).
+The webhook authenticates with HMAC. The bearer token stays on `/mcp`.
+>>>>>>> origin/feat/webhook-receiver
 
 Tasks can declare `blocked_by: [task_ids]` in `create_task` or `update_task`.
 Updating this field replaces the dependency list; `[]` clears it, while omitting

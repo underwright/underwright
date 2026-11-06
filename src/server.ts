@@ -8,6 +8,7 @@ import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
 import { renderDashboard } from "./dashboard.js";
+import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 
 // cli.ts reaches the store through this module so the edge stays cli → server → store.
 export { openStore };
@@ -250,11 +251,23 @@ export async function serve(dbPath: string) {
 }
 
 /** Shared control plane over HTTP — agents on any machine connect to /mcp.
- *  Bearer auth required when UNDERWRIGHT_TOKEN is set; /health stays open. */
+ *  Bearer auth required when UNDERWRIGHT_TOKEN is set. /health stays open.
+ *  POST /github/webhook stays open and authenticates with the HMAC secret. */
 export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
   const store = await openStore(dbPath);
   const stopSweeper = startLeaseSweeper(store);
   const http = createHttpServer(async (req, res) => {
+    if (isGithubWebhookRequest(req.url)) {
+      try {
+        await handleGithubWebhookHttp(store, req, res, webhookSecretFromEnv());
+      } catch (error) {
+        console.error("[underwright] webhook failed:", error);
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" }).end('{"error":"webhook handler failed"}');
+        }
+      }
+      return;
+    }
     if (token && req.url === "/mcp") {
       const auth = req.headers.authorization;
       if (auth !== `Bearer ${token}`) {
@@ -322,6 +335,8 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     await store.close();
     throw error;
   }
-  console.error(`[underwright] MCP over HTTP at http://${host}:${port}/mcp (stateless${token ? ", bearer-auth" : ", NO AUTH — set UNDERWRIGHT_TOKEN for shared use"})`);
+  const bound = http.address();
+  const boundPort = typeof bound === "object" && bound ? bound.port : port;
+  console.error(`[underwright] MCP over HTTP at http://${host}:${boundPort}/mcp (stateless${token ? ", bearer-auth" : ", NO AUTH — set UNDERWRIGHT_TOKEN for shared use"}); GitHub webhook POST /github/webhook`);
   return http;
 }

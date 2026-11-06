@@ -165,7 +165,7 @@ switch (cmd) {
 
 Usage:
   underwright serve              MCP server over stdio (local agent config).
-  underwright serve --http H:P   MCP server over HTTP at host:port (/mcp) — shared across machines.
+  underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
   underwright board              Print the task board.
   underwright create             Create a task, optionally from a template (--template feature).
@@ -173,5 +173,8 @@ Usage:
   underwright speckit import     Import Spec Kit markdown (constitution/spec/plan/tasks) and link ac_ids.
 
 Env:
-  UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)`);
+  UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)
+  UNDERWRIGHT_GITHUB_WEBHOOK_SECRET
+                      HMAC secret for POST /github/webhook.
+                      GITHUB_WEBHOOK_SECRET is the fallback. See docs/webhook.md.`);
 }
