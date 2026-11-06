@@ -61,6 +61,7 @@ export interface IStore {
   renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
+  dashboard(eventsLimit?: number): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;
   close(): Awaitable<void>;
 }

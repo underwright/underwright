@@ -63,6 +63,12 @@ underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 For shared HTTP use, set `UNDERWRIGHT_TOKEN` — `/mcp` then requires
 `Authorization: Bearer <token>` (`/health` stays open).
 
+Every `serve --http` instance also serves a read-only HTML board at `/board`
+(or `/`): tasks, claims, leases, active resource locks, open jobs, and recent
+events, auto-refreshing every few seconds. It is observability only — all
+mutations stay on `/mcp`. With `UNDERWRIGHT_TOKEN` set, pass the token via
+`Authorization: Bearer` or `?token=`.
+
 Tasks can declare `blocked_by: [task_ids]` in `create_task` or `update_task`.
 Updating this field replaces the dependency list; `[]` clears it, while omitting
 it preserves existing edges. Task reads, lists, and the board expose `blocked_by`,

@@ -642,6 +642,16 @@ export class SqliteStore implements IStore {
     return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers };
   }
 
+  /** Everything the read-only web dashboard needs in one round trip. */
+  dashboard(eventsLimit = 25) {
+    const now = new Date().toISOString();
+    const locks = this.db.prepare("SELECT * FROM locks WHERE lease_expires > ? ORDER BY resource").all(now);
+    const jobs = this.db
+      .prepare("SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at DESC")
+      .all();
+    return { ...this.board(), locks, jobs, events: this.auditLog(eventsLimit) };
+  }
+
   auditLog(limit = 50) {
     return this.db.prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit);
   }

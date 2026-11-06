@@ -54,6 +54,28 @@ async function matrix(token) {
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { ok: true });
     assert.equal((await request('/missing')).status, 404);
+
+    // Dashboard: read-only, server-rendered, auto-refreshing, token-consistent.
+    const dashPath = token ? `/board?token=${encodeURIComponent(token)}` : '/board';
+    const dash = await request(dashPath);
+    assert.equal(dash.status, 200);
+    assert.match(dash.headers.get('content-type') ?? '', /text\/html/);
+    assert.equal(dash.headers.get('x-underwright-dashboard'), 'read-only');
+    const dashHtml = await dash.text();
+    assert.match(dashHtml, /<meta http-equiv="refresh"/);
+    assert.match(dashHtml, /Underwright board/);
+    assert(!dashHtml.includes('<form'), 'dashboard must not expose mutation forms');
+    if (token) {
+      assert.equal((await request('/board')).status, 401);
+      assert.equal((await request('/')).status, 401);
+      const headerDash = await request('/board', { headers: { authorization: `Bearer ${token}` } });
+      assert.equal(headerDash.status, 200);
+      await headerDash.text();
+    } else {
+      assert.equal((await request('/')).status, 200);
+    }
+    assert.equal((await request('/board', { method: 'POST' })).status, 405);
+    assert.equal((await request('/', { method: 'POST' })).status, 405);
     const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream',
       ...(token ? { authorization: `Bearer ${token}` } : {}) };
     if (token) {
@@ -216,6 +238,9 @@ async function matrix(token) {
     assert.equal(board.tasks.find(t => t.id === task_id).status, 'done');
     assert.equal(board.helpers_registered, 1);
     assert(board.job_counts.some(j => j.status === 'queued' && j.n === 1));
+    const dashAfter = await (await request(dashPath)).text();
+    assert.match(dashAfter, /Updated HTTP matrix/);
+    assert.match(dashAfter, /queued/);
     assert.deepEqual([...exercised].sort(), listed.tools.map(t => t.name).sort(),
       'Every advertised tool must have a contract case');
     console.log(`PASS ${token ? 'bearer auth' : 'no auth'}: initialize, ${exercised.size} tools, shared state, rejection paths, HTTP checks`);
