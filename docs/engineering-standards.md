@@ -76,7 +76,10 @@ applies it. Enforcement is progressive: `observe → warn → block`.
   proven to degrade quality.
 - **Control plane**: schema: `evidence.agent_id` must differ from
   `claims.agent_id` for `kind:"review"` — enforce in `complete_task` when
-  DoD requires review.
+  DoD requires review. Task type `review` links to its subject with
+  `review_of`. `claim_task` refuses when the reviewer is that implementer.
+  The dispatcher assigns review tasks to a different harness, preferring a
+  stronger tier. Design reviews of architecture tasks prefer a high tier.
 - **This repo**: PRs reviewed by a different harness than the author where
   possible; human sign-off on what matters.
 

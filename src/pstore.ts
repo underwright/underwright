@@ -3,7 +3,7 @@ import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, AR
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
-import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   type        TEXT NOT NULL DEFAULT 'feature',
   severity    TEXT NOT NULL DEFAULT 'normal',
   estimate    TEXT NOT NULL DEFAULT '',
+  review_of   TEXT,
+  review_kind TEXT,
   status      TEXT NOT NULL DEFAULT 'open'
               CHECK (status IN ('open','claimed','in_review','done','blocked')),
   priority    INT NOT NULL DEFAULT 2,
@@ -130,6 +132,9 @@ export class PgStore implements IStore {
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_of TEXT`;
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_kind TEXT`;
+    await sql`CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of)`;
     return new PgStore(sql);
   }
 
@@ -197,14 +202,20 @@ export class PgStore implements IStore {
 
   private async createTaskAtomic(a: CreateTaskArgs) {
     const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const subject = a.review_of?.trim()
+      ? (await this.sql<{ id: string; type: string }[]>`SELECT id, type FROM tasks WHERE id=${a.review_of.trim()}`)[0]
+      : undefined;
+    const linked = linkedReviewArgs(a, subject ?? null);
+    if (linked.error) return { error: linked.error };
+    a = linked.args;
     const invalid = await this.validateDependencies(id, a.blocked_by ?? []);
     if (invalid) return { error: invalid };
     await this.sql`
-      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
+      INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate, review_of, review_kind)
       VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
               ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
               ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"},
-              ${a.severity ?? "normal"},${a.estimate ?? ""})`;
+              ${a.severity ?? "normal"},${a.estimate ?? ""},${linked.reviewOf},${a.review_kind ?? null})`;
     await this.replaceDependencies(id, a.blocked_by ?? []);
     await this.log("task", id, "created", a.created_by ?? "human", a);
     return this.getTask(id);
@@ -218,7 +229,15 @@ export class PgStore implements IStore {
     const [t] = await this.sql<any[]>`SELECT * FROM tasks WHERE id = ${id}`;
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
-    return { ...t, ...await this.dependencies(id, t.status), claim: claim ?? null, artifacts: await this.listArtifacts(id) };
+    return {
+      ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
+      artifacts: await this.listArtifacts(id), reviews: await this.reviewIds(id),
+    };
+  }
+
+  private async reviewIds(id: string): Promise<string[]> {
+    const rows = await this.sql<{ id: string }[]>`SELECT id FROM tasks WHERE review_of=${id} ORDER BY id`;
+    return rows.map((row) => row.id);
   }
 
   async setTaskStatus(id: string, status: TaskStatus, actor: string) {
@@ -295,6 +314,11 @@ export class PgStore implements IStore {
     const dor = evaluateDoR(task, loadPolicy());
     if (!dor.ready) {
       return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
+    }
+
+    if (task.type === "review" && task.review_of && claim?.agent_id !== agentId) {
+      const independence = reviewIndependenceError(agentId, await this.implementerOf(task.review_of), task.review_of);
+      if (independence) return { error: independence };
     }
 
     const expires = new Date(Date.now() + ttlSeconds * 1000);
@@ -498,17 +522,70 @@ export class PgStore implements IStore {
     };
   }
 
+  private async taskRouteMeta(id: string) {
+    const [row] = await this.sql<{ type: string; review_of: string | null; review_kind: string | null }[]>`
+      SELECT type, review_of, review_kind FROM tasks WHERE id=${id}`;
+    if (!row) return null;
+    return { type: row.type, review_of: row.review_of ?? null, review_kind: row.review_kind ?? null };
+  }
+
+  private async implementerOf(subjectId: string): Promise<string | null> {
+    const [completed] = await this.sql<{ actor: string }[]>`
+      SELECT actor FROM events WHERE entity_type='task' AND entity_id=${subjectId} AND action='completed' ORDER BY id DESC LIMIT 1`;
+    const [claim] = await this.sql<{ agent_id: string }[]>`SELECT agent_id FROM claims WHERE task_id=${subjectId}`;
+    const [claimed] = await this.sql<{ actor: string }[]>`
+      SELECT actor FROM events WHERE entity_type='task' AND entity_id=${subjectId} AND action='claimed' ORDER BY id DESC LIMIT 1`;
+    const [artifact] = await this.sql<{ agent_id: string }[]>`
+      SELECT agent_id FROM artifacts WHERE task_id=${subjectId} AND kind IN ('design','spec') ORDER BY created_at DESC LIMIT 1`;
+    const [created] = await this.sql<{ created_by: string }[]>`SELECT created_by FROM tasks WHERE id=${subjectId}`;
+    return implementerFromRecords({
+      completedBy: completed?.actor,
+      claimAgent: claim?.agent_id,
+      lastClaimedBy: claimed?.actor,
+      artifactAuthor: artifact?.agent_id,
+      createdBy: created?.created_by,
+    });
+  }
+
+  /** Assign the next open task. Review tasks go to a different harness than the implementer. */
   private async dispatchNext(agentId: string, excludeTaskId: string, trigger: "complete" | "release") {
     const policy = getDispatcherPolicy(loadPolicy());
     if (!policy.enabled) return null;
     const workload = await this.agentWorkload(agentId);
-    if (overCap(workload, policy.max_tasks_per_agent)) {
+    const capped = overCap(workload, policy.max_tasks_per_agent);
+    if (capped) {
       await this.log("task", excludeTaskId, "dispatch_capped", DISPATCHER_AGENT, {
         agent_id: agentId, workload, max: policy.max_tasks_per_agent, trigger,
       });
-      return null;
     }
-    for (const taskId of await this.dispatchCandidates(excludeTaskId)) {
+    const candidates = await this.dispatchCandidates(excludeTaskId);
+    const normals: string[] = [];
+    let self: { task_id: string; agent_id: string } | null = null;
+    for (const taskId of candidates) {
+      const meta = await this.taskRouteMeta(taskId);
+      if (meta?.type !== "review") {
+        normals.push(taskId);
+        continue;
+      }
+      const reviewer = chooseReviewer({
+        implementer: meta.review_of ? await this.implementerOf(meta.review_of) : null,
+        agents: (await this.knownAgentWorkloads()).filter((a) => !(capped && a.id === agentId)),
+        max: policy.max_tasks_per_agent,
+        requireDifferentHarness: policy.review.require_different_harness,
+        preferStronger: policy.review.prefer_stronger,
+        designReview: meta.review_kind === "design",
+      });
+      if (!reviewer || (self && reviewer === agentId)) continue;
+      const claimed = await this.claimTaskAtomic(taskId, reviewer) as { error?: string };
+      if (claimed.error) continue;
+      await this.sendMessage(reviewer, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
+      await this.log("task", taskId, "dispatched", DISPATCHER_AGENT, {
+        agent_id: reviewer, trigger, from_task: excludeTaskId, review: true,
+      });
+      if (reviewer === agentId) self = { task_id: taskId, agent_id: agentId };
+    }
+    if (self || capped) return self;
+    for (const taskId of normals) {
       const claimed = await this.claimTaskAtomic(taskId, agentId) as { error?: string };
       if (claimed.error) continue;
       await this.sendMessage(agentId, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
@@ -616,11 +693,21 @@ export class PgStore implements IStore {
         await mark("not_open", { status: task.status });
         continue;
       }
-      const next = chooseReassignAgent({
-        assignee: row.assignee,
-        agents: await this.knownAgentWorkloads(),
-        max: policy.max_tasks_per_agent,
-      });
+      const meta = await this.taskRouteMeta(row.taskId);
+      const next = meta?.type === "review"
+        ? chooseReviewer({
+          implementer: meta.review_of ? await this.implementerOf(meta.review_of) : null,
+          agents: (await this.knownAgentWorkloads()).filter((a) => a.id !== row.assignee),
+          max: policy.max_tasks_per_agent,
+          requireDifferentHarness: policy.review.require_different_harness,
+          preferStronger: policy.review.prefer_stronger,
+          designReview: meta.review_kind === "design",
+        })
+        : chooseReassignAgent({
+          assignee: row.assignee,
+          agents: await this.knownAgentWorkloads(),
+          max: policy.max_tasks_per_agent,
+        });
       if (!next) { await mark("no_alternate_agent"); continue; }
       const claimed = await this.claimTaskAtomic(row.taskId, next) as { error?: string };
       if (claimed.error) { await mark("claim_failed", { error: claimed.error }); continue; }

@@ -49,8 +49,12 @@ Rules of engagement:
     priority: z.number().int().min(0).max(4).optional(),
     ownership: z.object({ paths: z.array(z.string()).optional(), symbols: z.array(z.string()).optional() }).optional()
       .describe("file globs / symbols this task owns"),
-    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage"]).optional()
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage", "review"]).optional()
       .describe("task type — drives Definition-of-Done requirements at completion"),
+    review_of: z.string().optional()
+      .describe("subject task id. Sets type review and links the review. Code reviews wait until the subject is done. Architecture subjects are design reviews and are not blocked on the subject."),
+    review_kind: z.enum(["code", "design"]).optional()
+      .describe("code waits on the subject; design does not. Defaults from the subject type."),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional().describe("effort in agent-sessions"),
     template: z.string().optional()
@@ -69,7 +73,7 @@ Rules of engagement:
     spec_ref: z.string().optional(),
     blocked_by: z.array(z.string()).optional().describe("task ids that must be done before claiming; update replaces the list, [] clears it"),
     ac_ids: z.array(z.string()).optional(),
-    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage"]).optional(),
+    type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage", "review"]).optional(),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional(),
   }, async (a) => {

@@ -437,3 +437,5 @@ should prefer the cheapest harness that satisfies task complexity (#54).
 
 Free tier does not mean unreviewed: free/low-tier implementations still
 need independent review evidence before merge (peer-review policy).
+Review tasks route to a different harness than the implementer, preferring
+a stronger tier. Design reviews prefer a high-tier harness.
