@@ -1,11 +1,13 @@
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentBackend, AgentJobSpec } from "./istore.js";
-import { getHarnessBackend, type Policy } from "./policy.js";
+import { getHarnessBackend, getHarnessMatrix, type Policy } from "./policy.js";
 
 export type JobCall = (name: string, args: Record<string, unknown>) => Promise<any>;
 
-/** Harnesses omnigent can drive today; anything else launches raw (see docs/multi-harness.md). */
+/** Built-in omnigent coverage table: which harnesses `omni run` can drive
+ *  today. The policy harness_matrix.coverage overrides these defaults;
+ *  harnesses not marked true (or absent) launch raw. */
 export const OMNIGENT_HARNESS_SUPPORT: Record<string, boolean> = {
   codex: true,
   "claude-sdk": true,
@@ -39,18 +41,23 @@ export interface AgentInvocation {
 
 const executableBase = (path: string) => path.split(/[\\/]/).pop() ?? path;
 
-/** Expand only known placeholders; prompts are passed as argv, never shell code. */
+/** Expand only known placeholders; prompts are passed as argv, never shell code.
+ *  Resolution order: per-job spec fields win, then the policy harness_matrix
+ *  (exact agent_id, then "*"), then built-in defaults. Omnigent is preferred
+ *  whenever the resolved backend is omnigent, `omni` is on PATH, and the
+ *  harness is in the coverage table; anything else falls back to the raw CLI. */
 export function agentInvocation(job: any, agentId: string, host: string, context: InvocationContext = {}): AgentInvocation {
   const spec: AgentJobSpec = typeof job.agent_spec === "string" ? JSON.parse(job.agent_spec) : job.agent_spec;
   if (!spec?.executable || !Array.isArray(spec.args) || !spec.prompt) throw new Error("invalid agent job specification");
   const values: Record<string, string> = { task_id: job.task_id ?? "", agent_id: agentId, host, job_id: job.id };
   const prompt = spec.prompt.replace(/\{\{(task_id|agent_id|host|job_id)\}\}/g, (_, key) => values[key]);
-  // Per-job spec fields win; the policy matrix (exact agent_id, then "*") supplies defaults.
-  const matrix = getHarnessBackend(agentId, context.policy);
-  const harness = spec.harness ?? matrix.harness ?? executableBase(spec.executable);
-  const backend = spec.backend ?? matrix.backend ?? "raw";
-  const server = spec.server ?? matrix.server;
-  if (backend === "omnigent" && (context.omniAvailable ?? omniAvailable()) && OMNIGENT_HARNESS_SUPPORT[harness]) {
+  const matrix = getHarnessMatrix(context.policy);
+  const pref = matrix.agents[agentId] ?? matrix.agents["*"] ?? {};
+  const harness = spec.harness ?? pref.harness ?? executableBase(spec.executable);
+  const coverage = { ...OMNIGENT_HARNESS_SUPPORT, ...matrix.coverage };
+  const backend = spec.backend ?? pref.backend ?? (coverage[harness] === true ? "omnigent" : "raw");
+  const server = spec.server ?? pref.server;
+  if (backend === "omnigent" && (context.omniAvailable ?? omniAvailable()) && coverage[harness] === true) {
     const args = ["run", "--harness", harness];
     if (server) args.push("--server", server);
     args.push("-p", prompt);
