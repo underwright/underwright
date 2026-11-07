@@ -437,3 +437,9 @@ should prefer the cheapest harness that satisfies task complexity (#54).
 
 Free tier does not mean unreviewed: free/low-tier implementations still
 need independent review evidence before merge (peer-review policy).
+
+## Subscription routing (policy)
+
+- **claude** — Aura/work projects ONLY (work subscription). Never dispatch claude to OSS boards.
+- **Everything else** — free/personal harnesses (devin swe-2, cmdc, opencode, grok, agy, codex, kimi) for underwright/kraftina/OSS work.
+- Board isolation: Aura board (:8743) gets its own token + agent_id pool; claude@* ids may only appear there.
