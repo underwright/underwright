@@ -423,3 +423,17 @@ Rules:
 - [ ] Code lives in a worktree or a separate clone on a `feat/<topic>` branch
 - [ ] Headless entrypoint matches the harness (`claude -p`, `codex exec`, `grok --single`, `cmdc -p --yolo`, `agy --print`)
 - [ ] `main` is not the branch being committed
+
+## Cost tiers (dispatch guidance for #53)
+
+Observed economics — update as quotas/pricing change. The dispatcher
+should prefer the cheapest harness that satisfies task complexity (#54).
+
+| Tier | Harnesses | Notes |
+|---|---|---|
+| free | devin (swe-2), cmdc (command-code), opencode (free models) | devin@swe-2 has no marginal cost; cmdc/opencode have usable free tiers |
+| low | codex, grok | subscription/quota-bound |
+| high | claude, agy (Gemini), kimi | reserve for design/epics/review |
+
+Free tier does not mean unreviewed: free/low-tier implementations still
+need independent review evidence before merge (peer-review policy).
