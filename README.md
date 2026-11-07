@@ -149,7 +149,9 @@ git push origin main --follow-tags
 | `post_artifact` | Specs, designs, handoffs, reviews, and blocked escalations — durable, searchable |
 | `import_speckit` | Import Spec Kit `constitution.md`/`spec.md`/`plan.md`/`tasks.md` as spec artifacts and link `ac_ids` |
 | `search_context` | FTS over helpers + artifacts — call before writing shared code |
-| `register_helper` | Publish a reusable util/pattern/config |
+| `register_helper` | Publish a reusable util/pattern/config/fixture; `executable` helpers carry an `entry_point` command template |
+| `run_helper` | Execute a built-in playbook or registered executable helper — sync (bounded) or via the job queue; every run is recorded |
+| `helper_metrics` | Tools-over-inference: helper invocations vs agent control-plane actions per task |
 | `report_evidence` | Attach test/CI/review proof citing acceptance criteria |
 | `complete_task` | Refuses unless every AC has cited evidence |
 | `submit_job` / `job_status` | Async job queue — wait on processes, not inference |

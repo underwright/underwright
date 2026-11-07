@@ -1,12 +1,13 @@
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, PG_HELPERS_MIGRATION, PG_HELPER_RUNS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind, isHelperKind, HELPER_KIND_SQL } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
+import { PLAYBOOKS, getPlaybook, renderCommand, runCommandSync } from "./playbooks.js";
+import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult, RegisterHelperArgs, RunHelperArgs } from "./istore.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -59,11 +60,29 @@ CREATE TABLE IF NOT EXISTS helpers (
   agent_id   TEXT NOT NULL,
   path       TEXT NOT NULL,
   symbol     TEXT NOT NULL DEFAULT '',
-  kind       TEXT NOT NULL CHECK (kind IN ('util','pattern','config','fixture')),
+  kind       TEXT NOT NULL CHECK (kind IN (${HELPER_KIND_SQL})),
   summary    TEXT NOT NULL,
+  entry_point TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   UNIQUE (path, symbol)
 );
+CREATE TABLE IF NOT EXISTS helper_runs (
+  id          TEXT PRIMARY KEY,
+  helper_name TEXT NOT NULL,
+  helper_id   TEXT,
+  task_id     TEXT,
+  agent_id    TEXT NOT NULL,
+  mode        TEXT NOT NULL CHECK (mode IN ('sync','job')),
+  status      TEXT NOT NULL,
+  command     TEXT NOT NULL DEFAULT '',
+  job_id      TEXT,
+  exit_code   INT,
+  output      TEXT NOT NULL DEFAULT '',
+  duration_ms INT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS helper_runs_task ON helper_runs(task_id);
+CREATE INDEX IF NOT EXISTS helper_runs_name ON helper_runs(helper_name);
 CREATE TABLE IF NOT EXISTS jobs (
   id          TEXT PRIMARY KEY,
   task_id     TEXT REFERENCES tasks(id),
@@ -127,10 +146,24 @@ export class PgStore implements IStore {
     await sql.unsafe(DDL);
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
+    await sql.unsafe(PG_HELPERS_MIGRATION);
+    await sql.unsafe(PG_HELPER_RUNS_SCHEMA);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
-    return new PgStore(sql);
+    const store = new PgStore(sql);
+    await store.seedPlaybooks();
+    return store;
+  }
+
+  /** Ship the built-in playbooks as executable helpers so search_context finds them. */
+  private async seedPlaybooks() {
+    for (const p of PLAYBOOKS) {
+      await this.sql`
+        INSERT INTO helpers (id, agent_id, path, symbol, kind, summary, entry_point)
+        VALUES (${`hlp-playbook-${p.name}`}, 'underwright', 'playbook', ${p.name}, 'executable', ${`Built-in playbook: ${p.description}`}, ${p.command})
+        ON CONFLICT(path, symbol) DO NOTHING`;
+    }
   }
 
   async log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -636,12 +669,105 @@ export class PgStore implements IStore {
     return { reassigned, logged };
   }
 
-  async registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {
+  async registerHelper(a: RegisterHelperArgs) {
+    if (!isHelperKind(a.kind)) return { error: `unknown helper kind ${a.kind}` };
+    if (a.kind === "executable" && !a.entry_point)
+      return { error: "executable helpers require an entry_point command template" };
     const id = `hlp-${randomUUID().slice(0, 8)}`;
-    await this.sql`INSERT INTO helpers (id, agent_id, path, symbol, kind, summary) VALUES (${id},${a.agent_id},${a.path},${a.symbol ?? ""},${a.kind},${a.summary})
-      ON CONFLICT(path, symbol) DO UPDATE SET summary=EXCLUDED.summary, agent_id=EXCLUDED.agent_id`;
+    await this.sql`INSERT INTO helpers (id, agent_id, path, symbol, kind, summary, entry_point) VALUES (${id},${a.agent_id},${a.path},${a.symbol ?? ""},${a.kind},${a.summary},${a.entry_point ?? ""})
+      ON CONFLICT(path, symbol) DO UPDATE SET summary=EXCLUDED.summary, agent_id=EXCLUDED.agent_id, kind=EXCLUDED.kind, entry_point=EXCLUDED.entry_point`;
     await this.log("helper", id, "registered", a.agent_id, a);
     return { id };
+  }
+
+  private async recordHelperRun(row: {
+    helper_name: string; helper_id?: string | null; task_id?: string | null; agent_id: string;
+    mode: string; status: string; command: string; job_id?: string | null;
+    exit_code?: number | null; output?: string; duration_ms?: number | null;
+  }) {
+    await this.sql`INSERT INTO helper_runs (id, helper_name, helper_id, task_id, agent_id, mode, status, command, job_id, exit_code, output, duration_ms)
+      VALUES (${`hr-${randomUUID().slice(0, 8)}`},${row.helper_name},${row.helper_id ?? null},${row.task_id ?? null},
+      ${row.agent_id},${row.mode},${row.status},${row.command},${row.job_id ?? null},
+      ${row.exit_code ?? null},${row.output ?? ""},${row.duration_ms ?? null})`;
+  }
+
+  /** Execute a built-in playbook or a registered executable helper. */
+  async runHelper(a: RunHelperArgs) {
+    const values: Record<string, unknown> = { task_id: a.task_id ?? "", agent_id: a.agent_id, ...a.args };
+    let command: string;
+    let helperId: string | null = null;
+    let jobType = "test";
+    let timeoutMs = 60_000;
+    const pb = getPlaybook(a.name);
+    if (pb) {
+      const rendered = renderCommand(pb.command, values);
+      if (rendered.error) return { error: rendered.error };
+      command = rendered.command!;
+      jobType = pb.type;
+      timeoutMs = pb.timeout_ms;
+    } else {
+      const [helper] = await this.sql<any[]>`SELECT * FROM helpers WHERE symbol=${a.name} OR path=${a.name}`;
+      if (!helper) return { error: `helper '${a.name}' not found (built-in playbooks: ${PLAYBOOKS.map((p) => p.name).join(", ")})` };
+      if (helper.kind !== "executable" || !helper.entry_point)
+        return { error: `helper '${a.name}' is not executable (kind=${helper.kind}); register it with kind=executable and an entry_point` };
+      const rendered = renderCommand(helper.entry_point, values);
+      if (rendered.error) return { error: rendered.error };
+      command = rendered.command!;
+      helperId = helper.id;
+    }
+    if (a.sync) {
+      const cap = Math.min(Math.max(a.timeout_ms ?? timeoutMs, 1000), 600_000);
+      const result = await runCommandSync(command, cap);
+      const status = result.exit_code === 0 ? "done" : "failed";
+      await this.recordHelperRun({
+        helper_name: a.name, helper_id: helperId, task_id: a.task_id, agent_id: a.agent_id,
+        mode: "sync", status, command, exit_code: result.exit_code, output: result.output, duration_ms: result.duration_ms,
+      });
+      await this.log("helper_run", a.name, status, a.agent_id, {
+        task_id: a.task_id, mode: "sync", exit_code: result.exit_code, duration_ms: result.duration_ms,
+      });
+      return { helper: a.name, mode: "sync", status, command, exit_code: result.exit_code, output: result.output, duration_ms: result.duration_ms };
+    }
+    const job = await this.submitJob({ task_id: a.task_id, agent_id: a.agent_id, type: jobType, command });
+    if ((job as any).error) return job;
+    await this.recordHelperRun({
+      helper_name: a.name, helper_id: helperId, task_id: a.task_id, agent_id: a.agent_id,
+      mode: "job", status: "queued", command, job_id: (job as any).id,
+    });
+    await this.log("helper_run", a.name, "queued", a.agent_id, { task_id: a.task_id, mode: "job", job_id: (job as any).id });
+    return { helper: a.name, mode: "job", status: "queued", command, job_id: (job as any).id };
+  }
+
+  /** Helper invocations vs agent control-plane actions per task (tools-over-inference). */
+  async helperMetrics(taskId?: string) {
+    const runs = await this.sql<any[]>`
+      SELECT task_id, COUNT(*)::int n FROM helper_runs
+      ${taskId ? this.sql`WHERE task_id = ${taskId}` : this.sql``} GROUP BY task_id`;
+    const agentRows = await this.sql<any[]>`
+      SELECT entity_id task_id, actor, COUNT(*)::int n FROM events
+      WHERE entity_type = 'task' ${taskId ? this.sql`AND entity_id = ${taskId}` : this.sql``} GROUP BY entity_id, actor`;
+    const runMap = new Map(runs.map((r) => [r.task_id ?? "", r.n]));
+    const actionMap = new Map<string, number>();
+    for (const r of agentRows) {
+      if (isSystemActor(r.actor) || r.actor === "human" || r.actor === "cli") continue;
+      actionMap.set(r.task_id, (actionMap.get(r.task_id) ?? 0) + r.n);
+    }
+    const taskIds = [...new Set([...runMap.keys(), ...actionMap.keys()])].filter(Boolean).sort();
+    const perTask = taskIds.map((id) => {
+      const helper_runs = runMap.get(id) ?? 0;
+      const agent_prompts = actionMap.get(id) ?? 0;
+      return { task_id: id, helper_runs, agent_prompts, tools_over_inference: agent_prompts ? helper_runs / agent_prompts : helper_runs };
+    });
+    const totalRuns = perTask.reduce((s, t) => s + t.helper_runs, 0);
+    const totalPrompts = perTask.reduce((s, t) => s + t.agent_prompts, 0);
+    return {
+      totals: {
+        helper_runs: totalRuns,
+        agent_prompts: totalPrompts,
+        tools_over_inference: totalPrompts ? totalRuns / totalPrompts : totalRuns,
+      },
+      per_task: perTask,
+    };
   }
 
   async searchContext(query: string, kinds?: string[]) {

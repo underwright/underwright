@@ -1,12 +1,13 @@
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { SCHEMA, JOBS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { SCHEMA, JOBS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind, isHelperKind } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
+import { PLAYBOOKS, getPlaybook, renderCommand, runCommandSync } from "./playbooks.js";
+import type { IStore, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult, RegisterHelperArgs, RunHelperArgs } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
 export type { TaskStatus } from "./istore.js";
@@ -22,6 +23,7 @@ export class SqliteStore implements IStore {
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
     this.migrate();
+    this.seedPlaybooks();
   }
 
   /** Schema versioning via PRAGMA user_version. */
@@ -117,6 +119,50 @@ export class SqliteStore implements IStore {
           PRAGMA user_version = 7;
         `);
       })();
+    }
+    if (v < 8) {
+      // v8: executable helpers (kind + entry_point) and helper_run metrics.
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('helpers')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("entry_point")) {
+        this.db.transaction(() => {
+          this.db.exec(`
+            CREATE TABLE helpers_v8 (
+              id          TEXT PRIMARY KEY,
+              agent_id    TEXT NOT NULL,
+              path        TEXT NOT NULL,
+              symbol      TEXT NOT NULL DEFAULT '',
+              kind        TEXT NOT NULL CHECK (kind IN ('util','pattern','config','fixture','executable')),
+              summary     TEXT NOT NULL,
+              entry_point TEXT NOT NULL DEFAULT '',
+              created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+              UNIQUE (path, symbol)
+            );
+            INSERT INTO helpers_v8 (id, agent_id, path, symbol, kind, summary, created_at)
+              SELECT id, agent_id, path, symbol, kind, summary, created_at FROM helpers;
+            DROP TABLE helpers;
+            ALTER TABLE helpers_v8 RENAME TO helpers;
+            INSERT INTO search_idx (entity_type, entity_id, title, content)
+              SELECT 'helper', h.id, h.symbol || h.path, h.summary FROM helpers h
+              WHERE NOT EXISTS (SELECT 1 FROM search_idx s WHERE s.entity_type = 'helper' AND s.entity_id = h.id);
+          `);
+        })();
+      }
+      this.db.exec("PRAGMA user_version = 8;");
+    }
+  }
+
+  /** Ship the built-in playbooks as executable helpers so search_context finds them. */
+  private seedPlaybooks() {
+    const insert = this.db.prepare(`
+      INSERT INTO helpers (id, agent_id, path, symbol, kind, summary, entry_point)
+      VALUES (?, 'underwright', 'playbook', ?, 'executable', ?, ?)
+      ON CONFLICT(path, symbol) DO NOTHING`);
+    for (const p of PLAYBOOKS) {
+      const id = `hlp-playbook-${p.name}`;
+      const inserted = insert.run(id, p.name, `Built-in playbook: ${p.description}`, p.command);
+      if (inserted.changes > 0) this.index("helper", id, p.name, `Built-in playbook: ${p.description}`);
     }
   }
 
@@ -673,17 +719,127 @@ export class SqliteStore implements IStore {
     return rows.map((r) => (r.kind === "coverage" ? { ...r, coverage: parseCoverage(r.output ?? "") } : r));
   }
 
-  registerHelper(args: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }) {
+  registerHelper(args: RegisterHelperArgs) {
+    if (!isHelperKind(args.kind)) return { error: `unknown helper kind ${args.kind}` };
+    if (args.kind === "executable" && !args.entry_point)
+      return { error: "executable helpers require an entry_point command template" };
     const id = `hlp-${randomUUID().slice(0, 8)}`;
     this.db
       .prepare(
-        `INSERT INTO helpers (id, agent_id, path, symbol, kind, summary) VALUES (?,?,?,?,?,?)
-         ON CONFLICT(path, symbol) DO UPDATE SET summary=excluded.summary, agent_id=excluded.agent_id`
+        `INSERT INTO helpers (id, agent_id, path, symbol, kind, summary, entry_point) VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(path, symbol) DO UPDATE SET summary=excluded.summary, agent_id=excluded.agent_id, kind=excluded.kind, entry_point=excluded.entry_point`
       )
-      .run(id, args.agent_id, args.path, args.symbol ?? "", args.kind, args.summary);
+      .run(id, args.agent_id, args.path, args.symbol ?? "", args.kind, args.summary, args.entry_point ?? "");
     this.index("helper", id, `${args.symbol || args.path}`, args.summary);
     this.log("helper", id, "registered", args.agent_id, args);
     return { id };
+  }
+
+  /** Resolve a helper by playbook name, then by symbol, then by path. */
+  private findHelper(name: string): any {
+    return this.db.prepare("SELECT * FROM helpers WHERE symbol=? OR path=?").get(name, name);
+  }
+
+  private recordHelperRun(row: {
+    helper_name: string; helper_id?: string | null; task_id?: string | null; agent_id: string;
+    mode: string; status: string; command: string; job_id?: string | null;
+    exit_code?: number | null; output?: string; duration_ms?: number | null;
+  }) {
+    this.db
+      .prepare(
+        `INSERT INTO helper_runs (id, helper_name, helper_id, task_id, agent_id, mode, status, command, job_id, exit_code, output, duration_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+      )
+      .run(
+        `hr-${randomUUID().slice(0, 8)}`, row.helper_name, row.helper_id ?? null, row.task_id ?? null,
+        row.agent_id, row.mode, row.status, row.command, row.job_id ?? null,
+        row.exit_code ?? null, row.output ?? "", row.duration_ms ?? null
+      );
+  }
+
+  /** Execute a built-in playbook or a registered executable helper. */
+  async runHelper(a: RunHelperArgs) {
+    const values: Record<string, unknown> = { task_id: a.task_id ?? "", agent_id: a.agent_id, ...a.args };
+    let command: string;
+    let helperId: string | null = null;
+    let jobType = "test";
+    let timeoutMs = 60_000;
+    const pb = getPlaybook(a.name);
+    if (pb) {
+      const rendered = renderCommand(pb.command, values);
+      if (rendered.error) return { error: rendered.error };
+      command = rendered.command!;
+      jobType = pb.type;
+      timeoutMs = pb.timeout_ms;
+    } else {
+      const helper = this.findHelper(a.name);
+      if (!helper) return { error: `helper '${a.name}' not found (built-in playbooks: ${PLAYBOOKS.map((p) => p.name).join(", ")})` };
+      if (helper.kind !== "executable" || !helper.entry_point)
+        return { error: `helper '${a.name}' is not executable (kind=${helper.kind}); register it with kind=executable and an entry_point` };
+      const rendered = renderCommand(helper.entry_point, values);
+      if (rendered.error) return { error: rendered.error };
+      command = rendered.command!;
+      helperId = helper.id;
+    }
+    if (a.sync) {
+      const cap = Math.min(Math.max(a.timeout_ms ?? timeoutMs, 1000), 600_000);
+      const result = await runCommandSync(command, cap);
+      const status = result.exit_code === 0 ? "done" : "failed";
+      this.recordHelperRun({
+        helper_name: a.name, helper_id: helperId, task_id: a.task_id, agent_id: a.agent_id,
+        mode: "sync", status, command, exit_code: result.exit_code, output: result.output, duration_ms: result.duration_ms,
+      });
+      this.log("helper_run", a.name, status, a.agent_id, {
+        task_id: a.task_id, mode: "sync", exit_code: result.exit_code, duration_ms: result.duration_ms,
+      });
+      return { helper: a.name, mode: "sync", status, command, exit_code: result.exit_code, output: result.output, duration_ms: result.duration_ms };
+    }
+    const job = this.submitJob({ task_id: a.task_id, agent_id: a.agent_id, type: jobType, command });
+    if ((job as any).error) return job;
+    this.recordHelperRun({
+      helper_name: a.name, helper_id: helperId, task_id: a.task_id, agent_id: a.agent_id,
+      mode: "job", status: "queued", command, job_id: (job as any).id,
+    });
+    this.log("helper_run", a.name, "queued", a.agent_id, { task_id: a.task_id, mode: "job", job_id: (job as any).id });
+    return { helper: a.name, mode: "job", status: "queued", command, job_id: (job as any).id };
+  }
+
+  /** Helper invocations vs agent control-plane actions per task (tools-over-inference).
+   *  Agent prompts are proxied by agent-actor events on the task (human/cli/system rows
+   *  excluded) — as routines become executable, the ratio shifts toward helper_runs.
+   *  Feeds gh-35 cost tracking. */
+  helperMetrics(taskId?: string) {
+    const runs = this.db.prepare(
+      `SELECT task_id, COUNT(*) n FROM helper_runs ${taskId ? "WHERE task_id = ?" : ""} GROUP BY task_id`
+    ).all(...(taskId ? [taskId] : [])) as any[];
+    const runMap = new Map(runs.map((r) => [r.task_id ?? "", r.n]));
+    // Agent prompts are proxied by agent-actor control-plane actions on the task;
+    // human/cli-driven rows (task creation, CLI syncs) are not agent work.
+    const agentRows = this.db.prepare(
+      `SELECT entity_id task_id, actor, COUNT(*) n FROM events
+       WHERE entity_type = 'task' ${taskId ? "AND entity_id = ?" : ""} GROUP BY entity_id, actor`
+    ).all(...(taskId ? [taskId] : [])) as any[];
+    const actionMap = new Map<string, number>();
+    for (const r of agentRows) {
+      if (isSystemActor(r.actor) || r.actor === "human" || r.actor === "cli") continue;
+      actionMap.set(r.task_id, (actionMap.get(r.task_id) ?? 0) + r.n);
+    }
+    const taskIds = [...new Set([...runMap.keys(), ...actionMap.keys()])].filter(Boolean).sort();
+    const perTask = taskIds.map((id) => {
+      const helper_runs = runMap.get(id) ?? 0;
+      const agent_prompts = actionMap.get(id) ?? 0;
+      return { task_id: id, helper_runs, agent_prompts, tools_over_inference: agent_prompts ? helper_runs / agent_prompts : helper_runs };
+    });
+    const totalRuns = perTask.reduce((s, t) => s + t.helper_runs, 0);
+    const totalPrompts = perTask.reduce((s, t) => s + t.agent_prompts, 0);
+    return {
+      totals: {
+        helper_runs: totalRuns,
+        agent_prompts: totalPrompts,
+        tools_over_inference: totalPrompts ? totalRuns / totalPrompts : totalRuns,
+      },
+      per_task: perTask,
+    };
   }
 
   /** Pre-flight: what already exists? Search helpers + artifacts + indexed code symbols. */

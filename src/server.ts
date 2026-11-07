@@ -180,13 +180,27 @@ Rules of engagement:
     depth: z.number().int().min(1).max(10).optional(),
   }, async ({ name, depth }) => text(codeStore().blastRadius(name, depth)));
 
-  server.tool("register_helper", "Publish a reusable helper (utility, pattern, config, fixture) so other agents reuse it instead of duplicating.", {
+  server.tool("register_helper", "Publish a reusable helper (utility, pattern, config, fixture, executable) so other agents reuse it instead of duplicating. Executable helpers carry an entry_point command template invocable via run_helper.", {
     agent_id: z.string(),
     path: z.string(),
     symbol: z.string().optional(),
-    kind: z.enum(["util", "pattern", "config", "fixture"]),
+    kind: z.enum(["util", "pattern", "config", "fixture", "executable"]),
     summary: z.string(),
+    entry_point: z.string().optional().describe("executable helpers only: shell command template with {{placeholder}} args run_helper fills"),
   }, async (a) => text(await store.registerHelper(a)));
+
+  server.tool("run_helper", "Execute a registered executable helper or a built-in playbook (github-sync, merge-and-verify, evidence-attach, index-refresh, branch-worktree-setup). Renders the command template from args, then runs it synchronously (bounded, returns output) or queues it as a job. Every run is recorded for helper metrics.", {
+    name: z.string().describe("playbook name or helper symbol/path"),
+    agent_id: z.string(),
+    task_id: z.string().optional(),
+    args: z.record(z.string(), z.unknown()).optional().describe("values for the command template placeholders"),
+    sync: z.boolean().optional().describe("execute in the server with a timeout instead of queueing a job (default false)"),
+    timeout_ms: z.number().int().optional().describe("sync cap, default from the playbook (max 600000)"),
+  }, async (a) => text(await store.runHelper(a)));
+
+  server.tool("helper_metrics", "Tools-over-inference metric: helper invocations vs agent control-plane actions per task. As routines become executable, helper_runs should grow relative to agent_prompts.", {
+    task_id: z.string().optional().describe("restrict to one task; default aggregates all"),
+  }, async ({ task_id }) => text(await store.helperMetrics(task_id)));
 
   server.tool("report_evidence", "Attach proof of work to a task: a test run, CI check, review, or coverage result, citing which acceptance criteria it proves. Coverage output is parsed into structured lines/statements/branches/functions percentages.", {
     task_id: z.string(),

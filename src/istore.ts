@@ -30,6 +30,24 @@ export interface AgentJobSpec {
   /** Remote omnigent server URL, passed as `omni run --server`. */
   server?: string;
 }
+export interface RegisterHelperArgs {
+  agent_id: string; path: string; symbol?: string; kind: string; summary: string;
+  /** Executable helpers only: command template run_helper renders and runs. */
+  entry_point?: string;
+}
+
+export interface RunHelperArgs {
+  /** Playbook name or helper symbol/path. */
+  name: string;
+  agent_id: string;
+  task_id?: string;
+  /** Placeholder values for the helper's command template. */
+  args?: Record<string, unknown>;
+  /** Execute in the server (bounded) instead of queueing a job. */
+  sync?: boolean;
+  timeout_ms?: number;
+}
+
 export interface SubmitJobArgs {
   task_id?: string; agent_id: string; type: string; command?: string;
   host?: string; target_agent_id?: string; agent?: AgentJobSpec;
@@ -109,7 +127,11 @@ export interface IStore {
   }): Awaitable<any>;
   getEvidence(taskId: string): Awaitable<any[]>;
   completeTask(taskId: string, agentId: string): Awaitable<any>;
-  registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }): Awaitable<any>;
+  registerHelper(a: RegisterHelperArgs): Awaitable<any>;
+  /** Execute a built-in playbook or registered executable helper; records a helper_run. */
+  runHelper(a: RunHelperArgs): Awaitable<any>;
+  /** Helper invocations vs agent control-plane actions per task (tools-over-inference). */
+  helperMetrics(taskId?: string): Awaitable<any>;
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
   submitJob(a: SubmitJobArgs): Awaitable<any>;
   nextJob(agentId: string, host?: string, ttlSeconds?: number): Awaitable<any>;

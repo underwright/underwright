@@ -4,6 +4,7 @@ import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
 import { formatInitResult, initWorkspace } from "./init.js";
+import { indexWorkspace } from "./codeindex.js";
 import {
   syncIssues,
   syncPRs,
@@ -159,6 +160,52 @@ switch (cmd) {
     break;
   }
 
+  case "evidence": {
+    // underwright evidence --task ID --kind KIND [--file PATH | --output TEXT] [--exit-code N] [--ac a,b] [--by AGENT]
+    const task = flag("task");
+    const kind = flag("kind") ?? "test_run";
+    if (!task) {
+      console.error("usage: underwright evidence --task ID --kind KIND [--file PATH | --output TEXT] [--exit-code N] [--ac a,b] [--by AGENT]");
+      process.exit(1);
+    }
+    const file = flag("file");
+    const output = flag("output") ?? (file ? readFileSync(file, "utf8") : "");
+    const ac = flag("ac");
+    const store = await openStore(dbPath);
+    try {
+      console.log(JSON.stringify(await store.reportEvidence({
+        task_id: task,
+        agent_id: flag("by") ?? "cli",
+        kind,
+        command: `evidence --task ${task} --kind ${kind}`,
+        exit_code: flag("exit-code") !== undefined ? Number(flag("exit-code")) : undefined,
+        output,
+        ac_ids: ac ? ac.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+      }), null, 2));
+    } finally {
+      await store.close();
+    }
+    break;
+  }
+
+  case "index": {
+    // underwright index [--root DIR] [--by AGENT]
+    const store = await openStore(dbPath);
+    try {
+      const root = flag("root") ?? process.cwd();
+      const sink = store as any;
+      if (typeof sink.codeFileHashes !== "function" || typeof sink.upsertCodeFile !== "function") {
+        console.error("code index is only available on the SQLite store");
+        process.exit(1);
+      }
+      await indexWorkspace(sink, root, flag("by") ?? "indexer");
+      console.log(JSON.stringify({ indexed: root }));
+    } finally {
+      await store.close();
+    }
+    break;
+  }
+
   case "github": {
     const sub = args[0];
     const repo = args[args.indexOf("--repo") + 1];
@@ -219,6 +266,8 @@ Usage:
   underwright create             Create a task, optionally from a template (--template feature).
   underwright templates          List task templates (builtin + policy-defined).
   underwright speckit import     Import Spec Kit markdown (constitution/spec/plan/tasks) and link ac_ids.
+  underwright evidence           Attach command output to a task (--task ID --kind KIND [--file PATH | --output TEXT] [--exit-code N] [--ac a,b]).
+  underwright index              Refresh the tree-sitter code index ([--root DIR], default cwd).
 
 Env:
   UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)

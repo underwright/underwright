@@ -10,6 +10,15 @@ export function isArtifactKind(kind: string): boolean {
   return (ARTIFACT_KINDS as readonly string[]).includes(kind);
 }
 
+/** Helper kinds. `executable` helpers carry an entry_point run_helper can invoke. */
+export const HELPER_KINDS = ["util", "pattern", "config", "fixture", "executable"] as const;
+
+export const HELPER_KIND_SQL = HELPER_KINDS.map((kind) => `'${kind}'`).join(",");
+
+export function isHelperKind(kind: string): boolean {
+  return (HELPER_KINDS as readonly string[]).includes(kind);
+}
+
 export const TASK_DEPENDENCIES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -98,11 +107,31 @@ CREATE TABLE IF NOT EXISTS helpers (
   agent_id    TEXT NOT NULL,
   path        TEXT NOT NULL,             -- file path or module
   symbol      TEXT NOT NULL DEFAULT '',  -- exported symbol name
-  kind        TEXT NOT NULL CHECK (kind IN ('util','pattern','config','fixture')),
+  kind        TEXT NOT NULL CHECK (kind IN (${HELPER_KIND_SQL})),
   summary     TEXT NOT NULL,
+  entry_point TEXT NOT NULL DEFAULT '',  -- executable only: command template run_helper renders
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE (path, symbol)
 );
+
+-- Every run_helper invocation lands here: the metrics behind tools-over-inference.
+CREATE TABLE IF NOT EXISTS helper_runs (
+  id          TEXT PRIMARY KEY,
+  helper_name TEXT NOT NULL,
+  helper_id   TEXT,
+  task_id     TEXT,
+  agent_id    TEXT NOT NULL,
+  mode        TEXT NOT NULL CHECK (mode IN ('sync','job')),
+  status      TEXT NOT NULL,
+  command     TEXT NOT NULL DEFAULT '',
+  job_id      TEXT,
+  exit_code   INTEGER,
+  output      TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS helper_runs_task ON helper_runs(task_id);
+CREATE INDEX IF NOT EXISTS helper_runs_name ON helper_runs(helper_name);
 
 ${JOBS_SCHEMA}
 
@@ -204,4 +233,32 @@ BEGIN
   END LOOP;
 END $$;
 ALTER TABLE artifacts ADD CONSTRAINT artifacts_kind_check CHECK (kind IN (${ARTIFACT_KIND_SQL}));
+`;
+
+// Executable helpers: widen helpers.kind and add the entry_point column.
+export const PG_HELPERS_MIGRATION = `
+ALTER TABLE helpers ADD COLUMN IF NOT EXISTS entry_point TEXT NOT NULL DEFAULT '';
+ALTER TABLE helpers DROP CONSTRAINT IF EXISTS helpers_kind_check;
+ALTER TABLE helpers ADD CONSTRAINT helpers_kind_check CHECK (kind IN (${HELPER_KIND_SQL}));
+`;
+
+// Every run_helper invocation lands here: the metrics behind tools-over-inference.
+export const PG_HELPER_RUNS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS helper_runs (
+  id          TEXT PRIMARY KEY,
+  helper_name TEXT NOT NULL,
+  helper_id   TEXT,
+  task_id     TEXT,
+  agent_id    TEXT NOT NULL,
+  mode        TEXT NOT NULL CHECK (mode IN ('sync','job')),
+  status      TEXT NOT NULL,
+  command     TEXT NOT NULL DEFAULT '',
+  job_id      TEXT,
+  exit_code   INT,
+  output      TEXT NOT NULL DEFAULT '',
+  duration_ms INT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS helper_runs_task ON helper_runs(task_id);
+CREATE INDEX IF NOT EXISTS helper_runs_name ON helper_runs(helper_name);
 `;
