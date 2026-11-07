@@ -86,6 +86,7 @@ export const DEFAULT_POLICY = {
   enforcement: "warn",
   dor: { require_type: true, require_ac_ids: true, require_estimate: true, require_description: false },
   dispatcher: { enabled: true, max_tasks_per_agent: 0, idle_minutes: 15 },
+  harness_matrix: { "*": { backend: "raw" } },
 };
 
 export const GITIGNORE_ENTRIES = ["underwright.db*"];

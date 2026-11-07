@@ -209,7 +209,14 @@ Rules of engagement:
     command: z.string().min(1).optional(),
     host: z.string().min(1).optional(),
     target_agent_id: z.string().min(1).optional(),
-    agent: z.object({ executable: z.string().min(1), args: z.array(z.string()), prompt: z.string().min(1) }).optional(),
+    agent: z.object({
+      executable: z.string().min(1),
+      args: z.array(z.string()),
+      prompt: z.string().min(1),
+      harness: z.string().min(1).optional().describe("harness name for the omnigent backend; defaults to the executable basename"),
+      backend: z.enum(["raw", "omnigent"]).optional().describe("omnigent launches via `omni run`; raw (default) runs the CLI directly"),
+      server: z.string().min(1).optional().describe("remote omnigent server URL (`omni run --server`)"),
+    }).optional(),
   }, async (a) => text(await store.submitJob(a)));
 
   server.tool("next_job", "Atomically lease the next eligible job. Supply the runner identity and host; retain lease_token for heartbeats and completion.", {

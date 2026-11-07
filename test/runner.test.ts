@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore } from "../src/store.js";
-import { agentInvocation, executeLeasedJob, runSupervisor, type JobCall } from "../src/runner.js";
+import { getHarnessBackend, type Policy } from "../src/policy.js";
+import {
+  agentInvocation,
+  executeLeasedJob,
+  extractOmnigentSession,
+  OMNIGENT_HARNESS_SUPPORT,
+  runSupervisor,
+  type JobCall,
+} from "../src/runner.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { vi.useRealTimers(); cleanups.splice(0).reverse().forEach(f => f()); });
@@ -178,5 +186,96 @@ describe("runner execution", () => {
     await runSupervisor(shutdownCall, { agentId: "r", host: "A", signal: abort.signal, once: true });
     expect(store.getJob(j.id).status).toBe("failed");
     expect(store.getJob(j.id).result).toContain("shutting down");
+  });
+});
+
+describe("omnigent backend", () => {
+  const jobWith = (agent_spec: object) => ({
+    id: "job-omni", task_id: "task-9", agent_spec,
+    lease_token: "tok", lease_expires: new Date(Date.now() + 60000).toISOString(),
+  });
+  const spec = { executable: "codex", args: ["exec"], prompt: "do the thing" };
+  const matrix: Policy = {
+    harness_matrix: {
+      "codex@A": { harness: "codex", backend: "omnigent" },
+      "*": { backend: "raw" },
+    },
+  } as Policy;
+
+  it("templates `omni run --harness H -p PROMPT` when the spec requests omnigent", () => {
+    const inv = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: true });
+    expect(inv.executable).toBe("omni");
+    expect(inv.args).toEqual(["run", "--harness", "codex", "-p", "do the thing"]);
+    expect(inv.backend).toBe("omnigent");
+  });
+
+  it("templates --server when the spec names a remote omnigent server", () => {
+    const inv = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "claude-sdk", server: "https://omni.internal" }),
+      "a@A", "A", { omniAvailable: true });
+    expect(inv.args).toEqual(["run", "--harness", "claude-sdk", "--server", "https://omni.internal", "-p", "do the thing"]);
+  });
+
+  it("expands prompt placeholders inside the omnigent prompt", () => {
+    const inv = agentInvocation(jobWith({ executable: "codex", args: [], prompt: "claim {{task_id}} as {{agent_id}} on {{host}}", backend: "omnigent", harness: "codex" }),
+      "codex@A", "A", { omniAvailable: true });
+    expect(inv.args.at(-1)).toBe("claim task-9 as codex@A on A");
+  });
+
+  it("derives the harness from the executable basename when unspecified", () => {
+    const inv = agentInvocation(jobWith({ executable: "/usr/local/bin/codex", args: [], prompt: "x", backend: "omnigent" }),
+      "a@A", "A", { omniAvailable: true });
+    expect(inv.args).toEqual(["run", "--harness", "codex", "-p", "x"]);
+  });
+
+  it("falls back to the raw CLI when omni is unavailable or the harness is unsupported", () => {
+    const unavailable = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: false });
+    expect(unavailable.executable).toBe("codex");
+    expect(unavailable.args).toEqual(["exec", "do the thing"]);
+    expect(unavailable.backend).toBe("raw");
+    const unsupported = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "cmdc" }), "cmdc@A", "A", { omniAvailable: true });
+    expect(unsupported.executable).toBe("codex");
+    expect(unsupported.backend).toBe("raw");
+  });
+
+  it("covers codex and claude-sdk through omnigent while cmdc stays raw-only", () => {
+    expect(OMNIGENT_HARNESS_SUPPORT.codex).toBe(true);
+    expect(OMNIGENT_HARNESS_SUPPORT["claude-sdk"]).toBe(true);
+    expect(OMNIGENT_HARNESS_SUPPORT.cmdc).toBe(false);
+  });
+
+  it("resolves the policy matrix with the spec and the exact agent id winning", () => {
+    expect(getHarnessBackend("codex@A", matrix)).toEqual({ harness: "codex", backend: "omnigent" });
+    expect(getHarnessBackend("grok@B", matrix)).toEqual({ backend: "raw" });
+    expect(getHarnessBackend("grok@B", {} as Policy)).toEqual({});
+    const viaMatrix = agentInvocation(jobWith(spec), "codex@A", "A", { omniAvailable: true, policy: matrix });
+    expect(viaMatrix.executable).toBe("omni");
+    expect(viaMatrix.args).toEqual(["run", "--harness", "codex", "-p", "do the thing"]);
+    const specWins = agentInvocation(jobWith({ ...spec, backend: "raw" }), "codex@A", "A", { omniAvailable: true, policy: matrix });
+    expect(specWins.executable).toBe("codex");
+    expect(specWins.backend).toBe("raw");
+  });
+
+  it("extracts the last omnigent session marker, or a matching transcript URL", () => {
+    expect(extractOmnigentSession("noise\nomnigent session: https://omni.example/s/one\nmore\nomnigent session: abc123-def\n")).toBe("abc123-def");
+    expect(extractOmnigentSession("banner https://omni.example/transcript/zzz99 tail")).toBe("https://omni.example/transcript/zzz99");
+    expect(extractOmnigentSession("no marker here")).toBeNull();
+  });
+
+  it("launches through a PATH-visible omni and records the session link in the job result", async () => {
+    const { store } = fixture();
+    const dir = mkdtempSync(join(tmpdir(), "uw-omni-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    writeFileSync(join(dir, "omni"), "#!/bin/sh\necho \"omnigent session: https://omni.example/s/abc123\"\n", { mode: 0o755 });
+    const oldPath = process.env.PATH;
+    process.env.PATH = oldPath ? `${dir}:${oldPath}` : dir;
+    try {
+      const j = store.submitJob({ agent_id: "a", type: "agent", agent: { executable: "definitely-not-a-real-harness", args: ["exec"], prompt: "hello", backend: "omnigent", harness: "codex" } });
+      await executeLeasedJob(store.nextJob("r", "A"), caller(store), { agentId: "r", host: "A" });
+      const done = store.getJob(j.id);
+      expect(done.status).toBe("done");
+      expect(done.result).toContain("omnigent session: https://omni.example/s/abc123");
+    } finally {
+      process.env.PATH = oldPath;
+    }
   });
 });

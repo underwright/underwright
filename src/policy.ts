@@ -35,6 +35,21 @@ export interface DispatcherPolicy {
 
 export type HumanNotifyEventKind = "task_completed" | "claim_reclaimed";
 
+/** Preferred launch configuration for agent jobs, from the policy harness_matrix. */
+export interface HarnessBackend {
+  harness?: string;                 // e.g. "codex", "claude-sdk"
+  backend?: "raw" | "omnigent";
+  server?: string;                  // remote omnigent server URL
+}
+
+/** Full harness matrix: per-agent launch preferences plus the omnigent coverage table. */
+export interface HarnessMatrix {
+  /** agent_id (or "*") -> preferred harness+backend. */
+  agents: Record<string, HarnessBackend>;
+  /** harness -> runnable through omnigent today; missing or false means raw-only. */
+  coverage: Record<string, boolean>;
+}
+
 export interface HumanNotifyRule {
   enabled?: boolean;
   webhook_url?: string;
@@ -48,6 +63,9 @@ export interface HumanNotifyPolicy {
   events: HumanNotifyEventKind[];
 }
 
+/** Per-agent launch preferences plus the omnigent coverage table. Agent entries
+ *  map agent_id (or "*") to a preferred harness+backend; the "coverage" table
+ *  records which harnesses omnigent can drive today. */
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
@@ -59,6 +77,7 @@ export interface Policy {
   notifications?: string | HumanNotifyRule;
   notify?: string | HumanNotifyRule;
   webhook_url?: string;
+  harness_matrix?: Record<string, HarnessBackend | Record<string, boolean>> & { coverage?: Record<string, boolean | { omni?: boolean }> };
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -101,6 +120,15 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
     max_tasks_per_agent: Number.isFinite(max) && max > 0 ? Math.floor(max) : 0,
     idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
   };
+}
+
+/** Preferred harness+backend for an agent job. Exact agent_id wins over "*";
+ *  absent or malformed matrix yields {} (the runner then uses raw defaults). */
+export function getHarnessBackend(agentId: string, policy: Policy = loadPolicy()): HarnessBackend {
+  const matrix = policy.harness_matrix;
+  if (!matrix || typeof matrix !== "object") return {};
+  const entry = matrix[agentId] ?? matrix["*"];
+  return entry && typeof entry === "object" ? entry : {};
 }
 
 const DEFAULT_NOTIFY_EVENTS: HumanNotifyEventKind[] = ["task_completed", "claim_reclaimed"];

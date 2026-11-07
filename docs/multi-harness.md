@@ -372,6 +372,59 @@ shell commands unless the process is also started with `--yolo` (permission
 bypass for that run). A headless Command Code worker that must edit the
 tree uses both flags: `cmdc -p --yolo`.
 
+## uw-runner omnigent backend
+
+Agent jobs can launch through omnigent instead of a
+raw harness CLI. The runner then templates
+`omni run --harness H [--server URL] -p PROMPT` and gets session recording,
+sandboxing, and the transcript UI for free. Set `backend: "omnigent"` on the
+job's `agent` spec (optionally with `harness` and `server`); the runner falls
+back to the raw CLI whenever `omni` is not on PATH or the harness is not in
+the support table below.
+
+```json
+"agent": {
+  "executable": "codex",
+  "args": ["exec"],
+  "prompt": "You are {{agent_id}} on {{host}}. ... Job: {{job_id}}.",
+  "backend": "omnigent",
+  "harness": "codex",
+  "server": "https://omni.internal"
+}
+```
+
+- `harness` defaults to the executable basename (`/usr/local/bin/codex` → `codex`).
+- `server` is optional; it selects a remote omnigent session server (`--server`).
+- The runner probes `omni --version` per job; a missing binary or an
+  unsupported harness runs the raw executable+args exactly as before.
+- On completion the runner normalizes whatever the CLI printed into an
+  `omnigent session: <url-or-id>` line at the end of the job result, so the
+  board can link a task to its omnigent transcript.
+
+The policy file steers which backend each agent uses. `harness_matrix` maps an
+`agent_id` (or `"*"` as the fallback) to its preferred harness+backend; a
+per-job `backend`/`harness`/`server` field overrides the matrix:
+
+```json
+"harness_matrix": {
+  "codex@laptop-2": { "harness": "codex", "backend": "omnigent" },
+  "*":              { "backend": "raw" }
+}
+```
+
+### Harness coverage (via omnigent)
+
+| Harness | `omni run` | Raw CLI |
+|---|---|---|
+| codex | yes | yes |
+| claude-sdk | yes | yes |
+| cmdc | pending omnigent support landing | yes |
+| claude, grok, kimi, agy, opencode, cline, cursor, devin | — | yes |
+
+Anything not listed as "yes" for `omni run` falls back to the raw CLI; the
+runner never blocks a job on omnigent availability. Update this table and
+`OMNIGENT_HARNESS_SUPPORT` in `src/runner.ts` together as support lands.
+
 ## Don't run a local stdio database on a remote machine
 
 This is the failure that looks like a working control plane.

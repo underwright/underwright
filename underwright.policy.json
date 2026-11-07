@@ -19,5 +19,8 @@
     "enabled": true,
     "max_tasks_per_agent": 0,
     "idle_minutes": 15
+  },
+  "harness_matrix": {
+    "*": { "backend": "raw" }
   }
 }
