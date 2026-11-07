@@ -1,6 +1,8 @@
 // The control-plane store contract. Call sites always `await` results;
 // implementations may be sync (SQLite) or async (Postgres/Lakebase).
 
+import type { NodeEnrollmentInput, NodePolicy, NodePrincipal, NodeError, NodeEnrollment } from "./node-protocol.js";
+
 type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
@@ -65,6 +67,16 @@ export interface DigestResult {
 }
 
 export interface IStore {
+  createNodeEnrollment(a: NodeEnrollmentInput): Awaitable<NodeEnrollment | NodeError>;
+  listNodeEnrollments(): Awaitable<any[]>;
+  approveNodeEnrollment(id: string, code: string, policy: NodePolicy, actor: string): Awaitable<any>;
+  rejectNodeEnrollment(id: string, actor: string): Awaitable<any>;
+  exchangeNodeEnrollment(id: string, secret: string): Awaitable<any>;
+  listNodes(): Awaitable<any[]>;
+  revokeNode(id: string, actor: string): Awaitable<any>;
+  authenticateNode(token: string, sessionId?: string): Awaitable<NodePrincipal | NodeError>;
+  startNodeSession(token: string): Awaitable<any>;
+
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;
