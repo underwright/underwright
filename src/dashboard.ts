@@ -33,6 +33,7 @@ export type DashboardData = {
   jobs?: any[];
   events?: any[];
   job_counts?: Array<{ status: string; n: number }>;
+  nodes?: any[];
 };
 
 /** Server-rendered, dependency-free read-only view. Auto-refreshes via meta refresh. */
@@ -43,6 +44,7 @@ export function renderDashboard(data: DashboardData, opts: { refreshSeconds?: nu
   const locks = data.locks ?? [];
   const jobs = data.jobs ?? [];
   const events = data.events ?? [];
+  const nodes = data.nodes ?? [];
   const counts = data.job_counts ?? [];
   const jobSummary = counts.length ? counts.map((c) => `${c.n} ${c.status}`).join(" · ") : "no jobs";
   const cell = (value: unknown) => `<td>${escapeHtml(value)}</td>`;
@@ -85,7 +87,7 @@ tr.blocked td,tr.blocked .title{color:#f6c27a}
 <h1>Underwright board</h1>
 <p class="meta">read-only · auto-refresh ${refresh}s · rendered ${escapeHtml(new Date().toISOString())}</p>
 </header>
-<p class="meta">jobs: ${escapeHtml(jobSummary)} · tasks: ${tasks.length} · active locks: ${locks.length}</p>
+<p class="meta">jobs: ${escapeHtml(jobSummary)} · tasks: ${tasks.length} · active locks: ${locks.length} · nodes: ${nodes.length}</p>
 
 <h2>Tasks <span class="count">${tasks.length}</span></h2>
 <table>
@@ -112,6 +114,14 @@ ${rows(escalations, 4, (t) => `<tr class="blocked"><td><code>${escapeHtml(t.id)}
 <thead><tr><th>Resource</th><th>Agent</th><th>Task</th><th>Lease expires</th></tr></thead>
 <tbody>
 ${rows(locks, 4, (l) => `<tr><td><code>${escapeHtml(l.resource)}</code></td>${cell(l.agent_id)}${cell(l.task_id ?? "—")}${cell(l.lease_expires)}</tr>`)}
+</tbody>
+</table>
+
+<h2>Nodes <span class="count">${nodes.length}</span></h2>
+<table>
+<thead><tr><th>Node</th><th>State</th><th>Liveness</th><th>Last heartbeat</th><th>Current job</th><th>Capabilities</th><th>Harnesses</th></tr></thead>
+<tbody>
+${rows(nodes, 7, (n) => `<tr><td><code>${escapeHtml(n.id)}</code> <span class="title">${escapeHtml(n.name)}</span></td>${cell(n.state)}${cell(n.liveness)}${cell(n.last_seen_at ?? "—")}${cell(n.current_job_id ?? "—")}${cell(n.capabilities_freshness)}${cell((n.harnesses ?? []).map((h: any) => h.id).join(", ") || "—")}</tr>`)}
 </tbody>
 </table>
 

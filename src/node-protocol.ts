@@ -60,6 +60,72 @@ export const nodeFinishSchema = z.object({
 export const nodeHash = (value: string) => createHash('sha256').update(value).digest('hex');
 export const nodeSecret = () => randomBytes(32).toString('hex');
 export const nodeExpiry = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
+export const NODE_ONLINE_MS = 45_000;
+export const NODE_STALE_MS = 120_000;
+export const nodeHeartbeatSchema = z.object({
+  session_id: z.string().min(1).max(64),
+  capabilities_version: z.number().int().nonnegative().optional(),
+  active_job_id: z.string().max(64).optional(),
+  phase: z.enum(['idle', 'polling', 'running']).optional(),
+}).strict();
+export const nodeHarnessSchema = z.object({
+  id: z.string().min(1).max(64),
+  version: z.string().max(64).default('unknown'),
+  installed: z.boolean().default(false),
+  auth_status: z.enum(['ready', 'missing', 'unknown']).default('unknown'),
+  quota: z.object({
+    state: z.enum(['available', 'unknown', 'stale', 'exhausted']).default('unknown'),
+    observed_at: z.string().optional(),
+  }).strict().default({ state: 'unknown' }),
+}).strict();
+export const nodeInventorySchema = z.object({
+  protocol_version: z.literal(1).default(1),
+  daemon_version: z.string().max(32).optional(),
+  os: z.string().max(32).optional(),
+  arch: z.string().max(32).optional(),
+  labels: z.array(z.string().max(64)).max(16).default([]),
+  supported_operation_kinds: z.array(z.enum(NODE_JOB_KINDS)).max(4).default([]),
+  approved_workspace_ids: z.array(z.string().max(128)).max(32).default([]),
+  max_concurrency: z.number().int().min(1).max(8).default(1),
+  current_slots: z.number().int().min(0).max(8).default(0),
+  harnesses: z.array(nodeHarnessSchema).max(16).default([]),
+}).strict();
+export const nodeCapabilitiesSchema = z.object({
+  session_id: z.string().min(1).max(64),
+  version: z.number().int().nonnegative(),
+  inventory: nodeInventorySchema,
+}).strict();
+export function nodePresence(lastSeenAt: unknown, now = Date.now()) {
+  const seen = lastSeenAt ? Date.parse(isoTimestamp(lastSeenAt) ?? '') : NaN;
+  const age = Number.isFinite(seen) ? now - seen : Number.POSITIVE_INFINITY;
+  if (age <= NODE_ONLINE_MS) return 'online';
+  if (age <= NODE_STALE_MS) return 'stale';
+  return 'offline';
+}
+export function projectNode(node: any, now = Date.now()) {
+  const last_seen_at = isoTimestamp(node.last_seen_at);
+  const capabilities_observed_at = isoTimestamp(node.capabilities_observed_at);
+  const presence = nodePresence(last_seen_at, now);
+  const liveness = node.state === 'revoked' ? 'revoked' : node.state === 'draining' ? `draining:${presence}` : presence;
+  const capAge = capabilities_observed_at ? now - Date.parse(capabilities_observed_at) : Number.POSITIVE_INFINITY;
+  const capabilities_freshness = !capabilities_observed_at ? 'unknown' : capAge <= NODE_STALE_MS ? 'fresh' : 'stale';
+  let inventory: any = {};
+  try { inventory = typeof node.capabilities_json === 'string' ? JSON.parse(node.capabilities_json || '{}') : (node.capabilities_json ?? {}); }
+  catch { inventory = {}; }
+  const harnesses = Array.isArray(inventory.harnesses) ? inventory.harnesses.map((h: any) => ({
+    id: h.id, version: h.version ?? 'unknown', installed: Boolean(h.installed),
+    auth_status: h.auth_status ?? 'unknown', quota: h.quota ?? { state: 'unknown' },
+  })) : [];
+  return {
+    id: node.id, name: node.name, state: node.state, liveness,
+    last_seen_at, last_heartbeat_age_ms: last_seen_at ? now - Date.parse(last_seen_at) : null,
+    current_job_id: node.current_job_id ?? null,
+    capabilities_version: node.capabilities_version ?? 0,
+    capabilities_freshness, capabilities_observed_at,
+    supported_operation_kinds: inventory.supported_operation_kinds ?? [],
+    harnesses,
+  };
+}
 export const nodeError = (error = 'unauthorized', status_code = 401): NodeError => ({ error, status_code });
 export const boundNodeResult = (value: string) => value.slice(-NODE_RESULT_LIMIT);
 export const nodeReceiptDigest = (attemptId: string, status: string, result: string) =>

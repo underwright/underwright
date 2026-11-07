@@ -90,6 +90,8 @@ export interface IStore {
   renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
   finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
   sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;
+  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
+  putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
 
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;

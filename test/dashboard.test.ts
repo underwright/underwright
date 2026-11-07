@@ -56,6 +56,7 @@ describe("dashboard rendering", () => {
     expect(html).toContain("Tasks");
     expect(html).toContain("Active resource locks");
     expect(html).toContain("Open jobs");
+    expect(html).toContain("Nodes");
     expect(html).toContain("Recent events");
     expect(html).toContain("Ship it");
     expect(html).toContain("src/**");

@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, sleepSignal, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -117,7 +117,12 @@ export class SqliteStore implements IStore {
   }
 
   listNodes(): any[] {
-    return this.nodeQuery('SELECT id,name,state,policy_json,created_at,last_seen_at,session_expires_at FROM nodes ORDER BY created_at DESC LIMIT 1000');
+    const now = Date.now();
+    const rows = this.nodeQuery(`SELECT n.id,n.name,n.state,n.policy_json,n.created_at,n.last_seen_at,n.session_expires_at,
+      n.capabilities_json,n.capabilities_version,n.capabilities_observed_at,
+      (SELECT id FROM jobs j WHERE j.type='node' AND j.target_node_id=n.id AND j.status='running' LIMIT 1) AS current_job_id
+      FROM nodes n ORDER BY n.created_at DESC LIMIT 1000`);
+    return rows.map(row => projectNode(row, now));
   }
 
   revokeNode(id: string, actor: string): any {
@@ -332,6 +337,32 @@ export class SqliteStore implements IStore {
       if (job.task_id) s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
       return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
     });
+  }
+
+  nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
+    const principal = this.authenticateNode(token, sessionId);
+    if ("error" in principal) return principal;
+    const now = new Date().toISOString();
+    this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
+    const [row] = this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
+    return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
+  }
+
+  putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown) {
+    const parsed = nodeInventorySchema.safeParse(inventory);
+    if (!parsed.success) return nodeError("invalid inventory", 400);
+    const principal = this.authenticateNode(token, sessionId);
+    if ("error" in principal) return principal;
+    const now = new Date().toISOString();
+    const inventoryJson = JSON.stringify(parsed.data);
+    if (inventoryJson.includes("uw_node_")) return nodeError("invalid inventory", 400);
+    this.nodeQuery(
+      "UPDATE nodes SET last_seen_at=?, capabilities_json=?, capabilities_version=?, capabilities_observed_at=? WHERE id=?",
+      [now, inventoryJson, version, now, principal.node_id],
+    );
+    this.log("node", principal.node_id, "capabilities", principal.node_id, { version, harnesses: parsed.data.harnesses.map(h => h.id) });
+    return { node_id: principal.node_id, version, server_time: now };
   }
 
   constructor(path = "underwright.db") {
@@ -1189,7 +1220,7 @@ export class SqliteStore implements IStore {
       .all();
     const jobs = this.db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all();
     const helpers = (this.db.prepare("SELECT COUNT(*) n FROM helpers").get() as any).n;
-    return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers };
+    return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers, nodes: this.listNodes() };
   }
 
   /** Standup-style summary of board delta since a timestamp, optionally sent to an agent's mailbox. */

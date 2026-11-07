@@ -161,6 +161,13 @@ async function matrix(token) {
       }, queueIssued.token);
       assert.equal(finished.status, 200);
       assert.equal((await nodePost('/nodes/v1/poll', { session_id: queueSession.session_id, wait_seconds: 0 }, queueIssued.token)).status, 204);
+      assert.equal((await nodePost('/nodes/v1/heartbeat', { session_id: queueSession.session_id, phase: 'idle' }, queueIssued.token)).status, 200);
+      const caps = await fetch(`${base}/nodes/v1/capabilities`, { method: 'PUT', headers: {
+        'content-type': 'application/json', authorization: `Bearer ${queueIssued.token}` },
+        body: JSON.stringify({ session_id: queueSession.session_id, version: 1, inventory: { protocol_version: 1, harnesses: [{ id: 'grok', auth_status: 'unknown', quota: { state: 'unknown' } }] } }),
+        signal: AbortSignal.timeout(10_000) });
+      assert.equal(caps.status, 200);
+      assert.equal((await call('list_nodes')).find(n => n.id === queueApproved.node_id).liveness, 'online');
       await call('revoke_node', { node_id: queueIssued.node_id });
       await call('revoke_node', { node_id: issued.node_id });
       assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 401);

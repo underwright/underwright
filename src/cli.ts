@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import { enrollNode, nodeStatus } from "./node-client.js";
+import { runNode } from "./node-run.js";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
@@ -69,7 +70,12 @@ switch (cmd) {
       if (args[0] === "enroll") {
         await enrollNode(flag("url") ?? "", flag("name") ?? hostname(), args.includes("--allow-insecure"));
       } else if (args[0] === "status") console.log(JSON.stringify(nodeStatus(), null, 2));
-      else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status");
+      else if (args[0] === "run") {
+        const shutdown = new AbortController();
+        process.once("SIGINT", () => shutdown.abort());
+        process.once("SIGTERM", () => shutdown.abort());
+        await runNode({ signal: shutdown.signal });
+      } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;
   }
@@ -227,6 +233,7 @@ Usage:
   underwright run                Execute queued jobs locally (including agent jobs).
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
+  underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
   underwright board              Print the task board.
   underwright digest             Summarize board delta since --since TS [--to AGENT] [--text].
   underwright create             Create a task, optionally from a template (--template feature).

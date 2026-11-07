@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { IStore } from './istore.js';
-import { nodeEnrollmentSchema, nodePollSchema, nodeRenewSchema, nodeFinishSchema } from './node-protocol.js';
+import { nodeEnrollmentSchema, nodePollSchema, nodeRenewSchema, nodeFinishSchema, nodeHeartbeatSchema, nodeCapabilitiesSchema } from './node-protocol.js';
 
 function nodeBearer(req: IncomingMessage) {
   return req.headers.authorization?.match(/^Bearer (uw_node_[a-f0-9]{64})$/)?.[1];
@@ -17,7 +17,8 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
     res.writeHead(status, headers).end(JSON.stringify(value));
   };
   if (!adminConfigured) { reply(503, { error: 'Configure UNDERWRIGHT_TOKEN before enrolling nodes or approving enrollment' }); return; }
-  if (req.method !== 'POST') { reply(405, { error: 'POST required' }); return; }
+  const allowPut = req.url === '/nodes/v1/capabilities' && req.method === 'PUT';
+  if (!allowPut && req.method !== 'POST') { reply(405, { error: 'POST required' }); return; }
   if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) { reply(415, { error: 'JSON required' }); return; }
   const jobRoute = /^\/nodes\/v1\/jobs\//.test(req.url ?? '');
   const limit = jobRoute ? 80000 : 8192;
@@ -45,6 +46,14 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
       z.object({ version: z.literal(1) }).strict().parse(body);
       const token = nodeBearer(req);
       result = token ? await store.startNodeSession(token) : { error: 'unauthorized', status_code: 401 };
+    } else if (req.url === '/nodes/v1/heartbeat') {
+      const a = nodeHeartbeatSchema.parse(body);
+      const token = nodeBearer(req);
+      result = token ? await store.nodeHeartbeat(token, a.session_id, a) : { error: 'unauthorized', status_code: 401 };
+    } else if (req.url === '/nodes/v1/capabilities') {
+      const a = nodeCapabilitiesSchema.parse(body);
+      const token = nodeBearer(req);
+      result = token ? await store.putNodeCapabilities(token, a.session_id, a.version, a.inventory) : { error: 'unauthorized', status_code: 401 };
     } else if (req.url === '/nodes/v1/poll') {
       const a = nodePollSchema.parse(body);
       const token = nodeBearer(req);

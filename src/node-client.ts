@@ -5,7 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { nodeCredentialSchema, nodeHash, nodeSecret, type NodeCredential } from './node-protocol.js';
 
 export const nodeStateDirectory = () => join(homedir(), '.local', 'state', 'underwright', 'node');
-function secureDirectory(dir: string) {
+export function secureDirectory(dir: string) {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stat = lstatSync(dir);
   if (!stat.isDirectory() || stat.isSymbolicLink() || realpathSync(dir) !== resolve(dir)) throw new Error('node state directory must be a real user directory');
