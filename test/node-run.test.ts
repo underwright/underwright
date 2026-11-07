@@ -72,7 +72,7 @@ it("heartbeats independently while a job is running and redacts inventory secret
   const finished = await blocked;
   expect(finished.result).toContain("harmless");
   expect(heartbeats).toBeGreaterThanOrEqual(2);
-  expect(store.listNodes()[0].capabilities_freshness).toBe("fresh");
+  await vi.waitFor(() => expect(store.listNodes()[0].capabilities_freshness).toBe("fresh"));
   expect(JSON.stringify(store.listNodes()[0])).not.toContain(node.token);
   expect(JSON.stringify(store.auditLog(200))).not.toContain(node.token);
   shutdown.abort();

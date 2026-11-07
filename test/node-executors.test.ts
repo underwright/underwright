@@ -104,3 +104,24 @@ describe('node executors', () => {
     expect(Object.keys(sanitizedEnv([], { PATH: '/x', FOO: 'y' }))).toEqual(['PATH']);
   });
 });
+
+it('redacts split scoped credentials before output truncation', async () => {
+  const secret = 'uw_worker_' + 'a'.repeat(64);
+  const cfg = { workspaces: {}, maxOutput: 12, installers: { fixture: { executable: process.execPath, args: ['-e', `process.stdout.write(${JSON.stringify(secret.slice(0, 35))});setTimeout(()=>process.stdout.write(${JSON.stringify(secret.slice(35))}),30)`] } } };
+  const reg = createExecutorRegistry({ allowed_task_types: ['install-harness'], workspace_ids: [] }, cfg);
+  const result = await reg.execute(task('install-harness', { harness: 'fixture' }));
+  expect(result.result).toBe('[redacted]');
+});
+
+it('runOnce aborts its process and refuses stale finish when transport renewal is rejected', async () => {
+  const cfg = { workspaces: {}, installers: { fixture: { executable: node, args: ['-e', 'setInterval(()=>{},1000)'] } } };
+  const reg = createExecutorRegistry({ allowed_task_types: ['install-harness'], workspace_ids: [] }, cfg);
+  let finishes = 0;
+  const transport: NodeTransport = {
+    poll: async () => ({ ...task('install-harness', { harness: 'fixture' }), lease_expires: new Date(Date.now() + 10000).toISOString() }),
+    renew: async () => ({ error: 'lease lost' }),
+    finish: async () => { finishes++; },
+  };
+  await expect(reg.runOnce(transport)).rejects.toThrow('lease lost');
+  expect(finishes).toBe(0);
+});

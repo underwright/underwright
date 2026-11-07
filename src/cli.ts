@@ -74,7 +74,10 @@ switch (cmd) {
         const shutdown = new AbortController();
         process.once("SIGINT", () => shutdown.abort());
         process.once("SIGTERM", () => shutdown.abort());
-        await runNode({ signal: shutdown.signal });
+        const configPath = flag('config');
+        if (!configPath) throw new Error('node run requires --config FILE with locally approved resources');
+        const config = JSON.parse(readFileSync(configPath, 'utf8'));
+        await runNode({ signal: shutdown.signal, config });
       } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;

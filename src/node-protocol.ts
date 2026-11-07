@@ -127,7 +127,10 @@ export function projectNode(node: any, now = Date.now()) {
   };
 }
 export const nodeError = (error = 'unauthorized', status_code = 401): NodeError => ({ error, status_code });
-export const boundNodeResult = (value: string) => value.slice(-NODE_RESULT_LIMIT);
+export const boundNodeResult = (value: string) => value
+  .replace(/uw_(?:node|worker)_[a-f0-9]+/g, '[redacted]')
+  .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/=-]{8,}/gi, '$1[redacted]')
+  .slice(-NODE_RESULT_LIMIT);
 export const nodeReceiptDigest = (attemptId: string, status: string, result: string) =>
   nodeHash(`${attemptId}:${status}:${result}`);
 export function isoTimestamp(value: unknown): string | null {
@@ -143,7 +146,7 @@ export function publicNodeJob(job: any) {
   }
   return {
     id: job.id, type: job.type, status: job.status, task_id: job.task_id ?? null,
-    target_node_id: job.target_node_id, runner_id: job.runner_id ?? null,
+    agent_id: job.agent_id, target_node_id: job.target_node_id, runner_id: job.runner_id ?? null,
     attempt_id: job.attempt_id ?? null, lease_token: job.lease_token ?? null,
     lease_expires: isoTimestamp(job.lease_expires), session_id: job.session_id ?? null,
     node_spec, result: job.result ?? '', outcome_reason: job.outcome_reason ?? null,

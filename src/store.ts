@@ -156,15 +156,19 @@ export class SqliteStore implements IStore {
       const expires_at = nodeExpiry(3600);
       s.nodeQuery('UPDATE nodes SET session_epoch=?,session_expires_at=? WHERE id=?', [session_id, expires_at, principal.node_id]);
       s.nodeAudit(principal.node_id, 'session_started');
-      return { node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: NODE_LEASE_SECONDS };
+      return { policy: principal.policy, node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: NODE_LEASE_SECONDS };
     });
   }
 
-  private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string }, capabilitiesJson?: string) {
+  private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string; payload?: Record<string, unknown> }, capabilitiesJson?: string, observedAt?: unknown) {
     if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
     if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
     try {
       const capabilities = JSON.parse(capabilitiesJson || "{}");
+      if (spec.kind === 'launch-agent') {
+        const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
+        if (!observedAt || Date.now() - Date.parse(String(observedAt)) > 120000 || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
+      }
       const kinds = capabilities.supported_operation_kinds;
       if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
     } catch { return false; }
@@ -179,12 +183,21 @@ export class SqliteStore implements IStore {
       const node = (s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [args.target_node_id]))[0];
       if (!node) return nodeError("node unavailable", 404);
       const policy = JSON.parse(node.policy_json) as NodePolicy;
-      if (!s.nodePolicyAllows(policy, spec, node.capabilities_json)) return nodeError("operation not permitted", 403);
+      if (!s.nodePolicyAllows(policy, spec, node.capabilities_json, node.capabilities_observed_at)) return nodeError(spec.kind === "launch-agent" ? "launch requires fresh ready capability and approved policy" : "operation not permitted", 403);
+      if (spec.kind === 'launch-agent') {
+        const inventory = JSON.parse(node.capabilities_json || '{}');
+        const harness = inventory.harnesses?.find((h: any) => h.id === spec.payload.harness);
+        if (!args.task_id || !args.agent_id || !spec.workspace_id || spec.payload.workspace_id !== spec.workspace_id ||
+            !node.capabilities_observed_at || Date.now() - Date.parse(String(node.capabilities_observed_at)) > 120000 ||
+            !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return nodeError('launch requires task, agent and fresh ready harness capability', 403);
+        const reserved = (s.nodeQuery("SELECT * FROM jobs WHERE type='node' AND task_id=? AND agent_id=? AND status IN ('queued','running') AND dedupe_key LIKE 'launch:%'", [args.task_id, args.agent_id]))[0];
+        if (reserved) return { ...publicNodeJob(reserved), deduped: true };
+      }
       if (args.retry_of) {
         const prior = (s.nodeQuery("SELECT id FROM jobs WHERE id=? AND type='node'", [args.retry_of]))[0];
         if (!prior) return nodeError("retry_of not found", 404);
       }
-      const dedupe = args.dedupe_key ?? spec.idempotency_key ?? null;
+      const dedupe = spec.kind === 'launch-agent' ? 'launch:' + nodeHash(args.task_id + ':' + args.agent_id) : args.dedupe_key ?? spec.idempotency_key ?? null;
       if (dedupe) {
         const existing = (s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
@@ -209,6 +222,51 @@ export class SqliteStore implements IStore {
       }
       s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: args.target_node_id, kind: spec.kind, retry_of: args.retry_of ?? null });
       return { id, status: "queued", target_node_id: args.target_node_id };
+    });
+  }
+
+  issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string) {
+    return this.nodeTransaction(s => {
+      const principal = s.authenticateNode(token, sessionId);
+      if ('error' in principal) return principal;
+      const job = s.nodeQuery("SELECT * FROM jobs WHERE id=? AND target_node_id=? AND status='running' AND session_id=? AND lease_token=? AND lease_expires>?", [jobId, principal.node_id, sessionId, leaseToken, new Date().toISOString()])[0];
+      if (!job || !job.task_id || JSON.parse(job.node_spec).kind !== 'launch-agent') return nodeError('worker requires a live task launch', 403);
+      const worker = 'uw_worker_' + nodeSecret();
+      s.nodeQuery('DELETE FROM node_workers WHERE job_id=?', [jobId]);
+      s.nodeQuery('INSERT INTO node_workers(secret_hash,node_id,token_id,session_id,task_id,agent_id,job_id,attempt_id) VALUES (?,?,?,?,?,?,?,?)', [nodeHash(worker), principal.node_id, principal.token_id, sessionId, job.task_id, job.agent_id, jobId, job.attempt_id]);
+      s.log('job', jobId, 'worker_issued', principal.node_id, { attempt_id: job.attempt_id });
+      return { token: worker, task_id: job.task_id, agent_id: job.agent_id, job_id: jobId, attempt_id: job.attempt_id };
+    });
+  }
+
+  workerTool(token: string, name: string, args: Record<string, unknown>) {
+    if (!/^uw_worker_[a-f0-9]{64}$/.test(token)) return nodeError();
+    return this.nodeTransaction(s => {
+      const now = new Date().toISOString();
+      const w = s.nodeQuery(`SELECT w.* FROM node_workers w
+        JOIN jobs j ON j.id=w.job_id AND j.attempt_id=w.attempt_id AND j.session_id=w.session_id
+        AND j.task_id=w.task_id AND j.agent_id=w.agent_id AND j.target_node_id=w.node_id AND j.type='node'
+        JOIN nodes n ON n.id=w.node_id AND n.session_epoch=w.session_id
+        JOIN node_tokens t ON t.id=w.token_id
+        WHERE w.secret_hash=? AND j.status='running' AND j.lease_expires>?
+        AND n.state IN ('approved','draining') AND n.session_expires_at>?
+        AND t.revoked_at IS NULL AND t.expires_at>?`, [nodeHash(token), now, now, now])[0];
+      if (!w) return nodeError();
+      if ((args.task_id !== undefined && args.task_id !== w.task_id) || (args.agent_id !== undefined && args.agent_id !== w.agent_id)) return nodeError('worker scope mismatch', 403);
+      const task = s.getTask(w.task_id);
+      switch (name) {
+        case 'get_task': return task;
+        case 'board': return { tasks: task ? [task] : [] };
+        case 'get_evidence': return s.getEvidence(w.task_id);
+        case 'list_artifacts': return s.listArtifacts(w.task_id);
+        case 'claim_task': return s.claimTask(w.task_id, w.agent_id);
+        case 'renew_lease': return s.renewLease(w.task_id, w.agent_id);
+        case 'release_task': return s.releaseTask(w.task_id, w.agent_id, true);
+        case 'complete_task': return s.completeTask(w.task_id, w.agent_id, true);
+        case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        default: return nodeError('worker tool denied', 403);
+      }
     });
   }
 
@@ -249,9 +307,9 @@ export class SqliteStore implements IStore {
       if (!queued) return { empty: true, status_code: 204 };
       let spec: any = {};
       try { spec = JSON.parse(queued.node_spec || "{}"); } catch { spec = {}; }
-      const node = (s.nodeQuery("SELECT policy_json, capabilities_json, state FROM nodes WHERE id=?", [principal.node_id]))[0];
+      const node = (s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
-      if (!s.nodePolicyAllows(JSON.parse(node.policy_json), spec, node.capabilities_json)) {
+      if (!s.nodePolicyAllows(JSON.parse(node.policy_json), spec, node.capabilities_json, node.capabilities_observed_at)) {
         s.nodeQuery(
           "UPDATE jobs SET status='failed', finished_at=?, outcome_reason='policy_denied', lease_expires=NULL WHERE id=? AND status='queued'",
           [now, queued.id],
@@ -735,7 +793,7 @@ export class SqliteStore implements IStore {
     return { watching: taskId };
   }
 
-  releaseTask(taskId: string, agentId: string) {
+  releaseTask(taskId: string, agentId: string, scoped = false) {
     return this.db.transaction(() => {
       const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id = ?").get(taskId) as any;
       if (!claim) return { error: `task ${taskId} is not claimed` };
@@ -743,7 +801,7 @@ export class SqliteStore implements IStore {
       this.db.prepare("DELETE FROM claims WHERE task_id = ?").run(taskId);
       this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=?").run(taskId);
       this.log("task", taskId, "released", agentId);
-      const dispatched = this.dispatchNext(agentId, taskId, "release");
+      const dispatched = scoped ? undefined : this.dispatchNext(agentId, taskId, "release");
       return { released: taskId, ...(dispatched ? { dispatched } : {}) };
     }).immediate();
   }
@@ -834,8 +892,8 @@ export class SqliteStore implements IStore {
   }
 
   /** Close a task. Requires evidence for every declared acceptance criterion. */
-  completeTask(taskId: string, agentId: string) {
-    const res = this.db.transaction(() => this.completeTaskAtomic(taskId, agentId)).immediate() as any;
+  completeTask(taskId: string, agentId: string, scoped = false) {
+    const res = this.db.transaction(() => this.completeTaskAtomic(taskId, agentId, scoped)).immediate() as any;
     if (res && res._notify) {
       const { _notify, ...publicRes } = res;
       void sendHumanNotification(_notify, loadPolicy());
@@ -844,7 +902,7 @@ export class SqliteStore implements IStore {
     return res;
   }
 
-  private completeTaskAtomic(taskId: string, agentId: string) {
+  private completeTaskAtomic(taskId: string, agentId: string, scoped = false) {
     const task = this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
     if (task.status === "done") return { completed: taskId };
@@ -875,7 +933,7 @@ export class SqliteStore implements IStore {
     this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     this.notifyWatchers(taskId, `task ${taskId} → done`);
     this.unblockDependents(taskId, agentId);
-    const dispatched = this.dispatchNext(agentId, taskId, "complete");
+    const dispatched = scoped ? undefined : this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
       ...(dod.missing.length ? { warnings: dod.missing } : {}),

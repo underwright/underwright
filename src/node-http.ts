@@ -21,7 +21,7 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
   if (!allowPut && req.method !== 'POST') { reply(405, { error: 'POST required' }); return; }
   if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] ?? '')) { reply(415, { error: 'JSON required' }); return; }
   const jobRoute = /^\/nodes\/v1\/jobs\//.test(req.url ?? '');
-  const limit = jobRoute ? 80000 : 8192;
+  const limit = jobRoute ? 400000 : 8192;
   const timeout = setTimeout(() => { reply(408, { error: 'request timeout' }); req.destroy(); }, 10000);
   const abort = new AbortController();
   const onClose = () => { if (!res.headersSent && !res.writableEnded) abort.abort(); };
@@ -58,7 +58,7 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
       const a = nodePollSchema.parse(body);
       const token = nodeBearer(req);
       result = token ? await store.pollNodeJob(token, a.session_id, a.wait_seconds, abort.signal) : { error: 'unauthorized', status_code: 401 };
-    } else if (/^\/nodes\/v1\/jobs\/job-[a-f0-9]{8}\/(renew|finish)$/.test(req.url ?? '')) {
+    } else if (/^\/nodes\/v1\/jobs\/job-[a-f0-9]{8}\/(renew|finish|worker)$/.test(req.url ?? '')) {
       const jobId = req.url!.split('/')[4];
       const action = req.url!.split('/')[5];
       const token = nodeBearer(req);
@@ -66,6 +66,9 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
       if (action === 'renew') {
         const a = nodeRenewSchema.parse(body);
         result = await store.renewNodeJob(token, a.session_id, jobId, a.lease_token, a.result);
+      } else if (action === 'worker') {
+        const a = nodeRenewSchema.parse(body);
+        result = await store.issueNodeWorker(token, a.session_id, jobId, a.lease_token);
       } else {
         const a = nodeFinishSchema.parse(body);
         result = await store.finishNodeJob(token, a.session_id, jobId, a.lease_token, a.status, a.result, a.result_metadata);

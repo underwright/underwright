@@ -255,6 +255,11 @@ CREATE TABLE IF NOT EXISTS node_tokens (
   scopes_json TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
 );
 CREATE INDEX IF NOT EXISTS node_tokens_node ON node_tokens(node_id);
+CREATE TABLE IF NOT EXISTS node_workers (
+  secret_hash TEXT PRIMARY KEY, node_id TEXT NOT NULL, token_id TEXT NOT NULL,
+  session_id TEXT NOT NULL, task_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  job_id TEXT NOT NULL UNIQUE, attempt_id TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS node_rate_limits (
   bucket TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
 );

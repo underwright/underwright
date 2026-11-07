@@ -13,7 +13,8 @@
   "files": [
     "dist/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/install-agents.sh"
   ],
   "repository": {
     "type": "git",

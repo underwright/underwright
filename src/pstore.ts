@@ -123,7 +123,7 @@ export class PgStore implements IStore {
   private async nodeTransaction(work: (s: PgStore) => Promise<any>): Promise<any> {
     return this.sql.begin(async sql => {
       // Serialize enrollment quotas and auth transitions across control-plane replicas.
-      await sql.unsafe('LOCK TABLE node_enrollments, nodes, node_tokens, node_rate_limits IN SHARE ROW EXCLUSIVE MODE');
+      await sql.unsafe('LOCK TABLE node_enrollments, nodes, node_tokens, node_workers, node_rate_limits, task_dependencies IN SHARE ROW EXCLUSIVE MODE');
       return work(new PgStore(sql as unknown as postgres.Sql));
     });
   }
@@ -261,15 +261,19 @@ export class PgStore implements IStore {
       const expires_at = nodeExpiry(3600);
       await s.nodeQuery('UPDATE nodes SET session_epoch=?,session_expires_at=? WHERE id=?', [session_id, expires_at, principal.node_id]);
       await s.nodeAudit(principal.node_id, 'session_started');
-      return { node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: NODE_LEASE_SECONDS };
+      return { policy: principal.policy, node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: NODE_LEASE_SECONDS };
     });
   }
 
-  private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string }, capabilitiesJson?: string) {
+  private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string; payload?: Record<string, unknown> }, capabilitiesJson?: string, observedAt?: unknown) {
     if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
     if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
     try {
       const capabilities = JSON.parse(capabilitiesJson || "{}");
+      if (spec.kind === 'launch-agent') {
+        const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
+        if (!observedAt || Date.now() - Date.parse(String(observedAt)) > 120000 || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
+      }
       const kinds = capabilities.supported_operation_kinds;
       if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
     } catch { return false; }
@@ -282,16 +286,26 @@ export class PgStore implements IStore {
     const spec = parsed.data;
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
+      await sql.unsafe('LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE');
       const node = (await s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [args.target_node_id]))[0];
       if (!node) return nodeError("node unavailable", 404);
       const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
       const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
-      if (!s.nodePolicyAllows(policy, spec, capabilities)) return nodeError("operation not permitted", 403);
+      if (!s.nodePolicyAllows(policy, spec, capabilities, node.capabilities_observed_at)) return nodeError(spec.kind === "launch-agent" ? "launch requires fresh ready capability and approved policy" : "operation not permitted", 403);
+      if (spec.kind === 'launch-agent') {
+        const inventory = JSON.parse(node.capabilities_json || '{}');
+        const harness = inventory.harnesses?.find((h: any) => h.id === spec.payload.harness);
+        if (!args.task_id || !args.agent_id || !spec.workspace_id || spec.payload.workspace_id !== spec.workspace_id ||
+            !node.capabilities_observed_at || Date.now() - Date.parse(String(node.capabilities_observed_at)) > 120000 ||
+            !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return nodeError('launch requires task, agent and fresh ready harness capability', 403);
+        const reserved = (await s.nodeQuery("SELECT * FROM jobs WHERE type='node' AND task_id=? AND agent_id=? AND status IN ('queued','running') AND dedupe_key LIKE 'launch:%'", [args.task_id, args.agent_id]))[0];
+        if (reserved) return { ...publicNodeJob(reserved), deduped: true };
+      }
       if (args.retry_of) {
         const prior = (await s.nodeQuery("SELECT id FROM jobs WHERE id=? AND type='node'", [args.retry_of]))[0];
         if (!prior) return nodeError("retry_of not found", 404);
       }
-      const dedupe = args.dedupe_key ?? spec.idempotency_key ?? null;
+      const dedupe = spec.kind === 'launch-agent' ? 'launch:' + nodeHash(args.task_id + ':' + args.agent_id) : args.dedupe_key ?? spec.idempotency_key ?? null;
       if (dedupe) {
         const existing = (await s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
@@ -318,6 +332,51 @@ export class PgStore implements IStore {
       }
       await s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: args.target_node_id, kind: spec.kind, retry_of: args.retry_of ?? null });
       return { id, status: "queued", target_node_id: args.target_node_id };
+    });
+  }
+
+  async issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string) {
+    return this.nodeTransaction(async s => {
+      const principal = await s.authenticateNode(token, sessionId);
+      if ('error' in principal) return principal;
+      const job = (await s.nodeQuery("SELECT * FROM jobs WHERE id=? AND target_node_id=? AND status='running' AND session_id=? AND lease_token=? AND lease_expires>?", [jobId, principal.node_id, sessionId, leaseToken, new Date().toISOString()]))[0];
+      if (!job || !job.task_id || JSON.parse(job.node_spec).kind !== 'launch-agent') return nodeError('worker requires a live task launch', 403);
+      const worker = 'uw_worker_' + nodeSecret();
+      await s.nodeQuery('DELETE FROM node_workers WHERE job_id=?', [jobId]);
+      await s.nodeQuery('INSERT INTO node_workers(secret_hash,node_id,token_id,session_id,task_id,agent_id,job_id,attempt_id) VALUES (?,?,?,?,?,?,?,?)', [nodeHash(worker), principal.node_id, principal.token_id, sessionId, job.task_id, job.agent_id, jobId, job.attempt_id]);
+      await s.log('job', jobId, 'worker_issued', principal.node_id, { attempt_id: job.attempt_id });
+      return { token: worker, task_id: job.task_id, agent_id: job.agent_id, job_id: jobId, attempt_id: job.attempt_id };
+    });
+  }
+
+  async workerTool(token: string, name: string, args: Record<string, unknown>) {
+    if (!/^uw_worker_[a-f0-9]{64}$/.test(token)) return nodeError();
+    return this.nodeTransaction(async s => {
+      const now = new Date().toISOString();
+      const w = (await s.nodeQuery(`SELECT w.* FROM node_workers w
+        JOIN jobs j ON j.id=w.job_id AND j.attempt_id=w.attempt_id AND j.session_id=w.session_id
+        AND j.task_id=w.task_id AND j.agent_id=w.agent_id AND j.target_node_id=w.node_id AND j.type='node'
+        JOIN nodes n ON n.id=w.node_id AND n.session_epoch=w.session_id
+        JOIN node_tokens t ON t.id=w.token_id
+        WHERE w.secret_hash=? AND j.status='running' AND j.lease_expires>?
+        AND n.state IN ('approved','draining') AND n.session_expires_at>?
+        AND t.revoked_at IS NULL AND t.expires_at>?`, [nodeHash(token), now, now, now]))[0];
+      if (!w) return nodeError();
+      if ((args.task_id !== undefined && args.task_id !== w.task_id) || (args.agent_id !== undefined && args.agent_id !== w.agent_id)) return nodeError('worker scope mismatch', 403);
+      const task = await s.getTask(w.task_id);
+      switch (name) {
+        case 'get_task': return task;
+        case 'board': return { tasks: task ? [task] : [] };
+        case 'get_evidence': return s.getEvidence(w.task_id);
+        case 'list_artifacts': return s.listArtifacts(w.task_id);
+        case 'claim_task': return s.claimTaskAtomic(w.task_id, w.agent_id, 1800);
+        case 'renew_lease': return s.renewLease(w.task_id, w.agent_id);
+        case 'release_task': return s.releaseTaskAtomic(w.task_id, w.agent_id, true);
+        case 'complete_task': { const { _notify, ...result } = await s.completeTaskAtomic(w.task_id, w.agent_id, true) as any; return result; }
+        case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        default: return nodeError('worker tool denied', 403);
+      }
     });
   }
 
@@ -353,11 +412,11 @@ export class PgStore implements IStore {
       if (!queued) return { empty: true, status_code: 204 };
       let spec: any = queued.node_spec;
       if (typeof spec === "string") { try { spec = JSON.parse(spec); } catch { spec = {}; } }
-      const node = (await s.nodeQuery("SELECT policy_json, capabilities_json, state FROM nodes WHERE id=?", [principal.node_id]))[0];
+      const node = (await s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
       const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
-      if (!s.nodePolicyAllows(policy, spec, capabilities)) {
+      if (!s.nodePolicyAllows(policy, spec, capabilities, node.capabilities_observed_at)) {
         await s.nodeQuery(
           "UPDATE jobs SET status='failed', finished_at=now(), outcome_reason='policy_denied', lease_expires=NULL WHERE id=? AND status='queued'",
           [queued.id],
@@ -692,21 +751,21 @@ export class PgStore implements IStore {
     return this.sql`SELECT * FROM locks WHERE resource = ANY(${resources}) AND lease_expires > now()`;
   }
 
-  async releaseTask(taskId: string, agentId: string) {
+  async releaseTask(taskId: string, agentId: string, scoped = false) {
     return this.sql.begin(async sql => {
       const tx = new PgStore(sql as unknown as postgres.Sql);
-      return tx.releaseTaskAtomic(taskId, agentId);
+      return tx.releaseTaskAtomic(taskId, agentId, scoped);
     });
   }
 
-  private async releaseTaskAtomic(taskId: string, agentId: string) {
+  private async releaseTaskAtomic(taskId: string, agentId: string, scoped = false) {
     const [claim] = await this.sql<any[]>`SELECT agent_id FROM claims WHERE task_id=${taskId}`;
     if (!claim) return { error: `task ${taskId} is not claimed` };
     if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     await this.sql`DELETE FROM claims WHERE task_id=${taskId}`;
     await this.sql`UPDATE tasks SET status='open', updated_at=now() WHERE id=${taskId}`;
     await this.log("task", taskId, "released", agentId);
-    const dispatched = await this.dispatchNext(agentId, taskId, "release");
+    const dispatched = scoped ? undefined : await this.dispatchNext(agentId, taskId, "release");
     return { released: taskId, ...(dispatched ? { dispatched } : {}) };
   }
 
@@ -796,8 +855,8 @@ export class PgStore implements IStore {
     return rows.map((r) => (r.kind === "coverage" ? { ...r, coverage: parseCoverage(r.output ?? "") } : r));
   }
 
-  async completeTask(taskId: string, agentId: string) {
-    const res = await this.dependencyTransaction(store => store.completeTaskAtomic(taskId, agentId));
+  async completeTask(taskId: string, agentId: string, scoped = false) {
+    const res = await this.dependencyTransaction(store => store.completeTaskAtomic(taskId, agentId, scoped));
     if (res && res._notify) {
       const { _notify, ...publicRes } = res;
       await sendHumanNotification(_notify, loadPolicy());
@@ -806,7 +865,7 @@ export class PgStore implements IStore {
     return res;
   }
 
-  private async completeTaskAtomic(taskId: string, agentId: string) {
+  private async completeTaskAtomic(taskId: string, agentId: string, scoped = false) {
     const task = await this.getTask(taskId);
     if (!task) return { error: `task ${taskId} not found` };
     if (task.status === "done") return { completed: taskId };
@@ -838,7 +897,7 @@ export class PgStore implements IStore {
     await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     await this.notifyWatchers(taskId, `task ${taskId} → done`);
     await this.unblockDependents(taskId, agentId);
-    const dispatched = await this.dispatchNext(agentId, taskId, "complete");
+    const dispatched = scoped ? undefined : await this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
       ...(dod.missing.length ? { warnings: dod.missing } : {}),

@@ -1,3 +1,4 @@
+import { createWorkerServer } from './node-worker.js';
 import { handleNodeHttp } from "./node-http.js";
 import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -294,6 +295,17 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       nodeRequests++;
       try { await handleNodeHttp(store, req, res, Boolean(token)); }
       finally { nodeRequests--; }
+      return;
+    }
+    if (req.url === '/worker/mcp') {
+      const workerToken = req.headers.authorization?.match(/^Bearer (uw_worker_[a-f0-9]{64})$/)?.[1];
+      const auth = workerToken ? await store.workerTool(workerToken, 'board', {}) : { error: 'unauthorized' };
+      if (auth.error) { res.writeHead(401).end(); return; }
+      const server = createWorkerServer(store, workerToken!);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on('close', () => { void transport.close(); void server.close(); });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
       return;
     }
     // Explicitly refuse scoped credentials even in legacy no-auth mode and query fallback.

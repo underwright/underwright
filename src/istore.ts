@@ -93,6 +93,8 @@ export interface IStore {
   nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
   putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
 
+  issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string): Awaitable<any>;
+  workerTool(token: string, name: string, args: Record<string, unknown>): Awaitable<any>;
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;
@@ -101,7 +103,7 @@ export interface IStore {
   listTasks(status?: TaskStatus): Awaitable<any[]>;
   claimTask(taskId: string, agentId: string, ttlSeconds?: number, scope?: object): Awaitable<any>;
   updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string): Awaitable<any>;
-  releaseTask(taskId: string, agentId: string): Awaitable<any>;
+  releaseTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   sweepExpiredClaims(): Awaitable<{ reclaimed: string[] }>;
   /** Reassign dispatcher "your next task" mail whose task is still unclaimed. */
@@ -128,7 +130,7 @@ export interface IStore {
     exit_code?: number; output?: string; ac_ids?: string[];
   }): Awaitable<any>;
   getEvidence(taskId: string): Awaitable<any[]>;
-  completeTask(taskId: string, agentId: string): Awaitable<any>;
+  completeTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;
   registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }): Awaitable<any>;
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
   submitJob(a: SubmitJobArgs): Awaitable<any>;
