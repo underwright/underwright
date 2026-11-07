@@ -318,3 +318,5 @@ To push real-time notifications to Slack, Discord, or any generic webhook when t
 ```
 
 Each POST sends JSON containing `text` (Slack), `content` (Discord), and structured fields (`event`, `task_id`, `title`, `agent_id`, `timestamp`).
+
+Remote machine setup and typed execution policy: [node executors](docs/node-executors.md).

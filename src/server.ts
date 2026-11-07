@@ -1,3 +1,6 @@
+import { createWorkerServer } from './node-worker.js';
+import { handleNodeHttp } from "./node-http.js";
+import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -17,7 +20,7 @@ const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
 });
 
-export function createServer(store: IStore) {
+export function createServer(store: IStore, adminConfigured = Boolean(process.env.UNDERWRIGHT_TOKEN)) {
   const server = new McpServer(
     { name: "underwright", version: "0.1.0" },
     { instructions: `Underwright is the shared control plane for agentic development on this workspace.
@@ -30,6 +33,27 @@ Rules of engagement:
 6. Work the board until idle. After complete_task or release_task, read inbox. A message "your next task: <id>" is your assignment — claim it if you do not hold it, then repeat until no next task arrives.
 7. Anti-escalation: before asking a human, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact with kind "blocked" recording what was tried, send_message to the human, release_task, then read inbox and take the next dispatcher assignment. Do not go idle and do not stop silently.` }
   );
+
+  const admin = async (work: () => unknown) => adminConfigured
+    ? text(await work()) : text({ error: "Configure UNDERWRIGHT_TOKEN before administering nodes" });
+  server.tool("list_nodes", "List enrolled nodes (administrator only).", {},
+    async () => admin(() => store.listNodes()));
+  server.tool("list_node_enrollments", "List bounded pending/recent enrollment metadata; codes are shown only on the device.", {},
+    async () => admin(() => store.listNodeEnrollments()));
+  server.tool("approve_node_enrollment", "Approve the code compared on the enrolling device; configure explicit node policy.", {
+    enrollment_id: z.string().max(64), code: z.string().max(64), policy: nodePolicySchema,
+  }, async a => admin(() => store.approveNodeEnrollment(a.enrollment_id, a.code, a.policy, "admin")));
+  server.tool("reject_node_enrollment", "Reject a pending enrollment.", { enrollment_id: z.string().max(64) },
+    async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
+  server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
+    async a => admin(() => store.revokeNode(a.node_id, "admin")));
+  server.tool("submit_node_task", "Queue a node-targeted job. Legacy next_job consumers never receive these leases.", {
+    target_node_id: z.string().min(1).max(64),
+    node_spec: nodeSpecSchema,
+    task_id: z.string().max(64).optional(),
+    dedupe_key: z.string().min(1).max(128).optional(),
+    retry_of: z.string().max(64).optional(),
+  }, async a => admin(() => store.submitNodeTask({ ...a, agent_id: "admin" })));
 
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
     async () => text(await store.board()));
@@ -271,7 +295,33 @@ export async function serve(dbPath: string) {
 export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
   const store = await openStore(dbPath);
   const stopSweeper = startLeaseSweeper(store);
+  let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
+    if (req.url?.startsWith("/nodes/")) {
+      if (nodeRequests >= 32) { res.writeHead(429, { "retry-after": "3" }).end(); return; }
+      nodeRequests++;
+      try { await handleNodeHttp(store, req, res, Boolean(token)); }
+      finally { nodeRequests--; }
+      return;
+    }
+    if (req.url === '/worker/mcp') {
+      const workerToken = req.headers.authorization?.match(/^Bearer (uw_worker_[a-f0-9]{64})$/)?.[1];
+      const auth = workerToken ? await store.workerTool(workerToken, 'board', {}) : { error: 'unauthorized' };
+      if (auth.error) { res.writeHead(401).end(); return; }
+      const server = createWorkerServer(store, workerToken!);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      res.on('close', () => { void transport.close(); void server.close(); });
+      await server.connect(transport);
+      await transport.handleRequest(req, res);
+      return;
+    }
+    // Explicitly refuse scoped credentials even in legacy no-auth mode and query fallback.
+    let supplied: string | null;
+    try { supplied = new URL(req.url ?? "/", "http://underwright.local").searchParams.get("token"); }
+    catch { res.writeHead(400).end(); return; }
+    if (/^Bearer uw_(node|worker)_/.test(req.headers.authorization ?? "") || /^uw_(node|worker)_/.test(supplied ?? "")) {
+      res.writeHead(401).end('{"error":"scoped credential cannot access admin surface"}'); return;
+    }
     if (isGithubWebhookRequest(req.url)) {
       try {
         await handleGithubWebhookHttp(store, req, res, webhookSecretFromEnv());
@@ -293,7 +343,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     if (req.url === "/mcp") {
       // Stateless mode: fresh transport + server per request — all shared
       // state lives in the store, so any agent can call any tool anytime.
-      const { server } = createServer(store);
+      const { server } = createServer(store, Boolean(token));
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); server.close(); });
       await server.connect(transport);
@@ -334,6 +384,9 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     }
     res.writeHead(404).end();
   });
+  http.requestTimeout = 40000;
+  http.headersTimeout = 10000;
+  http.maxConnections = 128;
   http.once("close", () => {
     void stopSweeper().then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
   });

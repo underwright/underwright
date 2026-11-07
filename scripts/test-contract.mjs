@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -112,6 +113,67 @@ async function matrix(token) {
       assert.equal(result.content[0].type, 'text');
       exercised.add(name);
       return JSON.parse(result.content[0].text);
+    }
+    // Node admin tools fail closed without configured administrator authentication.
+    const nodePost = (path, body, bearer) => request(path, { method: 'POST', headers: {
+      'content-type': 'application/json', ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) }, body: JSON.stringify(body) });
+    if (!token) {
+      assert.equal((await nodePost('/nodes/v1/enrollments', {})).status, 503);
+      for (const [name, args] of [
+        ['list_nodes', {}], ['list_node_enrollments', {}],
+        ['approve_node_enrollment', { enrollment_id: 'fake', code: 'fake', policy: { allowed_task_types: [], workspace_ids: [] } }],
+        ['reject_node_enrollment', { enrollment_id: 'fake' }], ['revoke_node', { node_id: 'fake' }],
+        ['submit_node_task', { target_node_id: 'fake', node_spec: { version: 1, kind: 'run-script', payload: {} } }],
+      ]) assert.match((await call(name, args)).error, /Configure UNDERWRIGHT_TOKEN/);
+    } else {
+      const proof = randomBytes(32).toString('hex');
+      const enrollment = async () => (await nodePost('/nodes/v1/enrollments', { version: 1, name: 'contract-device', platform: 'test', arch: 'test',
+        device_secret_hash: createHash('sha256').update(proof).digest('hex') })).json();
+      const e = await enrollment();
+      assert((await call('list_node_enrollments')).some(row => row.id === e.id));
+      const approved = await call('approve_node_enrollment', { enrollment_id: e.id, code: e.code, policy: { allowed_task_types: [], workspace_ids: [] } });
+      const issued = await (await nodePost(`/nodes/v1/enrollments/${e.id}/exchange`, { device_secret: proof })).json();
+      assert.equal(issued.node_id, approved.node_id);
+      assert((await call('list_nodes')).some(row => row.id === issued.node_id));
+      assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 200);
+      assert.equal((await nodePost(`/nodes/v1/enrollments/${e.id}/exchange`, { device_secret: proof })).status, 409);
+      for (const path of ['/mcp', '/board', `/board?token=${issued.token}`]) {
+        assert.equal((await request(path, { headers: { authorization: `Bearer ${issued.token}` } })).status, 401);
+      }
+      const queueProof = randomBytes(32).toString('hex');
+      const queueEnroll = await (await nodePost('/nodes/v1/enrollments', { version: 1, name: 'queue-device', platform: 'test', arch: 'test',
+        device_secret_hash: createHash('sha256').update(queueProof).digest('hex') })).json();
+      const queueApproved = await call('approve_node_enrollment', { enrollment_id: queueEnroll.id, code: queueEnroll.code,
+        policy: { allowed_task_types: ['run-script'], workspace_ids: ['ws'] } });
+      const queueIssued = await (await nodePost(`/nodes/v1/enrollments/${queueEnroll.id}/exchange`, { device_secret: queueProof })).json();
+      const queueSession = await (await nodePost('/nodes/v1/session', { version: 1 }, queueIssued.token)).json();
+      const nodeTask = await call('submit_node_task', { target_node_id: queueApproved.node_id,
+        node_spec: { version: 1, kind: 'run-script', workspace_id: 'ws', payload: { argv: ['true'] } } });
+      const legacyJob = await call('submit_job', { agent_id: agent, type: 'test', command: 'echo legacy' });
+      const next = await call('next_job', { agent_id: 'runner-A', host: 'host-A' });
+      assert.equal(next.id, legacyJob.id);
+      assert.notEqual(next.id, nodeTask.id);
+      assert.equal((await call('finish_job', { job_id: next.id, agent_id: 'runner-A', lease_token: next.lease_token, status: 'done', result: 'legacy-ok' })).status, 'done');
+      const polled = await (await nodePost('/nodes/v1/poll', { session_id: queueSession.session_id, wait_seconds: 0 }, queueIssued.token)).json();
+      assert.equal(polled.id, nodeTask.id);
+      const finished = await nodePost(`/nodes/v1/jobs/${nodeTask.id}/finish`, {
+        session_id: queueSession.session_id, lease_token: polled.lease_token, status: 'done', result: 'ok',
+      }, queueIssued.token);
+      assert.equal(finished.status, 200);
+      assert.equal((await nodePost('/nodes/v1/poll', { session_id: queueSession.session_id, wait_seconds: 0 }, queueIssued.token)).status, 204);
+      assert.equal((await nodePost('/nodes/v1/heartbeat', { session_id: queueSession.session_id, phase: 'idle' }, queueIssued.token)).status, 200);
+      const caps = await fetch(`${base}/nodes/v1/capabilities`, { method: 'PUT', headers: {
+        'content-type': 'application/json', authorization: `Bearer ${queueIssued.token}` },
+        body: JSON.stringify({ session_id: queueSession.session_id, version: 1, inventory: { protocol_version: 1, harnesses: [{ id: 'grok', auth_status: 'unknown', quota: { state: 'unknown' } }] } }),
+        signal: AbortSignal.timeout(10_000) });
+      assert.equal(caps.status, 200);
+      assert.equal((await call('list_nodes')).find(n => n.id === queueApproved.node_id).liveness, 'online');
+      await call('revoke_node', { node_id: queueIssued.node_id });
+      await call('revoke_node', { node_id: issued.node_id });
+      assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 401);
+      const rejected = await enrollment();
+      assert.equal((await call('reject_node_enrollment', { enrollment_id: rejected.id })).status, 'rejected');
+      assert.equal((await nodePost(`/nodes/v1/enrollments/${rejected.id}/exchange`, { device_secret: proof })).status, 409);
     }
     const invalid = await first.callTool({ name: 'create_task', arguments: {} });
     assert.equal(invalid.isError, true);

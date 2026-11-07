@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from 'node:os';
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -53,6 +54,7 @@ describe("npm packaging, release CI, and install docs (gh-25)", () => {
     expect(packedPaths).toContain("dist/cli.js");
     expect(packedPaths).toContain("dist/uw-runner.js");
     expect(packedPaths).toContain("dist/server.js");
+    expect(packedPaths).toContain("scripts/install-agents.sh");
     expect(packedPaths.some((p) => p.startsWith("src/"))).toBe(false);
     expect(packedPaths.some((p) => p.startsWith("test/"))).toBe(false);
     expect(packedPaths).not.toContain(".mcp.json");
@@ -85,3 +87,24 @@ describe("npm packaging, release CI, and install docs (gh-25)", () => {
     expect(readme).toContain("npm version");
   });
 });
+
+it("runs the reviewed installer resource from an extracted npm package", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'uw-installed-'));
+  try {
+    const packed = JSON.parse(execFileSync('npm', ['pack', '--ignore-scripts', '--json', '--pack-destination', dir], { cwd: root, encoding: 'utf8' }))[0];
+    execFileSync('tar', ['-xzf', join(dir, packed.filename), '-C', dir]);
+    symlinkSync(join(root, 'node_modules'), join(dir, 'package', 'node_modules'), 'dir');
+    const script = join(dir, 'package', 'scripts', 'install-agents.sh');
+    expect(execFileSync('bash', [script, 'list'], { encoding: 'utf8' })).toContain('codex');
+    const result = execFileSync(process.execPath, ['--input-type=module', '-e', `
+      import { planTask } from ${JSON.stringify('file://' + join(dir, 'package', 'dist', 'node-executors.js'))};
+      const plan = planTask({id:'fixture',type:'install-harness',params:{harness:'codex'}},
+        {allowed_task_types:['install-harness'],workspace_ids:[]},
+        {workspaces:{},installers:{codex:{executable:'packaged-install-agents'}}});
+      console.log(JSON.stringify(plan));
+    `], { cwd: dir, encoding: 'utf8' });
+    const plan = JSON.parse(result);
+    expect(plan.executable).toBe('bash');
+    expect(plan.args).toEqual([script, 'install', '--agents', 'codex', '--yes', '--no-open']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+}, 15000);

@@ -2,7 +2,7 @@ import type { IStore } from "./istore.js";
 
 /** One sweep at startup, then every minute. Stop waits for in-flight work. */
 export function startLeaseSweeper(
-  store: Pick<IStore, "sweepExpiredClaims"> & Partial<Pick<IStore, "sweepIdleDispatches">>,
+  store: Pick<IStore, "sweepExpiredClaims"> & Partial<Pick<IStore, "sweepIdleDispatches" | "sweepExpiredNodeJobs">>,
   intervalMs = 60_000,
   onError: (error: unknown) => void = error => console.error("[underwright] lease sweep failed:", error),
 ) {
@@ -24,6 +24,11 @@ export function startLeaseSweeper(
         }
         try {
           await store.sweepIdleDispatches?.();
+        } catch (error) {
+          onError(error);
+        }
+        try {
+          await store.sweepExpiredNodeJobs?.();
         } catch (error) {
           onError(error);
         }

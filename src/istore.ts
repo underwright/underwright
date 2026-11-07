@@ -1,6 +1,8 @@
 // The control-plane store contract. Call sites always `await` results;
 // implementations may be sync (SQLite) or async (Postgres/Lakebase).
 
+import type { NodeEnrollmentInput, NodePolicy, NodePrincipal, NodeError, NodeEnrollment, NodeSpec } from "./node-protocol.js";
+
 type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
@@ -33,6 +35,15 @@ export interface AgentJobSpec {
 export interface SubmitJobArgs {
   task_id?: string; agent_id: string; type: string; command?: string;
   host?: string; target_agent_id?: string; agent?: AgentJobSpec;
+}
+
+export interface SubmitNodeTaskArgs {
+  target_node_id: string;
+  node_spec: NodeSpec;
+  task_id?: string;
+  agent_id?: string;
+  dedupe_key?: string;
+  retry_of?: string;
 }
 
 export interface DigestArgs {
@@ -73,6 +84,25 @@ export interface DigestResult {
 }
 
 export interface IStore {
+  createNodeEnrollment(a: NodeEnrollmentInput): Awaitable<NodeEnrollment | NodeError>;
+  listNodeEnrollments(): Awaitable<any[]>;
+  approveNodeEnrollment(id: string, code: string, policy: NodePolicy, actor: string): Awaitable<any>;
+  rejectNodeEnrollment(id: string, actor: string): Awaitable<any>;
+  exchangeNodeEnrollment(id: string, secret: string): Awaitable<any>;
+  listNodes(): Awaitable<any[]>;
+  revokeNode(id: string, actor: string): Awaitable<any>;
+  authenticateNode(token: string, sessionId?: string): Awaitable<NodePrincipal | NodeError>;
+  startNodeSession(token: string): Awaitable<any>;
+  submitNodeTask(a: SubmitNodeTaskArgs): Awaitable<any>;
+  pollNodeJob(token: string, sessionId: string, waitSeconds?: number, signal?: AbortSignal): Awaitable<any>;
+  renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
+  finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
+  sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;
+  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
+  putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
+
+  issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string): Awaitable<any>;
+  workerTool(token: string, name: string, args: Record<string, unknown>): Awaitable<any>;
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;
@@ -81,7 +111,7 @@ export interface IStore {
   listTasks(status?: TaskStatus): Awaitable<any[]>;
   claimTask(taskId: string, agentId: string, ttlSeconds?: number, scope?: object): Awaitable<any>;
   updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string): Awaitable<any>;
-  releaseTask(taskId: string, agentId: string): Awaitable<any>;
+  releaseTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   sweepExpiredClaims(): Awaitable<{ reclaimed: string[] }>;
   /** Reassign dispatcher "your next task" mail whose task is still unclaimed. */
@@ -108,7 +138,7 @@ export interface IStore {
     exit_code?: number; output?: string; ac_ids?: string[];
   }): Awaitable<any>;
   getEvidence(taskId: string): Awaitable<any[]>;
-  completeTask(taskId: string, agentId: string): Awaitable<any>;
+  completeTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;
   registerHelper(a: { agent_id: string; path: string; symbol?: string; kind: string; summary: string }): Awaitable<any>;
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
   submitJob(a: SubmitJobArgs): Awaitable<any>;

@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id           TEXT PRIMARY KEY,
   task_id      TEXT REFERENCES tasks(id),
   agent_id     TEXT NOT NULL,
-  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review','agent')),
+  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review','agent','node')),
   status       TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','done','failed')),
   command      TEXT NOT NULL,
@@ -38,8 +38,24 @@ CREATE TABLE IF NOT EXISTS jobs (
   result       TEXT NOT NULL DEFAULT '',
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   started_at   TEXT,
-  finished_at  TEXT
+  finished_at  TEXT,
+  target_node_id TEXT,
+  node_spec TEXT,
+  attempt_id TEXT,
+  session_id TEXT,
+  dedupe_key TEXT,
+  retry_of TEXT,
+  receipt_digest TEXT,
+  receipt_status TEXT,
+  outcome_reason TEXT,
+  result_metadata TEXT
 );
+`;
+
+export const JOBS_INDEXES = `
+CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
+  WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
 `;
 
 export const SCHEMA = `
@@ -178,14 +194,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(
 // Additive Postgres migration; keep the job shape beside the SQLite source.
 export const PG_JOBS_MIGRATION = `
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check;
-ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('test','build','deploy','review','agent'));
+ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('test','build','deploy','review','agent','node'));
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS host TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_agent_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS runner_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS agent_spec TEXT;
-UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_node_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS node_spec TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_of TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_digest TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_status TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS outcome_reason TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result_metadata TEXT;
+CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
+  WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
+UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL AND type <> 'node';
 `;
 
 // Widen artifacts.kind on databases created before the blocked escalation kind.
@@ -204,4 +233,34 @@ BEGIN
   END LOOP;
 END $$;
 ALTER TABLE artifacts ADD CONSTRAINT artifacts_kind_check CHECK (kind IN (${ARTIFACT_KIND_SQL}));
+`;
+
+/** Portable additive node enrollment schema. ISO timestamps sort consistently on both stores. */
+export const NODES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS nodes (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked','draining')),
+  policy_json TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT,
+  session_epoch TEXT, session_expires_at TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
+  capabilities_version INTEGER NOT NULL DEFAULT 0, capabilities_observed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS node_enrollments (
+  id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, device_secret_hash TEXT NOT NULL,
+  metadata_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','redeemed')),
+  expires_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT,
+  node_id TEXT REFERENCES nodes(id), redeemed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS node_enrollments_expiry ON node_enrollments(expires_at);
+CREATE TABLE IF NOT EXISTS node_tokens (
+  id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id), secret_hash TEXT NOT NULL UNIQUE,
+  scopes_json TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS node_tokens_node ON node_tokens(node_id);
+CREATE TABLE IF NOT EXISTS node_workers (
+  secret_hash TEXT PRIMARY KEY, node_id TEXT NOT NULL, token_id TEXT NOT NULL,
+  session_id TEXT NOT NULL, task_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+  job_id TEXT NOT NULL UNIQUE, attempt_id TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_rate_limits (
+  bucket TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+);
 `;

@@ -1,0 +1,82 @@
+import { afterEach, expect, it, vi } from "vitest";
+import { SqliteStore } from "../src/store.js";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const cleanup: (() => void)[] = [];
+afterEach(() => { vi.useRealTimers(); cleanup.splice(0).reverse().forEach(f => f()); });
+const hash = (s: string) => createHash('sha256').update(s).digest('hex');
+function fixture() {
+  const dir = mkdtempSync(join(tmpdir(), 'uw-node-'));
+  cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, 'store.db');
+  const store: any = new SqliteStore(path);
+  cleanup.push(() => store.close());
+  return { store, path };
+}
+async function enrollment(store: any) {
+  const secret = randomBytes(32).toString('hex');
+  const e = await store.createNodeEnrollment({ version: 1, name: 'test node', device_secret_hash: hash(secret), platform: 'linux', arch: 'x64', insecure_transport: true });
+  return { e, secret };
+}
+it('approves once, exchanges once across connections, stores only hashes and revokes independently', async () => {
+  const { store, path } = fixture();
+  const second: any = new SqliteStore(path); cleanup.push(() => second.close());
+  const { e, secret } = await enrollment(store);
+  expect(await store.exchangeNodeEnrollment(e.id, secret)).toMatchObject({ status: 'pending' });
+  expect((await store.approveNodeEnrollment(e.id, 'WRONG', { allowed_task_types: ['run-script'], workspace_ids: [] }, 'admin')).error).toBeTruthy();
+  const approved = await store.approveNodeEnrollment(e.id, e.code, { allowed_task_types: ['run-script'], workspace_ids: [] }, 'admin');
+  expect(approved.node_id).toBeTruthy();
+  expect((await second.approveNodeEnrollment(e.id, e.code, { allowed_task_types: [], workspace_ids: [] }, 'admin')).error).toBeTruthy();
+  expect((await second.exchangeNodeEnrollment(e.id, randomBytes(32).toString('hex'))).error).toBeTruthy();
+  const results = await Promise.all([store.exchangeNodeEnrollment(e.id, secret), second.exchangeNodeEnrollment(e.id, secret)]);
+  const token = results.find(r => r.token)?.token;
+  expect(token).toMatch(/^uw_node_/);
+  expect(results.filter(r => r.error)).toHaveLength(1);
+  expect((await store.authenticateNode(token)).node_id).toBe(approved.node_id);
+  const session = await store.startNodeSession(token);
+  expect(session.session_id).toBeTruthy();
+  const newer = await second.startNodeSession(token);
+  expect(newer.session_id).not.toBe(session.session_id);
+  expect((await store.authenticateNode(token, session.session_id)).error).toBeTruthy();
+  expect((await store.authenticateNode(token, newer.session_id)).node_id).toBe(approved.node_id);
+  const other = await enrollment(store);
+  await store.approveNodeEnrollment(other.e.id, other.e.code, { allowed_task_types: [], workspace_ids: [] }, 'admin');
+  const otherToken = (await store.exchangeNodeEnrollment(other.e.id, other.secret)).token;
+  await store.revokeNode(approved.node_id, 'admin');
+  expect((await store.startNodeSession(token)).error).toBeTruthy();
+  expect((await store.startNodeSession(otherToken)).session_id).toBeTruthy();
+  const log = JSON.stringify(await store.auditLog(1000));
+  for (const sensitive of [token, secret, e.code, hash(secret)]) expect(log).not.toContain(sensitive);
+  expect(JSON.stringify(await store.listNodeEnrollments())).not.toContain(hash(secret));
+});
+it('rejects expired/rejected enrollment and never recovers lost exchange credentials', async () => {
+  const { store } = fixture();
+  vi.useFakeTimers();
+  const { e, secret } = await enrollment(store);
+  vi.setSystemTime(Date.now() + 601000);
+  expect((await store.approveNodeEnrollment(e.id, e.code, { allowed_task_types: [], workspace_ids: [] }, 'admin')).error).toBeTruthy();
+  expect((await store.exchangeNodeEnrollment(e.id, secret)).error).toBeTruthy();
+  const next = await enrollment(store);
+  await store.rejectNodeEnrollment(next.e.id, 'admin');
+  expect((await store.exchangeNodeEnrollment(next.e.id, next.secret)).error).toBeTruthy();
+  const lost = await enrollment(store);
+  const node = await store.approveNodeEnrollment(lost.e.id, lost.e.code, { allowed_task_types: [], workspace_ids: [] }, 'admin');
+  await store.exchangeNodeEnrollment(lost.e.id, lost.secret);
+  expect((await store.exchangeNodeEnrollment(lost.e.id, lost.secret)).error).toBeTruthy();
+  expect(await store.revokeNode(node.node_id, 'admin')).toMatchObject({ state: 'revoked' });
+});
+it('enforces durable creation limits across connections and rejects expired node credentials', async () => {
+  const { store, path } = fixture();
+  const second: any = new SqliteStore(path); cleanup.push(() => second.close());
+  vi.useFakeTimers();
+  const { e, secret } = await enrollment(store);
+  await store.approveNodeEnrollment(e.id, e.code, { allowed_task_types: [], workspace_ids: [] }, 'admin');
+  const issued = await store.exchangeNodeEnrollment(e.id, secret);
+  for (let i = 0; i < 29; i++) expect((await enrollment(i % 2 ? store : second)).e.error).toBeUndefined();
+  expect((await enrollment(second)).e.status_code).toBe(429);
+  vi.setSystemTime(Date.now() + 31 * 86400000);
+  expect((await store.authenticateNode(issued.token)).error).toBeTruthy();
+  expect((await enrollment(second)).e.error).toBeUndefined();
+});
