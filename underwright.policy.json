@@ -21,6 +21,18 @@
     "idle_minutes": 15
   },
   "harness_matrix": {
-    "*": { "backend": "raw" }
+    "agents": {
+      "codex@laptop-2":   { "harness": "codex", "backend": "omnigent" },
+      "claude@minipc":    { "harness": "claude-sdk", "backend": "omnigent" },
+      "grok@alandesktop": { "harness": "grok" },
+      "agy@alandesktop":  { "harness": "agy" },
+      "kimi@alandesktop": { "harness": "kimi" },
+      "cmdc@winbox":      { "harness": "cmdc" }
+    },
+    "coverage": {
+      "codex": true,
+      "claude-sdk": true,
+      "cmdc": false
+    }
   }
 }
