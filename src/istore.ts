@@ -17,10 +17,18 @@ export interface CreateTaskArgs {
   template?: string;   // task template id — expands AC scaffold, type, DoR checklist
 }
 
+export type AgentBackend = "raw" | "omnigent";
+
 export interface AgentJobSpec {
   executable: string;
   args: string[];
   prompt: string; // {{task_id}}, {{agent_id}}, {{host}}, {{job_id}}
+  /** Harness name for the omnigent backend; defaults to the executable basename. */
+  harness?: string;
+  /** "omnigent" launches through `omni run`; unset (or "raw") runs the CLI directly. */
+  backend?: AgentBackend;
+  /** Remote omnigent server URL, passed as `omni run --server`. */
+  server?: string;
 }
 export interface SubmitJobArgs {
   task_id?: string; agent_id: string; type: string; command?: string;

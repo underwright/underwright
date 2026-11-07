@@ -35,6 +35,28 @@ export interface DispatcherPolicy {
 
 export type HumanNotifyEventKind = "task_completed" | "claim_reclaimed";
 
+/** Preferred launch configuration for agent jobs, from the policy harness_matrix. */
+export interface HarnessBackend {
+  harness?: string;                 // e.g. "codex", "claude-sdk"
+  backend?: "raw" | "omnigent";
+  server?: string;                  // remote omnigent server URL
+}
+
+/** Full harness matrix: per-agent launch preferences plus the omnigent coverage table. */
+export interface HarnessMatrix {
+  /** agent_id (or "*") -> preferred harness+backend. */
+  agents: Record<string, HarnessBackend>;
+  /** harness -> runnable through omnigent today; missing or false means raw-only. */
+  coverage: Record<string, boolean>;
+}
+
+/** Policy harness_matrix block: agent_id (or "*") entries plus a "coverage" table. */
+export type HarnessMatrixRule = {
+  coverage?: Record<string, boolean | { omni?: boolean }>;
+} & {
+  [agentId: string]: HarnessBackend | Record<string, boolean | { omni?: boolean }> | undefined;
+};
+
 export interface HumanNotifyRule {
   enabled?: boolean;
   webhook_url?: string;
@@ -48,6 +70,9 @@ export interface HumanNotifyPolicy {
   events: HumanNotifyEventKind[];
 }
 
+/** Per-agent launch preferences plus the omnigent coverage table. Agent entries
+ *  map agent_id (or "*") to a preferred harness+backend; the "coverage" table
+ *  records which harnesses omnigent can drive today. */
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
@@ -59,6 +84,9 @@ export interface Policy {
   notifications?: string | HumanNotifyRule;
   notify?: string | HumanNotifyRule;
   webhook_url?: string;
+  /** Per-agent preferred harness+backend for agent jobs, plus the omnigent
+   *  coverage table. Exact agent_id wins over "*". */
+  harness_matrix?: HarnessMatrixRule;
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -101,6 +129,41 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
     max_tasks_per_agent: Number.isFinite(max) && max > 0 ? Math.floor(max) : 0,
     idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
   };
+}
+
+/** Parse the policy harness_matrix into agents + coverage. Agent preferences
+ *  may be namespaced under "agents" or listed flat by agent_id (or "*");
+ *  the reserved "coverage" key holds the per-harness omnigent support table
+ *  (true/false or { "omni": bool }). Malformed blocks yield empty maps. */
+export function getHarnessMatrix(policy: Policy = loadPolicy()): HarnessMatrix {
+  const agents: Record<string, HarnessBackend> = {};
+  const coverage: Record<string, boolean> = {};
+  const raw = policy.harness_matrix;
+  if (raw && typeof raw === "object") {
+    for (const source of [raw.agents, raw]) {
+      if (!source || typeof source !== "object") continue;
+      for (const [key, value] of Object.entries(source)) {
+        if (key === "agents" || key === "coverage") continue;
+        if (value && typeof value === "object" && !("omni" in value) && !(key in agents)) {
+          agents[key] = value as HarnessBackend;
+        }
+      }
+    }
+    const table = raw.coverage;
+    if (table && typeof table === "object") {
+      for (const [harness, value] of Object.entries(table)) {
+        coverage[harness] = typeof value === "boolean" ? value : value?.omni === true;
+      }
+    }
+  }
+  return { agents, coverage };
+}
+
+/** Preferred harness+backend for an agent job. Exact agent_id wins over "*";
+ *  absent or malformed matrix yields {} (the runner then uses raw defaults). */
+export function getHarnessBackend(agentId: string, policy: Policy = loadPolicy()): HarnessBackend {
+  const { agents } = getHarnessMatrix(policy);
+  return agents[agentId] ?? agents["*"] ?? {};
 }
 
 const DEFAULT_NOTIFY_EVENTS: HumanNotifyEventKind[] = ["task_completed", "claim_reclaimed"];

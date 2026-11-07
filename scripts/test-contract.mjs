@@ -228,6 +228,13 @@ async function matrix(token) {
         prompt: 'Harness {{agent_id}} on {{host}} literal $(exit 99)' } });
     assert.match(await runnerOnce(), /Harness runner-A on host-A literal \$\(exit 99\)/);
     assert.equal((await call('job_status', { job_id: agentJob.id })).status, 'done');
+    // Matrix-tagged agent job: harness cmdc is raw-only in the coverage table, so the
+    // runner must fall back to the raw CLI even when the spec requests omnigent.
+    const matrixJob = await call('submit_job', { agent_id: agent, type: 'agent', host: 'host-A',
+      agent: { executable: process.execPath, args: ['-e', 'console.log(process.argv[1])'],
+        prompt: 'Matrix {{agent_id}} on {{host}} literal $(exit 99)', backend: 'omnigent', harness: 'cmdc' } });
+    assert.match(await runnerOnce(), /Matrix runner-A on host-A literal \$\(exit 99\)/);
+    assert.equal((await call('job_status', { job_id: matrixJob.id })).status, 'done');
     await call('submit_job', { agent_id: agent, type: 'build', command: 'echo queued' });
     assert.match((await call('complete_task', { task_id, agent_id: agent })).error, /http-ac/);
     assert.match((await call('report_evidence', { task_id, agent_id: agent, kind: 'contract_test',

@@ -372,6 +372,45 @@ shell commands unless the process is also started with `--yolo` (permission
 bypass for that run). A headless Command Code worker that must edit the
 tree uses both flags: `cmdc -p --yolo`.
 
+## Omnigent backend (uw-runner)
+
+Agent jobs can launch through Omnigent instead of a raw harness CLI. The
+runner then gets session recording, portability (`--server`), sandbox/policy,
+and a transcript UI for free. Three optional fields on the `agent` job spec
+control it:
+
+| Field | Meaning |
+|---|---|
+| `backend` | `"omnigent"` routes the launch through `omni run`; `"raw"` (or absent) spawns the CLI directly |
+| `harness` | Harness name for the omnigent backend; defaults to the policy matrix, then the executable basename |
+| `server` | Remote omnigent server, passed as `omni run --server <server>` (use `"remote"` for the managed control plane) |
+
+The policy `harness_matrix` maps `agent_id` (or `"*"`) to a preferred
+`harness`/`backend`/`server`; the per-job spec fields win over the policy.
+When the resolved backend is omnigent and the `omni` CLI is on the runner's
+PATH, the runner templates:
+
+```text
+omni run --harness H [--server S] -p PROMPT
+```
+
+Fallback is automatic: if `omni` is missing, or the harness is not in the
+coverage table, the raw CLI (`executable` + `args` + prompt) runs instead.
+
+Coverage today (mirrored in `underwright.policy.json` → `harness_matrix.coverage`,
+which may override these defaults):
+
+| Harness | Via omnigent | Via raw CLI |
+|---|---|---|
+| codex | yes | yes |
+| claude-sdk | yes | yes |
+| cmdc | pending the new support landing | yes (`cmdc -p --yolo`) |
+| grok, agy, kimi, cline, opencode, cursor | not yet | yes |
+
+When omnigent drives the job, the runner captures the session it prints
+(`omnigent session: <url-or-id>`, or an omnigent transcript URL) into the
+job result, so `job_status` links the task to the session transcript.
+
 ## Don't run a local stdio database on a remote machine
 
 This is the failure that looks like a working control plane.
