@@ -205,3 +205,28 @@ BEGIN
 END $$;
 ALTER TABLE artifacts ADD CONSTRAINT artifacts_kind_check CHECK (kind IN (${ARTIFACT_KIND_SQL}));
 `;
+
+/** Portable additive node enrollment schema. ISO timestamps sort consistently on both stores. */
+export const NODES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS nodes (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked','draining')),
+  policy_json TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT,
+  session_epoch TEXT, session_expires_at TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
+  capabilities_version INTEGER NOT NULL DEFAULT 0, capabilities_observed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS node_enrollments (
+  id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, device_secret_hash TEXT NOT NULL,
+  metadata_json TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','redeemed')),
+  expires_at TEXT NOT NULL, approved_by TEXT, approved_at TEXT,
+  node_id TEXT REFERENCES nodes(id), redeemed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS node_enrollments_expiry ON node_enrollments(expires_at);
+CREATE TABLE IF NOT EXISTS node_tokens (
+  id TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id), secret_hash TEXT NOT NULL UNIQUE,
+  scopes_json TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT
+);
+CREATE INDEX IF NOT EXISTS node_tokens_node ON node_tokens(node_id);
+CREATE TABLE IF NOT EXISTS node_rate_limits (
+  bucket TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+);
+`;

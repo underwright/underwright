@@ -1,3 +1,5 @@
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
 import { randomUUID } from "node:crypto";
@@ -118,6 +120,147 @@ const EVIDENCE_KINDS = ["test_run","ci_check","review","coverage","deploy","cont
 export class PgStore implements IStore {
   private sql: postgres.Sql;
 
+  private async nodeTransaction(work: (s: PgStore) => Promise<any>): Promise<any> {
+    return this.sql.begin(async sql => {
+      // Serialize enrollment quotas and auth transitions across control-plane replicas.
+      await sql.unsafe('LOCK TABLE node_enrollments, nodes, node_tokens, node_rate_limits IN SHARE ROW EXCLUSIVE MODE');
+      return work(new PgStore(sql as unknown as postgres.Sql));
+    });
+  }
+
+  private async nodeQuery(query: string, params: any[] = []): Promise<any[]> {
+    let i = 0;
+    return this.sql.unsafe(query.replace(/\?/g, () => `$${++i}`), params) as any;
+  }
+
+  private async nodeAudit(id: string, action: string, actor = 'node-protocol') {
+    await this.log('node', id, action, actor);
+  }
+
+  private async nodeRate(bucket: string, limit: number): Promise<boolean> {
+    const now = new Date().toISOString();
+    const cutoff = new Date(Date.now() - 60000).toISOString();
+    await this.nodeQuery('DELETE FROM node_rate_limits WHERE window_start < ?', [cutoff]);
+    const rows = await this.nodeQuery(`INSERT INTO node_rate_limits(bucket,window_start,attempts) VALUES (?,?,1)
+      ON CONFLICT(bucket) DO UPDATE SET attempts=node_rate_limits.attempts+1 RETURNING attempts`, [bucket, now]);
+    return rows[0].attempts <= limit;
+  }
+
+  async createNodeEnrollment(input: NodeEnrollmentInput): Promise<any> {
+    const parsed = nodeEnrollmentSchema.safeParse(input);
+    if (!parsed.success) return nodeError('invalid enrollment', 400);
+    return this.nodeTransaction(async s => {
+      const now = new Date().toISOString();
+      await s.nodeQuery('DELETE FROM node_enrollments WHERE expires_at < ?', [new Date(Date.now() - 86400000).toISOString()]);
+      await s.nodeQuery('DELETE FROM node_tokens WHERE expires_at < ?', [new Date(Date.now() - 86400000).toISOString()]);
+      const count = await s.nodeQuery('SELECT COUNT(*) AS n FROM node_enrollments WHERE expires_at > ?', [now]);
+      if (!await s.nodeRate('enrollment-create', 30) || Number(count[0].n) >= 100) return nodeError('enrollment limit reached', 429);
+      const id = 'enroll-' + randomUUID();
+      const code = nodeSecret().slice(0, 16).toUpperCase();
+      const expires = nodeExpiry(600);
+      const { device_secret_hash, ...metadata } = parsed.data;
+      await s.nodeQuery(`INSERT INTO node_enrollments(id,code_hash,device_secret_hash,metadata_json,status,expires_at)
+        VALUES (?,?,?,?,'pending',?)`, [id, nodeHash(code), device_secret_hash, JSON.stringify(metadata), expires]);
+      await s.nodeAudit(id, 'enrollment_created');
+      return { id, code, expires_at: expires, retry_after: 3 };
+    });
+  }
+
+  async listNodeEnrollments(): Promise<any[]> {
+    return this.nodeQuery(`SELECT id,metadata_json,status,expires_at,approved_by,approved_at,node_id,redeemed_at
+      FROM node_enrollments ORDER BY expires_at DESC LIMIT 100`);
+  }
+
+  async approveNodeEnrollment(id: string, code: string, policy: NodePolicy, actor: string): Promise<any> {
+    const parsed = nodePolicySchema.safeParse(policy);
+    if (!parsed.success) return nodeError('invalid node policy', 400);
+    return this.nodeTransaction(async s => {
+      if (!await s.nodeRate('enrollment-approve', 60)) return nodeError('approval limit reached', 429);
+      const e = (await s.nodeQuery('SELECT * FROM node_enrollments WHERE id=?', [id]))[0];
+      if (!e || e.status !== 'pending' || e.expires_at <= new Date().toISOString() || nodeHash(code) !== e.code_hash) {
+        await s.nodeAudit('enrollment', 'approval_denied', actor);
+        return nodeError('enrollment unavailable', 409);
+      }
+      const node_id = 'node-' + randomUUID();
+      const now = new Date().toISOString();
+      await s.nodeQuery(`INSERT INTO nodes(id,name,state,policy_json,created_at) VALUES (?,?,'approved',?,?)`,
+        [node_id, JSON.parse(e.metadata_json).name, JSON.stringify(parsed.data), now]);
+      await s.nodeQuery(`UPDATE node_enrollments SET status='approved',approved_by=?,approved_at=?,node_id=? WHERE id=?`, [actor, now, node_id, id]);
+      await s.nodeAudit(node_id, 'enrollment_approved', actor);
+      return { node_id, status: 'approved' };
+    });
+  }
+
+  async rejectNodeEnrollment(id: string, actor: string): Promise<any> {
+    return this.nodeTransaction(async s => {
+      const rows = await s.nodeQuery(`UPDATE node_enrollments SET status='rejected' WHERE id=? AND status='pending' RETURNING id`, [id]);
+      await s.nodeAudit(rows.length ? id : 'enrollment', rows.length ? 'enrollment_rejected' : 'rejection_denied', actor);
+      return rows.length ? { id, status: 'rejected' } : nodeError('enrollment unavailable', 409);
+    });
+  }
+
+  async exchangeNodeEnrollment(id: string, secret: string): Promise<any> {
+    return this.nodeTransaction(async s => {
+      if (!await s.nodeRate('enrollment-exchange', 240)) return nodeError('exchange limit reached', 429);
+      const e = (await s.nodeQuery('SELECT * FROM node_enrollments WHERE id=?', [id]))[0];
+      if (!e || e.expires_at <= new Date().toISOString() || nodeHash(secret) !== e.device_secret_hash || !['pending','approved'].includes(e.status)) {
+        await s.nodeAudit('enrollment', 'exchange_denied');
+        return nodeError('enrollment unavailable; revoke and reenroll if response was lost', 409);
+      }
+      if (e.status === 'pending') return { status: 'pending', retry_after: 3 };
+      const node = (await s.nodeQuery("SELECT id FROM nodes WHERE id=? AND state='approved'", [e.node_id]))[0];
+      if (!node) return nodeError();
+      const token = 'uw_node_' + nodeSecret();
+      const expires_at = nodeExpiry(30 * 86400);
+      const token_id = 'nt-' + randomUUID();
+      await s.nodeQuery('INSERT INTO node_tokens(id,node_id,secret_hash,scopes_json,expires_at) VALUES (?,?,?,?,?)',
+        [token_id, e.node_id, nodeHash(token), JSON.stringify(NODE_SCOPES), expires_at]);
+      await s.nodeQuery("UPDATE node_enrollments SET status='redeemed',redeemed_at=? WHERE id=?", [new Date().toISOString(), id]);
+      await s.nodeAudit(e.node_id, 'credential_issued');
+      return { node_id: e.node_id, token, token_id, expires_at };
+    });
+  }
+
+  async listNodes(): Promise<any[]> {
+    return this.nodeQuery('SELECT id,name,state,policy_json,created_at,last_seen_at,session_expires_at FROM nodes ORDER BY created_at DESC LIMIT 1000');
+  }
+
+  async revokeNode(id: string, actor: string): Promise<any> {
+    return this.nodeTransaction(async s => {
+      const rows = await s.nodeQuery("UPDATE nodes SET state='revoked',session_epoch=NULL,session_expires_at=NULL WHERE id=? RETURNING id", [id]);
+      if (!rows.length) return nodeError('node unavailable', 404);
+      await s.nodeQuery('UPDATE node_tokens SET revoked_at=? WHERE node_id=? AND revoked_at IS NULL', [new Date().toISOString(), id]);
+      await s.nodeAudit(id, 'revoked', actor);
+      return { node_id: id, state: 'revoked' };
+    });
+  }
+
+  async authenticateNode(token: string, sessionId?: string): Promise<NodePrincipal | NodeError> {
+    if (!/^uw_node_[a-f0-9]{64}$/.test(token)) return nodeError();
+    const rows = await this.nodeQuery(`SELECT t.id AS token_id,t.node_id,t.expires_at,n.session_epoch,n.session_expires_at,n.policy_json
+      FROM node_tokens t JOIN nodes n ON n.id=t.node_id
+      WHERE t.secret_hash=? AND t.revoked_at IS NULL AND t.expires_at>? AND n.state IN ('approved','draining')`, [nodeHash(token), new Date().toISOString()]);
+    const r = rows[0];
+    if (!r || (sessionId !== undefined && (r.session_epoch !== sessionId || r.session_expires_at <= new Date().toISOString()))) {
+      await this.nodeAudit('credential', 'authorization_denied');
+      return nodeError();
+    }
+    return { node_id: r.node_id, token_id: r.token_id, expires_at: r.expires_at, session_id: r.session_epoch, policy: JSON.parse(r.policy_json) };
+  }
+
+  async startNodeSession(token: string): Promise<any> {
+    return this.nodeTransaction(async s => {
+      const principal = await s.authenticateNode(token);
+      if ('error' in principal) return principal;
+      const session_id = randomUUID();
+      const expires_at = nodeExpiry(3600);
+      await s.nodeQuery('UPDATE nodes SET session_epoch=?,session_expires_at=? WHERE id=?', [session_id, expires_at, principal.node_id]);
+      await s.nodeAudit(principal.node_id, 'session_started');
+      return { node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: 60 };
+    });
+  }
+
+
   private constructor(sql: postgres.Sql) {
     this.sql = sql;
   }
@@ -125,6 +268,7 @@ export class PgStore implements IStore {
   static async connect(url: string) {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
+    await sql.unsafe(NODES_SCHEMA);
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
+import { enrollNode, nodeStatus } from "./node-client.js";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
@@ -60,6 +61,16 @@ switch (cmd) {
     } else {
       await serve(dbPath);
     }
+    break;
+  }
+
+  case "node": {
+    try {
+      if (args[0] === "enroll") {
+        await enrollNode(flag("url") ?? "", flag("name") ?? hostname(), args.includes("--allow-insecure"));
+      } else if (args[0] === "status") console.log(JSON.stringify(nodeStatus(), null, 2));
+      else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status");
+    } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;
   }
 
@@ -214,6 +225,8 @@ Usage:
   underwright serve              MCP server over stdio (local agent config).
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
+  underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
+  underwright node status        Show local credential identity/expiry without secrets.
   underwright board              Print the task board.
   underwright digest             Summarize board delta since --since TS [--to AGENT] [--text].
   underwright create             Create a task, optionally from a template (--template feature).

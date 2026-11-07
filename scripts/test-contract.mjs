@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -112,6 +113,37 @@ async function matrix(token) {
       assert.equal(result.content[0].type, 'text');
       exercised.add(name);
       return JSON.parse(result.content[0].text);
+    }
+    // Node admin tools fail closed without configured administrator authentication.
+    const nodePost = (path, body, bearer) => request(path, { method: 'POST', headers: {
+      'content-type': 'application/json', ...(bearer ? { authorization: `Bearer ${bearer}` } : {}) }, body: JSON.stringify(body) });
+    if (!token) {
+      assert.equal((await nodePost('/nodes/v1/enrollments', {})).status, 503);
+      for (const [name, args] of [
+        ['list_nodes', {}], ['list_node_enrollments', {}],
+        ['approve_node_enrollment', { enrollment_id: 'fake', code: 'fake', policy: { allowed_task_types: [], workspace_ids: [] } }],
+        ['reject_node_enrollment', { enrollment_id: 'fake' }], ['revoke_node', { node_id: 'fake' }],
+      ]) assert.match((await call(name, args)).error, /Configure UNDERWRIGHT_TOKEN/);
+    } else {
+      const proof = randomBytes(32).toString('hex');
+      const enrollment = async () => (await nodePost('/nodes/v1/enrollments', { version: 1, name: 'contract-device', platform: 'test', arch: 'test',
+        device_secret_hash: createHash('sha256').update(proof).digest('hex') })).json();
+      const e = await enrollment();
+      assert((await call('list_node_enrollments')).some(row => row.id === e.id));
+      const approved = await call('approve_node_enrollment', { enrollment_id: e.id, code: e.code, policy: { allowed_task_types: [], workspace_ids: [] } });
+      const issued = await (await nodePost(`/nodes/v1/enrollments/${e.id}/exchange`, { device_secret: proof })).json();
+      assert.equal(issued.node_id, approved.node_id);
+      assert((await call('list_nodes')).some(row => row.id === issued.node_id));
+      assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 200);
+      assert.equal((await nodePost(`/nodes/v1/enrollments/${e.id}/exchange`, { device_secret: proof })).status, 409);
+      for (const path of ['/mcp', '/board', `/board?token=${issued.token}`]) {
+        assert.equal((await request(path, { headers: { authorization: `Bearer ${issued.token}` } })).status, 401);
+      }
+      await call('revoke_node', { node_id: issued.node_id });
+      assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 401);
+      const rejected = await enrollment();
+      assert.equal((await call('reject_node_enrollment', { enrollment_id: rejected.id })).status, 'rejected');
+      assert.equal((await nodePost(`/nodes/v1/enrollments/${rejected.id}/exchange`, { device_secret: proof })).status, 409);
     }
     const invalid = await first.callTool({ name: 'create_task', arguments: {} });
     assert.equal(invalid.isError, true);
