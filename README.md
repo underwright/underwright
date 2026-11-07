@@ -228,6 +228,14 @@ stops the active process group and reports failure. Execution times out after
 ten minutes. Stdout and stderr stream locally and are uploaded in heartbeat
 snapshots; the final 64,000 characters are retained by `finish_job`.
 
+Agent jobs (`type: "agent"`) may set `backend: "omnigent"` to launch through
+Omnigent (`omni run --harness H -p PROMPT`, plus `--server` for a remote
+control plane) instead of the raw harness CLI; the runner falls back to the
+raw CLI when `omni` or the harness is unavailable. Preferences are pinned in
+`underwright.policy.json` under `harness_matrix`. See
+[docs/multi-harness.md](docs/multi-harness.md#omnigent-backend-uw-runner) for
+the coverage table and the session-link captured into job results.
+
 `submit_job` accepts optional `host` and `target_agent_id` affinity; both must
 match when supplied. `agent_id` remains the submitter identity. Unpinned jobs
 can run on any idle runner. `next_job` atomically claims a 60-second lease

@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore } from "../src/store.js";
-import { getHarnessBackend, type Policy } from "../src/policy.js";
+import { getHarnessBackend, getHarnessMatrix, type Policy } from "../src/policy.js";
 import {
   agentInvocation,
   executeLeasedJob,
@@ -253,6 +253,45 @@ describe("omnigent backend", () => {
     const specWins = agentInvocation(jobWith({ ...spec, backend: "raw" }), "codex@A", "A", { omniAvailable: true, policy: matrix });
     expect(specWins.executable).toBe("codex");
     expect(specWins.backend).toBe("raw");
+  });
+
+  it("infers omnigent from the coverage table when the matrix pins only the harness", () => {
+    const nested: Policy = {
+      harness_matrix: {
+        agents: { "codex@A": { harness: "codex" }, "kimi@A": { harness: "kimi" } },
+        coverage: { codex: true, "claude-sdk": true, cmdc: false },
+      },
+    } as Policy;
+    const covered = agentInvocation(jobWith(spec), "codex@A", "A", { omniAvailable: true, policy: nested });
+    expect(covered.executable).toBe("omni");
+    expect(covered.args).toEqual(["run", "--harness", "codex", "-p", "do the thing"]);
+    const uncovered = agentInvocation(jobWith(spec), "kimi@A", "A", { omniAvailable: true, policy: nested });
+    expect(uncovered.executable).toBe("codex");
+    expect(uncovered.backend).toBe("raw");
+  });
+
+  it("lets policy coverage override the built-in support table", () => {
+    const flipped: Policy = { harness_matrix: { coverage: { cmdc: true, codex: false } } } as Policy;
+    const cmdc = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "cmdc" }), "cmdc@A", "A", { omniAvailable: true, policy: flipped });
+    expect(cmdc.executable).toBe("omni");
+    expect(cmdc.args).toEqual(["run", "--harness", "cmdc", "-p", "do the thing"]);
+    const codex = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: true, policy: flipped });
+    expect(codex.executable).toBe("codex");
+    expect(codex.backend).toBe("raw");
+  });
+
+  it("ships a policy matrix covering codex/claude-sdk on omni and cmdc pending", () => {
+    const shipped = JSON.parse(readFileSync(new URL("../underwright.policy.json", import.meta.url), "utf8"));
+    const parsed = getHarnessMatrix(shipped);
+    expect(parsed.coverage).toMatchObject({ codex: true, "claude-sdk": true, cmdc: false });
+    expect(parsed.agents["codex@laptop-2"]).toMatchObject({ harness: "codex", backend: "omnigent" });
+    expect(parsed.agents["cmdc@winbox"]).toMatchObject({ harness: "cmdc" });
+    expect(getHarnessBackend("grok@alandesktop", shipped).harness).toBe("grok");
+    const routed = agentInvocation(jobWith(spec), "codex@laptop-2", "laptop-2", { omniAvailable: true, policy: shipped });
+    expect(routed.executable).toBe("omni");
+    const pending = agentInvocation(jobWith({ executable: "cmdc", args: ["-p", "--yolo"], prompt: "x" }), "cmdc@winbox", "winbox", { omniAvailable: true, policy: shipped });
+    expect(pending.executable).toBe("cmdc");
+    expect(pending.backend).toBe("raw");
   });
 
   it("extracts the last omnigent session marker, or a matching transcript URL", () => {

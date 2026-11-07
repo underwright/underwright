@@ -131,18 +131,23 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
   };
 }
 
-/** Parse the policy harness_matrix into agents + coverage. Entries whose value
- *  is an object with harness/backend/server keys are agent preferences; the
- *  reserved "coverage" key holds the per-harness omnigent support table
+/** Parse the policy harness_matrix into agents + coverage. Agent preferences
+ *  may be namespaced under "agents" or listed flat by agent_id (or "*");
+ *  the reserved "coverage" key holds the per-harness omnigent support table
  *  (true/false or { "omni": bool }). Malformed blocks yield empty maps. */
 export function getHarnessMatrix(policy: Policy = loadPolicy()): HarnessMatrix {
   const agents: Record<string, HarnessBackend> = {};
   const coverage: Record<string, boolean> = {};
   const raw = policy.harness_matrix;
   if (raw && typeof raw === "object") {
-    for (const [key, value] of Object.entries(raw)) {
-      if (key === "coverage") continue;
-      if (value && typeof value === "object" && !("omni" in value)) agents[key] = value as HarnessBackend;
+    for (const source of [raw.agents, raw]) {
+      if (!source || typeof source !== "object") continue;
+      for (const [key, value] of Object.entries(source)) {
+        if (key === "agents" || key === "coverage") continue;
+        if (value && typeof value === "object" && !("omni" in value) && !(key in agents)) {
+          agents[key] = value as HarnessBackend;
+        }
+      }
     }
     const table = raw.coverage;
     if (table && typeof table === "object") {

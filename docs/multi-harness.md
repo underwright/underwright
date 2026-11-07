@@ -372,58 +372,44 @@ shell commands unless the process is also started with `--yolo` (permission
 bypass for that run). A headless Command Code worker that must edit the
 tree uses both flags: `cmdc -p --yolo`.
 
-## uw-runner omnigent backend
+## Omnigent backend (uw-runner)
 
-Agent jobs can launch through omnigent instead of a
-raw harness CLI. The runner then templates
-`omni run --harness H [--server URL] -p PROMPT` and gets session recording,
-sandboxing, and the transcript UI for free. Set `backend: "omnigent"` on the
-job's `agent` spec (optionally with `harness` and `server`); the runner falls
-back to the raw CLI whenever `omni` is not on PATH or the harness is not in
-the support table below.
+Agent jobs can launch through Omnigent instead of a raw harness CLI. The
+runner then gets session recording, portability (`--server`), sandbox/policy,
+and a transcript UI for free. Three optional fields on the `agent` job spec
+control it:
 
-```json
-"agent": {
-  "executable": "codex",
-  "args": ["exec"],
-  "prompt": "You are {{agent_id}} on {{host}}. ... Job: {{job_id}}.",
-  "backend": "omnigent",
-  "harness": "codex",
-  "server": "https://omni.internal"
-}
+| Field | Meaning |
+|---|---|
+| `backend` | `"omnigent"` routes the launch through `omni run`; `"raw"` (or absent) spawns the CLI directly |
+| `harness` | Harness name for the omnigent backend; defaults to the policy matrix, then the executable basename |
+| `server` | Remote omnigent server, passed as `omni run --server <server>` (use `"remote"` for the managed control plane) |
+
+The policy `harness_matrix` maps `agent_id` (or `"*"`) to a preferred
+`harness`/`backend`/`server`; the per-job spec fields win over the policy.
+When the resolved backend is omnigent and the `omni` CLI is on the runner's
+PATH, the runner templates:
+
+```text
+omni run --harness H [--server S] -p PROMPT
 ```
 
-- `harness` defaults to the executable basename (`/usr/local/bin/codex` → `codex`).
-- `server` is optional; it selects a remote omnigent session server (`--server`).
-- The runner probes `omni --version` per job; a missing binary or an
-  unsupported harness runs the raw executable+args exactly as before.
-- On completion the runner normalizes whatever the CLI printed into an
-  `omnigent session: <url-or-id>` line at the end of the job result, so the
-  board can link a task to its omnigent transcript.
+Fallback is automatic: if `omni` is missing, or the harness is not in the
+coverage table, the raw CLI (`executable` + `args` + prompt) runs instead.
 
-The policy file steers which backend each agent uses. `harness_matrix` maps an
-`agent_id` (or `"*"` as the fallback) to its preferred harness+backend; a
-per-job `backend`/`harness`/`server` field overrides the matrix:
+Coverage today (mirrored in `underwright.policy.json` → `harness_matrix.coverage`,
+which may override these defaults):
 
-```json
-"harness_matrix": {
-  "codex@laptop-2": { "harness": "codex", "backend": "omnigent" },
-  "*":              { "backend": "raw" }
-}
-```
-
-### Harness coverage (via omnigent)
-
-| Harness | `omni run` | Raw CLI |
+| Harness | Via omnigent | Via raw CLI |
 |---|---|---|
 | codex | yes | yes |
 | claude-sdk | yes | yes |
-| cmdc | pending omnigent support landing | yes |
-| claude, grok, kimi, agy, opencode, cline, cursor, devin | — | yes |
+| cmdc | pending the new support landing | yes (`cmdc -p --yolo`) |
+| grok, agy, kimi, cline, opencode, cursor | not yet | yes |
 
-Anything not listed as "yes" for `omni run` falls back to the raw CLI; the
-runner never blocks a job on omnigent availability. Update this table and
-`OMNIGENT_HARNESS_SUPPORT` in `src/runner.ts` together as support lands.
+When omnigent drives the job, the runner captures the session it prints
+(`omnigent session: <url-or-id>`, or an omnigent transcript URL) into the
+job result, so `job_status` links the task to the session transcript.
 
 ## Don't run a local stdio database on a remote machine
 
