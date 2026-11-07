@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, sleepSignal, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
@@ -8,7 +8,7 @@ import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, DigestArgs, DigestResult } from "./istore.js";
+import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -256,10 +256,189 @@ export class PgStore implements IStore {
       const expires_at = nodeExpiry(3600);
       await s.nodeQuery('UPDATE nodes SET session_epoch=?,session_expires_at=? WHERE id=?', [session_id, expires_at, principal.node_id]);
       await s.nodeAudit(principal.node_id, 'session_started');
-      return { node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: 60 };
+      return { node_id: principal.node_id, session_id, expires_at, server_time: new Date().toISOString(), heartbeat_seconds: 15, lease_seconds: NODE_LEASE_SECONDS };
     });
   }
 
+  private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string }, capabilitiesJson?: string) {
+    if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
+    if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
+    try {
+      const capabilities = JSON.parse(capabilitiesJson || "{}");
+      const kinds = capabilities.supported_operation_kinds;
+      if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
+    } catch { return false; }
+    return true;
+  }
+
+  async submitNodeTask(args: SubmitNodeTaskArgs) {
+    const parsed = nodeSpecSchema.safeParse(args.node_spec);
+    if (!parsed.success) return nodeError("invalid node_spec", 400);
+    const spec = parsed.data;
+    return this.sql.begin(async sql => {
+      const s = new PgStore(sql as unknown as postgres.Sql);
+      const node = (await s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [args.target_node_id]))[0];
+      if (!node) return nodeError("node unavailable", 404);
+      const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
+      const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
+      if (!s.nodePolicyAllows(policy, spec, capabilities)) return nodeError("operation not permitted", 403);
+      if (args.retry_of) {
+        const prior = (await s.nodeQuery("SELECT id FROM jobs WHERE id=? AND type='node'", [args.retry_of]))[0];
+        if (!prior) return nodeError("retry_of not found", 404);
+      }
+      const dedupe = args.dedupe_key ?? spec.idempotency_key ?? null;
+      if (dedupe) {
+        const existing = (await s.nodeQuery(
+          "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
+          [args.target_node_id, dedupe],
+        ))[0];
+        if (existing) return { ...publicNodeJob(existing), deduped: true };
+      }
+      const id = `job-${randomUUID().slice(0, 8)}`;
+      try {
+        await s.nodeQuery(
+          `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key,retry_of)
+           VALUES (?,?,?,'node','',?,?,?,?)`,
+          [id, args.task_id ?? null, args.agent_id ?? "admin", args.target_node_id, JSON.stringify(spec), dedupe, args.retry_of ?? null],
+        );
+      } catch (error: any) {
+        if (error?.code === "23505") {
+          const existing = (await s.nodeQuery(
+            "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
+            [args.target_node_id, dedupe],
+          ))[0];
+          if (existing) return { ...publicNodeJob(existing), deduped: true };
+        }
+        throw error;
+      }
+      await s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: args.target_node_id, kind: spec.kind, retry_of: args.retry_of ?? null });
+      return { id, status: "queued", target_node_id: args.target_node_id };
+    });
+  }
+
+  async sweepExpiredNodeJobs() {
+    const rows = await this.sql<{ id: string }[]>`
+      UPDATE jobs SET status='failed', finished_at=now(), outcome_reason='lease_lost/outcome_unknown', lease_expires=NULL
+      WHERE type='node' AND status='running' AND lease_expires<=now() RETURNING id`;
+    for (const row of rows) await this.log("job", row.id, "failed", "lease-sweeper", { reason: "lease_lost/outcome_unknown" });
+    return { expired: rows.map(row => row.id) };
+  }
+
+  private async leaseNodeJob(token: string, sessionId: string) {
+    await this.sweepExpiredNodeJobs();
+    const principal = await this.authenticateNode(token, sessionId);
+    if ("error" in principal) return principal;
+    return this.sql.begin(async sql => {
+      const s = new PgStore(sql as unknown as postgres.Sql);
+      await s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [new Date().toISOString(), principal.node_id]);
+      const held = (await s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>now() AND session_id=? FOR UPDATE",
+        [principal.node_id, sessionId],
+      ))[0];
+      if (held) return publicNodeJob(held);
+      const busy = (await s.nodeQuery(
+        "SELECT id FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>now() FOR UPDATE",
+        [principal.node_id],
+      ))[0];
+      if (busy) return { empty: true, status_code: 204 };
+      const queued = (await s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED",
+        [principal.node_id],
+      ))[0];
+      if (!queued) return { empty: true, status_code: 204 };
+      let spec: any = queued.node_spec;
+      if (typeof spec === "string") { try { spec = JSON.parse(spec); } catch { spec = {}; } }
+      const node = (await s.nodeQuery("SELECT policy_json, capabilities_json, state FROM nodes WHERE id=?", [principal.node_id]))[0];
+      if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
+      const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
+      const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
+      if (!s.nodePolicyAllows(policy, spec, capabilities)) {
+        await s.nodeQuery(
+          "UPDATE jobs SET status='failed', finished_at=now(), outcome_reason='policy_denied', lease_expires=NULL WHERE id=? AND status='queued'",
+          [queued.id],
+        );
+        await s.log("job", queued.id, "failed", principal.node_id, { reason: "policy_denied" });
+        return { empty: true, status_code: 204 };
+      }
+      const attempt_id = randomUUID();
+      const lease_token = randomUUID();
+      const lease_expires = nodeExpiry(NODE_LEASE_SECONDS);
+      const updated = await s.nodeQuery(
+        `UPDATE jobs SET status='running', started_at=now(), finished_at=NULL, result='',
+         runner_id=?, lease_token=?, lease_expires=?, attempt_id=?, session_id=?
+         WHERE id=? AND status='queued' RETURNING *`,
+        [principal.node_id, lease_token, lease_expires, attempt_id, sessionId, queued.id],
+      );
+      if (!updated[0]) return { empty: true, status_code: 204 };
+      await s.log("job", queued.id, "started", principal.node_id, { attempt_id, lease_expires });
+      return publicNodeJob(updated[0]);
+    });
+  }
+
+  async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal) {
+    const waitMs = Math.max(0, Math.min(NODE_POLL_MAX_WAIT, waitSeconds)) * 1000;
+    const deadline = Date.now() + waitMs;
+    try {
+      while (true) {
+        if (signal?.aborted) return nodeError("canceled", 499);
+        const leased = await this.leaseNodeJob(token, sessionId);
+        if (!leased || !("empty" in leased)) return leased;
+        if (Date.now() >= deadline) return leased;
+        await sleepSignal(Math.min(50, Math.max(1, deadline - Date.now())), signal);
+      }
+    } catch (error) {
+      if ((error as { canceled?: boolean }).canceled) return nodeError("canceled", 499);
+      throw error;
+    }
+  }
+
+  async renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string) {
+    const principal = await this.authenticateNode(token, sessionId);
+    if ("error" in principal) return principal;
+    const lease_expires = new Date(Date.now() + NODE_LEASE_SECONDS * 1000);
+    const updated = await this.nodeQuery(
+      `UPDATE jobs SET lease_expires=?, result=COALESCE(?,result)
+       WHERE id=? AND type='node' AND status='running' AND target_node_id=? AND runner_id=?
+       AND session_id=? AND lease_token=? AND lease_expires>now() RETURNING id`,
+      [lease_expires.toISOString(), result === undefined ? null : boundNodeResult(result), jobId, principal.node_id, principal.node_id, sessionId, leaseToken],
+    );
+    if (!updated.length) return nodeError("job lease not owned or expired", 409);
+    await this.log("job", jobId, "renewed", principal.node_id);
+    return { id: jobId, lease_expires: lease_expires.toISOString() };
+  }
+
+  async finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown) {
+    const principal = await this.authenticateNode(token, sessionId);
+    if ("error" in principal) return principal;
+    const bounded = boundNodeResult(result);
+    return this.sql.begin(async sql => {
+      const s = new PgStore(sql as unknown as postgres.Sql);
+      const job = (await s.nodeQuery("SELECT * FROM jobs WHERE id=? AND type='node' AND target_node_id=? FOR UPDATE", [jobId, principal.node_id]))[0];
+      if (!job) return nodeError("job lease not owned or expired", 409);
+      if (job.lease_token !== leaseToken || job.session_id !== sessionId) return nodeError("job lease not owned or expired", 409);
+      const digest = nodeReceiptDigest(job.attempt_id ?? "", status, bounded);
+      if (job.status === "done" || job.status === "failed") {
+        if (job.receipt_status === status && job.receipt_digest === digest) {
+          return { id: jobId, status: job.status, attempt_id: job.attempt_id, receipt_digest: job.receipt_digest, idempotent: true };
+        }
+        return nodeError("conflicting completion", 409);
+      }
+      const expires = job.lease_expires instanceof Date ? job.lease_expires : new Date(job.lease_expires);
+      if (job.status !== "running" || !job.lease_expires || expires.getTime() <= Date.now()) {
+        return nodeError("job lease not owned or expired", 409);
+      }
+      const metadata = resultMetadata == null ? null : JSON.stringify(resultMetadata);
+      const updated = await s.nodeQuery(
+        `UPDATE jobs SET status=?, result=?, finished_at=now(), lease_expires=NULL, receipt_digest=?, receipt_status=?, result_metadata=?
+         WHERE id=? AND status='running' AND lease_token=? AND session_id=? AND lease_expires>now() RETURNING id`,
+        [status, bounded, digest, status, metadata, jobId, leaseToken, sessionId],
+      );
+      if (!updated.length) return nodeError("job lease not owned or expired", 409);
+      await s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
+      if (job.task_id) await s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
+      return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
+    });
+  }
 
   private constructor(sql: postgres.Sql) {
     this.sql = sql;
@@ -818,6 +997,7 @@ export class PgStore implements IStore {
   }
 
   async submitJob(a: SubmitJobArgs) {
+    if (a.type === "node") return { error: "use submit_node_task for node jobs" };
     if (a.type === "agent" ? !a.agent?.executable || !a.agent.prompt : !a.command)
       return { error: "command required, or executable and prompt for agent jobs" };
     const id = `job-${randomUUID().slice(0, 8)}`;
@@ -834,6 +1014,7 @@ export class PgStore implements IStore {
       UPDATE jobs SET status='running', started_at=now(), finished_at=NULL, result='',
       runner_id=${agentId}, lease_token=${randomUUID()}, lease_expires=${expires}
       WHERE id = (SELECT id FROM jobs WHERE (status='queued' OR (status='running' AND lease_expires<=now()))
+      AND type<>'node' AND target_node_id IS NULL
       AND (host IS NULL OR host=${host ?? null}) AND (target_agent_id IS NULL OR target_agent_id=${agentId})
       ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`;
     if (!job) return null;

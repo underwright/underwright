@@ -123,6 +123,7 @@ async function matrix(token) {
         ['list_nodes', {}], ['list_node_enrollments', {}],
         ['approve_node_enrollment', { enrollment_id: 'fake', code: 'fake', policy: { allowed_task_types: [], workspace_ids: [] } }],
         ['reject_node_enrollment', { enrollment_id: 'fake' }], ['revoke_node', { node_id: 'fake' }],
+        ['submit_node_task', { target_node_id: 'fake', node_spec: { version: 1, kind: 'run-script', payload: {} } }],
       ]) assert.match((await call(name, args)).error, /Configure UNDERWRIGHT_TOKEN/);
     } else {
       const proof = randomBytes(32).toString('hex');
@@ -139,6 +140,28 @@ async function matrix(token) {
       for (const path of ['/mcp', '/board', `/board?token=${issued.token}`]) {
         assert.equal((await request(path, { headers: { authorization: `Bearer ${issued.token}` } })).status, 401);
       }
+      const queueProof = randomBytes(32).toString('hex');
+      const queueEnroll = await (await nodePost('/nodes/v1/enrollments', { version: 1, name: 'queue-device', platform: 'test', arch: 'test',
+        device_secret_hash: createHash('sha256').update(queueProof).digest('hex') })).json();
+      const queueApproved = await call('approve_node_enrollment', { enrollment_id: queueEnroll.id, code: queueEnroll.code,
+        policy: { allowed_task_types: ['run-script'], workspace_ids: ['ws'] } });
+      const queueIssued = await (await nodePost(`/nodes/v1/enrollments/${queueEnroll.id}/exchange`, { device_secret: queueProof })).json();
+      const queueSession = await (await nodePost('/nodes/v1/session', { version: 1 }, queueIssued.token)).json();
+      const nodeTask = await call('submit_node_task', { target_node_id: queueApproved.node_id,
+        node_spec: { version: 1, kind: 'run-script', workspace_id: 'ws', payload: { argv: ['true'] } } });
+      const legacyJob = await call('submit_job', { agent_id: agent, type: 'test', command: 'echo legacy' });
+      const next = await call('next_job', { agent_id: 'runner-A', host: 'host-A' });
+      assert.equal(next.id, legacyJob.id);
+      assert.notEqual(next.id, nodeTask.id);
+      assert.equal((await call('finish_job', { job_id: next.id, agent_id: 'runner-A', lease_token: next.lease_token, status: 'done', result: 'legacy-ok' })).status, 'done');
+      const polled = await (await nodePost('/nodes/v1/poll', { session_id: queueSession.session_id, wait_seconds: 0 }, queueIssued.token)).json();
+      assert.equal(polled.id, nodeTask.id);
+      const finished = await nodePost(`/nodes/v1/jobs/${nodeTask.id}/finish`, {
+        session_id: queueSession.session_id, lease_token: polled.lease_token, status: 'done', result: 'ok',
+      }, queueIssued.token);
+      assert.equal(finished.status, 200);
+      assert.equal((await nodePost('/nodes/v1/poll', { session_id: queueSession.session_id, wait_seconds: 0 }, queueIssued.token)).status, 204);
+      await call('revoke_node', { node_id: queueIssued.node_id });
       await call('revoke_node', { node_id: issued.node_id });
       assert.equal((await nodePost('/nodes/v1/session', { version: 1 }, issued.token)).status, 401);
       const rejected = await enrollment();

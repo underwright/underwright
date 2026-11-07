@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   id           TEXT PRIMARY KEY,
   task_id      TEXT REFERENCES tasks(id),
   agent_id     TEXT NOT NULL,
-  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review','agent')),
+  type         TEXT NOT NULL CHECK (type IN ('test','build','deploy','review','agent','node')),
   status       TEXT NOT NULL DEFAULT 'queued'
                CHECK (status IN ('queued','running','done','failed')),
   command      TEXT NOT NULL,
@@ -38,8 +38,24 @@ CREATE TABLE IF NOT EXISTS jobs (
   result       TEXT NOT NULL DEFAULT '',
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
   started_at   TEXT,
-  finished_at  TEXT
+  finished_at  TEXT,
+  target_node_id TEXT,
+  node_spec TEXT,
+  attempt_id TEXT,
+  session_id TEXT,
+  dedupe_key TEXT,
+  retry_of TEXT,
+  receipt_digest TEXT,
+  receipt_status TEXT,
+  outcome_reason TEXT,
+  result_metadata TEXT
 );
+`;
+
+export const JOBS_INDEXES = `
+CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
+  WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
 `;
 
 export const SCHEMA = `
@@ -178,14 +194,27 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_idx USING fts5(
 // Additive Postgres migration; keep the job shape beside the SQLite source.
 export const PG_JOBS_MIGRATION = `
 ALTER TABLE jobs DROP CONSTRAINT IF EXISTS jobs_type_check;
-ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('test','build','deploy','review','agent'));
+ALTER TABLE jobs ADD CONSTRAINT jobs_type_check CHECK (type IN ('test','build','deploy','review','agent','node'));
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS host TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_agent_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS runner_id TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_token TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_expires TIMESTAMPTZ;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS agent_spec TEXT;
-UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS target_node_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS node_spec TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS attempt_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS retry_of TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_digest TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_status TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS outcome_reason TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result_metadata TEXT;
+CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
+  WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
+UPDATE jobs SET status='queued' WHERE status='running' AND lease_expires IS NULL AND type <> 'node';
 `;
 
 // Widen artifacts.kind on databases created before the blocked escalation kind.

@@ -153,6 +153,17 @@ describe("background lease sweeper", () => {
     await stop();
   });
 
+  it("sweeps expired node jobs after idle dispatch", async () => {
+    vi.useFakeTimers();
+    const sweepExpiredClaims = vi.fn().mockResolvedValue({ reclaimed: [] });
+    const sweepIdleDispatches = vi.fn().mockResolvedValue({ reassigned: [], logged: [] });
+    const sweepExpiredNodeJobs = vi.fn().mockResolvedValue({ expired: ["job-1"] });
+    const stop = startLeaseSweeper({ sweepExpiredClaims, sweepIdleDispatches, sweepExpiredNodeJobs }, 60_000);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sweepExpiredNodeJobs).toHaveBeenCalledTimes(1);
+    await stop();
+  });
+
   it("reports lease and idle sweep failures separately", async () => {
     vi.useFakeTimers();
     const sweepExpiredClaims = vi.fn().mockRejectedValue(new Error("lease down"));

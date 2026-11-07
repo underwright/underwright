@@ -100,3 +100,44 @@ it('additive upgrade preserves task history and live legacy leases across repeat
   expect(store.getJob(job.id).status).toBe('running');
   expect(store.listNodes()).toEqual([]);
 });
+it('long-polls node jobs over scoped HTTP, isolates legacy MCP next_job, and drops revoked waiters', async () => {
+  const { url, post, store } = await server('admin-secret');
+  const secret = nodeSecret();
+  const e = await (await post('/nodes/v1/enrollments', { version: 1, name: 'queue', device_secret_hash: nodeHash(secret), platform: 'linux', arch: 'x64' })).json() as any;
+  const client = new Client({ name: 'admin', version: '1' });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url + '/mcp'), { requestInit: { headers: { authorization: 'Bearer admin-secret' } } }));
+  cleanups.push(() => client.close());
+  const approved = JSON.parse((await client.callTool({ name: 'approve_node_enrollment', arguments: {
+    enrollment_id: e.id, code: e.code, policy: { allowed_task_types: ['run-script'], workspace_ids: ['ws'] },
+  } })).content[0].text);
+  const issued = await (await post(`/nodes/v1/enrollments/${e.id}/exchange`, { device_secret: secret })).json() as any;
+  const session = await (await post('/nodes/v1/session', { version: 1 }, issued.token)).json() as any;
+  const submitted = JSON.parse((await client.callTool({ name: 'submit_node_task', arguments: {
+    target_node_id: approved.node_id,
+    node_spec: { version: 1, kind: 'run-script', workspace_id: 'ws', payload: { argv: ['true'] } },
+  } })).content[0].text);
+  const legacy = JSON.parse((await client.callTool({ name: 'submit_job', arguments: { agent_id: 'runner', type: 'test', command: 'echo hi' } })).content[0].text);
+  const next = JSON.parse((await client.callTool({ name: 'next_job', arguments: { agent_id: 'runner', host: 'host-A' } })).content[0].text);
+  expect(next.id).toBe(legacy.id);
+  const polled = await (await post('/nodes/v1/poll', { session_id: session.session_id, wait_seconds: 0 }, issued.token)).json() as any;
+  expect(polled.id).toBe(submitted.id);
+  const empty = await post('/nodes/v1/poll', { session_id: session.session_id, wait_seconds: 0 }, issued.token);
+  expect(empty.status).toBe(200);
+  expect((await empty.json() as any).id).toBe(submitted.id);
+  const finished = await post(`/nodes/v1/jobs/${submitted.id}/finish`, {
+    session_id: session.session_id, lease_token: polled.lease_token, status: 'done', result: 'ok',
+  }, issued.token);
+  expect(finished.status).toBe(200);
+  const idle = await post('/nodes/v1/poll', { session_id: session.session_id, wait_seconds: 0 }, issued.token);
+  expect(idle.status).toBe(204);
+  const waiter = fetch(url + '/nodes/v1/poll', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + issued.token },
+    body: JSON.stringify({ session_id: session.session_id, wait_seconds: 5 }),
+  });
+  await new Promise(resolve => setTimeout(resolve, 80));
+  await client.callTool({ name: 'revoke_node', arguments: { node_id: issued.node_id } });
+  const revoked = await waiter;
+  expect(revoked.status).toBe(401);
+});
+

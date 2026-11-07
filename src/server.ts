@@ -1,5 +1,5 @@
 import { handleNodeHttp } from "./node-http.js";
-import { nodePolicySchema } from "./node-protocol.js";
+import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -46,6 +46,13 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
+  server.tool("submit_node_task", "Queue a node-targeted job. Legacy next_job consumers never receive these leases.", {
+    target_node_id: z.string().min(1).max(64),
+    node_spec: nodeSpecSchema,
+    task_id: z.string().max(64).optional(),
+    dedupe_key: z.string().min(1).max(128).optional(),
+    retry_of: z.string().max(64).optional(),
+  }, async a => admin(() => store.submitNodeTask({ ...a, agent_id: "admin" })));
 
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
     async () => text(await store.board()));
@@ -358,7 +365,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     }
     res.writeHead(404).end();
   });
-  http.requestTimeout = 15000;
+  http.requestTimeout = 40000;
   http.headersTimeout = 10000;
   http.maxConnections = 128;
   http.once("close", () => {
