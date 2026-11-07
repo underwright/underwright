@@ -18,6 +18,14 @@ export interface AutoMergeRule {
   delete_branch?: boolean;
 }
 
+/** How review tasks are handed to someone other than the implementer. */
+export interface ReviewRoutingRule {
+  /** Dispatch only to a different harness when one is known. Default true. */
+  require_different_harness?: boolean;
+  /** Prefer a higher tier than the implementer. Default true. */
+  prefer_stronger?: boolean;
+}
+
 /** Micro-manager. Absent or enabled:false leaves complete/release unchanged. */
 export interface DispatcherRule {
   enabled?: boolean;
@@ -25,12 +33,33 @@ export interface DispatcherRule {
   max_tasks_per_agent?: number;
   /** How long a "your next task" message may sit while that task is unclaimed. */
   idle_minutes?: number;
+  review?: ReviewRoutingRule;
+}
+
+export interface ReviewRoutingPolicy {
+  require_different_harness: boolean;
+  prefer_stronger: boolean;
 }
 
 export interface DispatcherPolicy {
   enabled: boolean;
   max_tasks_per_agent: number;
   idle_minutes: number;
+  review: ReviewRoutingPolicy;
+}
+
+const DEFAULT_REVIEW_ROUTING: ReviewRoutingPolicy = {
+  require_different_harness: true,
+  prefer_stronger: true,
+};
+
+function reviewRoutingFrom(raw: DispatcherRule | undefined): ReviewRoutingPolicy {
+  const review = raw?.review;
+  if (!review || typeof review !== "object") return { ...DEFAULT_REVIEW_ROUTING };
+  return {
+    require_different_harness: review.require_different_harness !== false,
+    prefer_stronger: review.prefer_stronger !== false,
+  };
 }
 
 export type HumanNotifyEventKind = "task_completed" | "claim_reclaimed";
@@ -119,8 +148,9 @@ export function getAutoMergePolicy(
 /** Missing block stays off so callers that ship no policy do not auto-assign. */
 export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPolicy {
   const raw = policy.dispatcher;
+  const review = reviewRoutingFrom(raw);
   if (!raw || typeof raw !== "object") {
-    return { enabled: false, max_tasks_per_agent: 0, idle_minutes: 15 };
+    return { enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review };
   }
   const max = Number(raw.max_tasks_per_agent);
   const idle = Number(raw.idle_minutes);
@@ -128,6 +158,7 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
     enabled: raw.enabled === true,
     max_tasks_per_agent: Number.isFinite(max) && max > 0 ? Math.floor(max) : 0,
     idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
+    review,
   };
 }
 

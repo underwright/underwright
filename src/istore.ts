@@ -7,7 +7,7 @@ type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
 
-export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | "tdd" | string;
+export type TaskType = "feature" | "bug" | "deploy" | "architecture" | "docs" | "tdd" | "triage" | "review" | string;
 
 export interface CreateTaskArgs {
   title: string; description?: string; spec_ref?: string; ac_ids?: string[];
@@ -17,6 +17,8 @@ export interface CreateTaskArgs {
   severity?: "low" | "normal" | "high" | "critical";
   estimate?: "S" | "M" | "L" | "";
   template?: string;   // task template id — expands AC scaffold, type, DoR checklist
+  review_of?: string;  // subject task; creates a review task linked to it
+  review_kind?: "code" | "design";
 }
 
 export type AgentBackend = "raw" | "omnigent";

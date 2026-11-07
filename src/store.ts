@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
-import { chooseReassignAgent, DISPATCHER_AGENT, isSystemActor, leaseActive, nextTaskMessage, overCap, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
@@ -538,6 +538,16 @@ export class SqliteStore implements IStore {
         this.db.exec("PRAGMA user_version = 8;");
       })();
     }
+    if (v < 9) {
+      // v9: review tasks point at the subject they review.
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('tasks')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("review_of")) this.db.exec("ALTER TABLE tasks ADD COLUMN review_of TEXT;");
+      if (!cols.has("review_kind")) this.db.exec("ALTER TABLE tasks ADD COLUMN review_kind TEXT;");
+      this.db.exec("CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of);");
+      this.db.exec("PRAGMA user_version = 9;");
+    }
   }
 
   notifyWatchers(taskId: string, body: string) {
@@ -608,18 +618,25 @@ export class SqliteStore implements IStore {
 
   private createTaskAtomic(a: CreateTaskArgs) {
     const id = a.id ?? `task-${randomUUID().slice(0, 8)}`;
+    const subject = a.review_of?.trim()
+      ? this.db.prepare("SELECT id, type FROM tasks WHERE id=?").get(a.review_of.trim()) as { id: string; type: string } | undefined
+      : undefined;
+    const linked = linkedReviewArgs(a, subject ?? null);
+    if (linked.error) return { error: linked.error };
+    a = linked.args;
     const invalid = this.validateDependencies(id, a.blocked_by ?? []);
     if (invalid) return { error: invalid };
     this.db
       .prepare(
-        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`
+        `INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate, review_of, review_kind)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
       )
       .run(
         id, a.title, a.description ?? "", a.spec_ref ?? null,
         JSON.stringify(a.ac_ids ?? []), a.priority ?? 2,
         JSON.stringify(a.ownership ?? {}), a.created_by ?? "human",
-        a.type ?? "feature", a.severity ?? "normal", a.estimate ?? ""
+        a.type ?? "feature", a.severity ?? "normal", a.estimate ?? "",
+        linked.reviewOf, a.review_kind ?? null
       );
     this.replaceDependencies(id, a.blocked_by ?? []);
     this.log("task", id, "created", a.created_by ?? "human", a);
@@ -638,7 +655,13 @@ export class SqliteStore implements IStore {
       ...t, ...this.dependencies(id, t.status),
       ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
       artifacts: this.listArtifacts(id),
+      reviews: this.reviewIds(id),
     };
+  }
+
+  private reviewIds(id: string): string[] {
+    return (this.db.prepare("SELECT id FROM tasks WHERE review_of=? ORDER BY id").all(id) as { id: string }[])
+      .map((row) => row.id);
   }
 
   setTaskStatus(id: string, status: TaskStatus, actor: string) {
@@ -719,6 +742,11 @@ export class SqliteStore implements IStore {
     const dor = evaluateDoR(task, loadPolicy());
     if (!dor.ready) {
       return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
+    }
+
+    if (task.type === "review" && task.review_of && existing?.agent_id !== agentId) {
+      const independence = reviewIndependenceError(agentId, this.implementerOf(task.review_of), task.review_of);
+      if (independence) return { error: independence };
     }
 
     const expires = new Date(Date.now() + ttlSeconds * 1000).toISOString();
@@ -947,18 +975,73 @@ export class SqliteStore implements IStore {
     };
   }
 
-  /** Assign the next open, unblocked task to the agent who just finished one. */
+  private taskRouteMeta(id: string) {
+    const row = this.db.prepare("SELECT type, review_of, review_kind FROM tasks WHERE id=?").get(id) as
+      { type: string; review_of: string | null; review_kind: string | null } | undefined;
+    if (!row) return null;
+    return { type: row.type, review_of: row.review_of ?? null, review_kind: row.review_kind ?? null };
+  }
+
+  private implementerOf(subjectId: string): string | null {
+    const completed = this.db.prepare(
+      "SELECT actor FROM events WHERE entity_type='task' AND entity_id=? AND action='completed' ORDER BY id DESC LIMIT 1"
+    ).get(subjectId) as { actor?: string } | undefined;
+    const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id=?").get(subjectId) as { agent_id?: string } | undefined;
+    const claimed = this.db.prepare(
+      "SELECT actor FROM events WHERE entity_type='task' AND entity_id=? AND action='claimed' ORDER BY id DESC LIMIT 1"
+    ).get(subjectId) as { actor?: string } | undefined;
+    const artifact = this.db.prepare(
+      "SELECT agent_id FROM artifacts WHERE task_id=? AND kind IN ('design','spec') ORDER BY created_at DESC LIMIT 1"
+    ).get(subjectId) as { agent_id?: string } | undefined;
+    const created = this.db.prepare("SELECT created_by FROM tasks WHERE id=?").get(subjectId) as { created_by?: string } | undefined;
+    return implementerFromRecords({
+      completedBy: completed?.actor,
+      claimAgent: claim?.agent_id,
+      lastClaimedBy: claimed?.actor,
+      artifactAuthor: artifact?.agent_id,
+      createdBy: created?.created_by,
+    });
+  }
+
+  /** Assign the next open task. Review tasks go to a different harness than the implementer. */
   private dispatchNext(agentId: string, excludeTaskId: string, trigger: "complete" | "release") {
     const policy = getDispatcherPolicy(loadPolicy());
     if (!policy.enabled) return null;
     const workload = this.agentWorkload(agentId);
-    if (overCap(workload, policy.max_tasks_per_agent)) {
+    const capped = overCap(workload, policy.max_tasks_per_agent);
+    if (capped) {
       this.log("task", excludeTaskId, "dispatch_capped", DISPATCHER_AGENT, {
         agent_id: agentId, workload, max: policy.max_tasks_per_agent, trigger,
       });
-      return null;
     }
-    for (const taskId of this.dispatchCandidates(excludeTaskId)) {
+    const candidates = this.dispatchCandidates(excludeTaskId);
+    const normals: string[] = [];
+    let self: { task_id: string; agent_id: string } | null = null;
+    for (const taskId of candidates) {
+      const meta = this.taskRouteMeta(taskId);
+      if (meta?.type !== "review") {
+        normals.push(taskId);
+        continue;
+      }
+      const reviewer = chooseReviewer({
+        implementer: meta.review_of ? this.implementerOf(meta.review_of) : null,
+        agents: this.knownAgentWorkloads().filter((a) => !(capped && a.id === agentId)),
+        max: policy.max_tasks_per_agent,
+        requireDifferentHarness: policy.review.require_different_harness,
+        preferStronger: policy.review.prefer_stronger,
+        designReview: meta.review_kind === "design",
+      });
+      if (!reviewer || (self && reviewer === agentId)) continue;
+      const claimed = this.claimTaskAtomic(taskId, reviewer) as { error?: string };
+      if (claimed.error) continue;
+      this.sendMessage(reviewer, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
+      this.log("task", taskId, "dispatched", DISPATCHER_AGENT, {
+        agent_id: reviewer, trigger, from_task: excludeTaskId, review: true,
+      });
+      if (reviewer === agentId) self = { task_id: taskId, agent_id: agentId };
+    }
+    if (self || capped) return self;
+    for (const taskId of normals) {
       const claimed = this.claimTaskAtomic(taskId, agentId) as { error?: string };
       if (claimed.error) continue;
       this.sendMessage(agentId, DISPATCHER_AGENT, nextTaskMessage(taskId), taskId);
@@ -1062,11 +1145,21 @@ export class SqliteStore implements IStore {
         mark("not_open", { status: task.status });
         continue;
       }
-      const next = chooseReassignAgent({
-        assignee: row.assignee,
-        agents: this.knownAgentWorkloads(),
-        max: policy.max_tasks_per_agent,
-      });
+      const meta = this.taskRouteMeta(row.taskId);
+      const next = meta?.type === "review"
+        ? chooseReviewer({
+          implementer: meta.review_of ? this.implementerOf(meta.review_of) : null,
+          agents: this.knownAgentWorkloads().filter((a) => a.id !== row.assignee),
+          max: policy.max_tasks_per_agent,
+          requireDifferentHarness: policy.review.require_different_harness,
+          preferStronger: policy.review.prefer_stronger,
+          designReview: meta.review_kind === "design",
+        })
+        : chooseReassignAgent({
+          assignee: row.assignee,
+          agents: this.knownAgentWorkloads(),
+          max: policy.max_tasks_per_agent,
+        });
       if (!next) { mark("no_alternate_agent"); continue; }
       const claimed = this.claimTaskAtomic(row.taskId, next) as { error?: string };
       if (claimed.error) { mark("claim_failed", { error: claimed.error }); continue; }

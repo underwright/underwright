@@ -5,29 +5,92 @@ import { join } from "node:path";
 import { SqliteStore } from "../src/store.js";
 import { PgStore } from "../src/pstore.js";
 import type { IStore } from "../src/istore.js";
-import { chooseReassignAgent, leaseActive, nextTaskMessage } from "../src/dispatcher.js";
-import { getDispatcherPolicy } from "../src/policy.js";
+import { chooseReassignAgent, chooseReviewer, harnessOf, leaseActive, linkedReviewArgs, nextTaskMessage } from "../src/dispatcher.js";
+import { evaluateDoD, getDispatcherPolicy } from "../src/policy.js";
 
 const root = new URL("..", import.meta.url);
 
 describe("dispatcher policy", () => {
+  const review = { require_different_harness: true, prefer_stronger: true };
+
   it("stays off when the block is absent and reads on/off, cap, and idle minutes", () => {
     expect(getDispatcherPolicy({ dod: {}, enforcement: "observe" })).toEqual({
-      enabled: false, max_tasks_per_agent: 0, idle_minutes: 15,
+      enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review,
     });
     expect(getDispatcherPolicy({
       dod: {}, enforcement: "warn",
       dispatcher: { enabled: true, max_tasks_per_agent: 4, idle_minutes: 0 },
-    })).toEqual({ enabled: true, max_tasks_per_agent: 4, idle_minutes: 0 });
+    })).toEqual({ enabled: true, max_tasks_per_agent: 4, idle_minutes: 0, review });
     expect(getDispatcherPolicy({
       dod: {}, enforcement: "warn",
       dispatcher: { enabled: false, max_tasks_per_agent: -3, idle_minutes: -1 },
-    })).toEqual({ enabled: false, max_tasks_per_agent: 0, idle_minutes: 15 });
+    })).toEqual({ enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review });
+    expect(getDispatcherPolicy({
+      dod: {}, enforcement: "warn",
+      dispatcher: { enabled: true, review: { require_different_harness: false, prefer_stronger: false } },
+    }).review).toEqual({ require_different_harness: false, prefer_stronger: false });
   });
 
   it("ships an enabled dispatcher with a cap and an idle window", () => {
     const policy = JSON.parse(readFileSync(new URL("../underwright.policy.json", import.meta.url), "utf8"));
     expect(policy.dispatcher).toMatchObject({ enabled: true, max_tasks_per_agent: 0, idle_minutes: 15 });
+    expect(policy.dispatcher.review).toEqual(review);
+    expect(policy.dod.review).toEqual({ artifacts: ["review"] });
+  });
+
+  it("routes review work to a different, stronger harness and links review_of", () => {
+    expect(harnessOf("claude@minipc")).toBe("claude");
+    const agents = [
+      { id: "grok@alandesktop", workload: 1 },
+      { id: "grok@other", workload: 0 },
+      { id: "cmdc@box", workload: 0 },
+      { id: "claude@minipc", workload: 2 },
+    ];
+    expect(chooseReviewer({
+      implementer: "grok@alandesktop", agents, max: 0,
+      requireDifferentHarness: true, preferStronger: true, designReview: false,
+    })).toBe("claude@minipc");
+    expect(chooseReviewer({
+      implementer: "grok@alandesktop",
+      agents: [{ id: "grok@other", workload: 0 }],
+      max: 0, requireDifferentHarness: true, preferStronger: true, designReview: false,
+    })).toBeNull();
+    expect(chooseReviewer({
+      implementer: "grok@alandesktop",
+      agents: [{ id: "grok@other", workload: 0 }, { id: "codex@laptop", workload: 3 }],
+      max: 0, requireDifferentHarness: false, preferStronger: false, designReview: false,
+    })).toBe("grok@other");
+    expect(chooseReviewer({
+      implementer: "grok@alandesktop",
+      agents: [{ id: "codex@laptop", workload: 0 }, { id: "claude@minipc", workload: 4 }],
+      max: 0, requireDifferentHarness: true, preferStronger: true, designReview: true,
+    })).toBe("claude@minipc");
+    expect(chooseReviewer({
+      implementer: "claude@minipc", agents: [{ id: "codex@laptop", workload: 1 }],
+      max: 1, requireDifferentHarness: true, preferStronger: true, designReview: true,
+    })).toBeNull();
+
+    expect(linkedReviewArgs({ title: "rev", review_of: "task-1" }, null).error).toMatch(/not found/);
+    const code = linkedReviewArgs({ review_of: "task-1", blocked_by: [] }, { type: "feature" });
+    expect(code.args).toMatchObject({ type: "review", review_kind: "code", blocked_by: ["task-1"] });
+    const design = linkedReviewArgs({ review_of: "task-arch" }, { type: "architecture" });
+    expect(design.args).toMatchObject({ type: "review", review_kind: "design", blocked_by: [] });
+    expect(linkedReviewArgs({ type: "bug", review_of: "task-1" }, { type: "feature" }).error).toMatch(/type review/);
+  });
+
+  it("asks a review task for a review artifact", () => {
+    const policy = { dod: { review: { artifacts: ["review"] } }, enforcement: "block" as const };
+    const missing = evaluateDoD({
+      task: { type: "review" }, evidence: [], artifacts: [], claimAgent: "claude@minipc", policy,
+    });
+    expect(missing.blocked).toBe(true);
+    expect(missing.missing.join(" ")).toContain("review");
+    const ok = evaluateDoD({
+      task: { type: "review" }, evidence: [], artifacts: [{ kind: "review", agent_id: "claude@minipc" }],
+      claimAgent: "claude@minipc", policy,
+    });
+    expect(ok.ok).toBe(true);
+    expect(ok.blocked).toBe(false);
   });
 
   it("picks the least-loaded agent under the cap", () => {
@@ -79,7 +142,7 @@ for (const backend of ["sqlite", "postgres"] as const) {
       dispatcher: { enabled: true, max_tasks_per_agent: 0, idle_minutes: 0 },
     };
 
-    function writePolicy(dispatcher = basePolicy.dispatcher) {
+    function writePolicy(dispatcher: Record<string, unknown> = basePolicy.dispatcher) {
       writeFileSync(policyPath, JSON.stringify({ ...basePolicy, dispatcher }));
     }
 
@@ -243,6 +306,113 @@ for (const backend of ["sqlite", "postgres"] as const) {
       expect(sweep.logged).toContain(target.id);
       expect(sweep.reassigned).not.toContain(target.id);
       expect((await store.getTask(target.id)).claim).toBeNull();
+    });
+
+    async function register(agentId: string) {
+      const task = await ready(`reg-${agentId}`, { priority: 4 });
+      await store.claimTask(task.id, agentId);
+      const done = await finish(task.id, agentId) as { error?: string };
+      expect(done.error).toBeUndefined();
+    }
+
+    it("links a code review to its subject and blocks the claim until that subject is done", async () => {
+      const feature = await ready("feature");
+      const missing = await store.createTask({
+        title: "missing subject", review_of: "missing-task", ac_ids: ["ac"], estimate: "S", type: "review",
+      }) as { error?: string };
+      expect(missing.error).toMatch(/not found/);
+      const wrongType = await store.createTask({
+        title: "wrong type", review_of: feature.id, type: "bug", ac_ids: ["ac"], estimate: "S",
+      }) as { error?: string };
+      expect(wrongType.error).toMatch(/type review/);
+
+      const review = await store.createTask({
+        title: "review feature", review_of: feature.id, ac_ids: ["ac"], estimate: "S",
+      });
+      expect(review).toMatchObject({
+        type: "review", review_kind: "code", review_of: feature.id, blocked_by: [feature.id], status: "blocked",
+      });
+      expect((await store.getTask(feature.id)).reviews).toEqual([review.id]);
+      expect((await store.claimTask(review.id, "claude@minipc") as any).error).toMatch(/blocked/);
+    });
+
+    it("refuses the implementer at the claim gate and lets a different agent renew", async () => {
+      const feature = await ready("feature");
+      await store.claimTask(feature.id, "grok@alandesktop");
+      const review = await store.createTask({
+        title: "review feature", review_of: feature.id, ac_ids: ["ac"], estimate: "S",
+      });
+      await finish(feature.id, "grok@alandesktop");
+      const denied = await store.claimTask(review.id, "grok@alandesktop") as { error?: string };
+      expect(denied.error).toMatch(/cannot claim this review/);
+      expect(denied.error).toContain("grok@alandesktop");
+      const allowed = await store.claimTask(review.id, "claude@minipc") as { error?: string; agent_id?: string };
+      expect(allowed.error).toBeUndefined();
+      expect(allowed.agent_id).toBe("claude@minipc");
+      const renewed = await store.claimTask(review.id, "claude@minipc") as { error?: string };
+      expect(renewed.error).toBeUndefined();
+    });
+
+    it("routes a code review to a stronger harness and still gives the implementer other work", async () => {
+      await register("claude@minipc");
+      await register("cmdc@box");
+      const feature = await ready("feature");
+      await store.claimTask(feature.id, "grok@alandesktop");
+      const review = await store.createTask({
+        title: "review feature", review_of: feature.id, ac_ids: ["ac"], estimate: "S", priority: 1,
+      });
+      const follow = await ready("follow", { priority: 3 });
+      const result = await finish(feature.id, "grok@alandesktop") as { dispatched?: { task_id: string; agent_id: string } };
+      expect((await store.getTask(review.id)).claim.agent_id).toBe("claude@minipc");
+      expect((await store.inbox("claude@minipc")).map((m: any) => m.body)).toContain(nextTaskMessage(review.id));
+      expect(result.dispatched).toEqual({ task_id: follow.id, agent_id: "grok@alandesktop" });
+      expect((await store.getTask(follow.id)).claim.agent_id).toBe("grok@alandesktop");
+    });
+
+    it("leaves a review open when the only other agent is the same harness", async () => {
+      await register("grok@other");
+      const feature = await ready("feature");
+      await store.claimTask(feature.id, "grok@alandesktop");
+      const review = await store.createTask({
+        title: "review feature", review_of: feature.id, ac_ids: ["ac"], estimate: "S", priority: 1,
+      });
+      const follow = await ready("follow", { priority: 3 });
+      const result = await finish(feature.id, "grok@alandesktop") as { dispatched?: { task_id: string } };
+      expect((await store.getTask(review.id)).claim).toBeNull();
+      expect(result.dispatched).toEqual({ task_id: follow.id, agent_id: "grok@alandesktop" });
+    });
+
+    it("routes a design review of an architecture task to a high-tier harness before the subject is done", async () => {
+      await register("codex@laptop");
+      await register("claude@minipc");
+      const arch = await ready("arch", { type: "architecture" });
+      await store.claimTask(arch.id, "grok@alandesktop");
+      const design = await store.createTask({
+        title: "design review", review_of: arch.id, ac_ids: ["ac"], estimate: "S", priority: 1,
+      });
+      expect(design).toMatchObject({ type: "review", review_kind: "design", blocked_by: [], status: "open" });
+      expect((await store.getTask(arch.id)).reviews).toEqual([design.id]);
+      const other = await ready("other", { priority: 3 });
+      await store.claimTask(other.id, "grok@alandesktop");
+      await finish(other.id, "grok@alandesktop");
+      expect((await store.getTask(design.id)).claim.agent_id).toBe("claude@minipc");
+      expect((await store.getTask(arch.id)).claim.agent_id).toBe("grok@alandesktop");
+    });
+
+    it("reassigns a stale review away from the implementer to a stronger harness", async () => {
+      await register("claude@minipc");
+      await register("grok@other");
+      const feature = await ready("feature");
+      await store.claimTask(feature.id, "grok@alandesktop");
+      await finish(feature.id, "grok@alandesktop");
+      const review = await store.createTask({
+        title: "review feature", review_of: feature.id, ac_ids: ["ac"], estimate: "S",
+      });
+      expect((await store.getTask(review.id)).status).toBe("open");
+      await store.sendMessage("grok@alandesktop", "dispatcher", nextTaskMessage(review.id), review.id);
+      const sweep = await store.sweepIdleDispatches();
+      expect(sweep.reassigned).toEqual([review.id]);
+      expect((await store.getTask(review.id)).claim.agent_id).toBe("claude@minipc");
     });
   });
 }

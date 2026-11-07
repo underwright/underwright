@@ -68,6 +68,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   type          TEXT NOT NULL DEFAULT 'feature',  -- drives Definition-of-Done rules
   severity      TEXT NOT NULL DEFAULT 'normal',   -- low|normal|high|critical
   estimate      TEXT NOT NULL DEFAULT '',          -- S|M|L (agent-sessions); empty = unestimated
+  review_of     TEXT,                              -- subject task id when type is review
+  review_kind   TEXT,                              -- code | design; set with review_of
   status        TEXT NOT NULL DEFAULT 'open'
                 CHECK (status IN ('open','claimed','in_review','done','blocked')),
   priority      INTEGER NOT NULL DEFAULT 2,

@@ -1,1 +1,6 @@
-[underwright] MCP over HTTP at http://0.0.0.0:8741/mcp (stateless, bearer-auth)
+[underwright] MCP over HTTP at http://0.0.0.0:8741/mcp (stateless, bearer-auth); GitHub webhook POST /github/webhook
+[underwright] lease sweep failed: SyntaxError: Expected double-quoted property name in JSON at position 767 (line 22 column 1)
+    at JSON.parse (<anonymous>)
+    at loadPolicy (file:///home/alan/code/underwright/dist/policy.js:133:25)
+    at SqliteStore.sweepIdleDispatches (file:///home/alan/code/underwright/dist/store.js:1003:44)
+    at file:///home/alan/code/underwright/dist/sweeper.js:22:54

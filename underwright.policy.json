@@ -6,6 +6,7 @@
     "architecture": { "artifacts": ["design"], "evidence": ["review"] },
     "docs":         { "evidence": ["review"] },
     "tdd":          { "evidence": ["test_run"], "tdd": true },
+    "review":       { "artifacts": ["review"] },
     "default":      { "evidence": ["test_run"] }
   },
   "enforcement": "warn",
@@ -18,7 +19,11 @@
   "dispatcher": {
     "enabled": true,
     "max_tasks_per_agent": 0,
-    "idle_minutes": 15
+    "idle_minutes": 15,
+    "review": {
+      "require_different_harness": true,
+      "prefer_stronger": true
+    }
   },
   "harness_matrix": {
     "agents": {
@@ -33,6 +38,7 @@
       "codex": true,
       "claude-sdk": true,
       "cmdc": false
+
     }
   }
 }

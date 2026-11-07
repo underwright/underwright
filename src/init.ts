@@ -81,11 +81,17 @@ export const DEFAULT_POLICY = {
     architecture: { artifacts: ["design"], evidence: ["review"] },
     docs: { evidence: ["review"] },
     tdd: { evidence: ["test_run"], tdd: true },
+    review: { artifacts: ["review"] },
     default: { evidence: ["test_run"] },
   },
   enforcement: "warn",
   dor: { require_type: true, require_ac_ids: true, require_estimate: true, require_description: false },
-  dispatcher: { enabled: true, max_tasks_per_agent: 0, idle_minutes: 15 },
+  dispatcher: {
+    enabled: true,
+    max_tasks_per_agent: 0,
+    idle_minutes: 15,
+    review: { require_different_harness: true, prefer_stronger: true },
+  },
   harness_matrix: {
     agents: {},
     coverage: { codex: true, "claude-sdk": true, cmdc: false },

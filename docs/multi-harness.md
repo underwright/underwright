@@ -482,3 +482,6 @@ need independent review evidence before merge (peer-review policy).
 - **claude** — Aura/work projects ONLY (work subscription). Never dispatch claude to OSS boards.
 - **Everything else** — free/personal harnesses (devin swe-2, cmdc, opencode, grok, agy, codex, kimi) for underwright/kraftina/OSS work.
 - Board isolation: Aura board (:8743) gets its own token + agent_id pool; claude@* ids may only appear there.
+
+Review tasks route to a different harness than the implementer, preferring
+a stronger tier. Design reviews prefer a high-tier harness.
