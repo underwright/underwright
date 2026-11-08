@@ -144,3 +144,163 @@ ${rows(events, 4, (e) => `<tr${isBlockedEvent(e) ? ' class="blocked"' : ""}>${ce
 </body>
 </html>`;
 }
+
+// ---------- Interactive surface ----------
+// Task detail, create/claim/release, and inbox via plain HTML forms — works
+// with zero client JS. Token propagates through links/forms as ?token=.
+
+const shell = (title: string, body: string) => `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;font:14px/1.5 ui-monospace,Menlo,Consolas,monospace;background:#0f1115;color:#d6dae2}
+main{max-width:1100px}
+h1{font-size:20px;margin:0 0 4px} h2{font-size:13px;margin:22px 0 8px;color:#9aa4b2;text-transform:uppercase;letter-spacing:.08em}
+a{color:#7dd3fc}
+table{width:100%;border-collapse:collapse;background:#151922;border:1px solid #232a36}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid #1e2531;vertical-align:top}
+th{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8b95a5;background:#11151d}
+input,select,textarea{background:#11151d;color:#d6dae2;border:1px solid #2a3342;padding:6px 8px;font:inherit;border-radius:4px}
+textarea{width:100%;min-height:80px}
+button{background:#1d4ed8;color:#fff;border:0;border-radius:4px;padding:6px 14px;font:inherit;cursor:pointer}
+button:hover{background:#2563eb}
+form.inline{display:inline}
+form.stack{display:flex;flex-direction:column;gap:8px;max-width:640px}
+.meta{color:#6f7a89}.empty{color:#566070;font-style:italic}
+pre.desc{white-space:pre-wrap;background:#11151d;border:1px solid #232a36;padding:10px;border-radius:6px;max-height:400px;overflow:auto}
+.badge{display:inline-block;padding:1px 8px;border:1px solid #334155;border-radius:999px;font-size:11px;color:#9aa4b2}
+nav{margin-bottom:14px;font-size:13px}
+</style></head><body><main>${body}</main></body></html>`;
+
+const tok = (t?: string) => t ? `?token=${encodeURIComponent(t)}` : "";
+const tokAnd = (t?: string) => t ? `&token=${encodeURIComponent(t)}` : "";
+
+export function renderTaskPage(task: any, opts: { token?: string } = {}): string {
+  const t = opts.token;
+  const ac = (task.ac_ids ?? []).map((a: string) => `<span class="badge">${escapeHtml(a)}</span>`).join(" ");
+  const evidence = (task.evidence ?? []).map((e: any) =>
+    `<tr><td>${escapeHtml(e.created_at)}</td><td>${escapeHtml(e.kind)}</td><td>${escapeHtml(e.agent_id)}</td><td>${escapeHtml(e.exit_code ?? "—")}</td><td><pre class="desc">${escapeHtml((e.output ?? "").slice(0, 2000))}</pre></td></tr>`).join("\n");
+  const artifacts = (task.artifacts ?? []).map((a: any) =>
+    `<tr><td>${escapeHtml(a.created_at)}</td><td>${escapeHtml(a.kind)}</td><td>${escapeHtml(a.agent_id)}</td><td>${escapeHtml(a.title ?? "—")}</td><td><pre class="desc">${escapeHtml((a.content ?? "").slice(0, 2000))}</pre></td></tr>`).join("\n");
+  const claim = task.claim;
+  const actions = claim
+    ? `<form class="inline" method="post" action="/task/${escapeHtml(task.id)}/release${tok(t)}"><input type="hidden" name="agent_id" value="${escapeHtml(claim.agent_id)}"><button>Release claim (${escapeHtml(claim.agent_id)})</button></form>`
+    : `<form class="inline" method="post" action="/task/${escapeHtml(task.id)}/claim${tok(t)}"><input name="agent_id" placeholder="agent@host" required><button>Claim</button></form>`;
+  return shell(`Task ${task.id}`, `
+<nav><a href="/board${tok(t)}">← board</a> · <a href="/inbox/you${tok(t)}">inbox</a></nav>
+<h1>${escapeHtml(task.title)}</h1>
+<p class="meta"><code>${escapeHtml(task.id)}</code> · ${escapeHtml(task.status)} · p${escapeHtml(task.priority)} · ${escapeHtml(task.type)} · created by ${escapeHtml(task.created_by)}</p>
+<p>${ac || '<span class="empty">no acceptance criteria</span>'}</p>
+<p>${actions}</p>
+<h2>Description</h2><pre class="desc">${escapeHtml(task.description || "—")}</pre>
+<h2>Post artifact</h2>
+<form class="stack" method="post" action="/task/${escapeHtml(task.id)}/artifact${tok(t)}">
+<input name="agent_id" placeholder="agent@host" required>
+<select name="kind"><option>note</option><option>spec</option><option>design</option><option>handoff</option><option>review</option><option>blocked</option></select>
+<input name="title" placeholder="title">
+<textarea name="content" required></textarea><button>Post</button></form>
+<h2>Report evidence</h2>
+<form class="stack" method="post" action="/task/${escapeHtml(task.id)}/evidence${tok(t)}">
+<input name="agent_id" placeholder="agent@host" required>
+<select name="kind"><option>test_run</option><option>ci_check</option><option>review</option><option>coverage</option><option>deploy</option><option>contract_test</option><option>security_scan</option><option>smoke_test</option><option>mutation</option><option>cost</option></select>
+<input name="command" placeholder="command run">
+<input name="exit_code" type="number" placeholder="exit code">
+<input name="ac_ids" placeholder="ac ids, comma-separated">
+<textarea name="output" placeholder="output / results"></textarea><button>Report</button></form>
+<h2>Evidence <span class="meta">${(task.evidence ?? []).length}</span></h2>
+<table><tbody>${evidence || '<tr><td class="empty">none</td></tr>'}</tbody></table>
+<h2>Artifacts <span class="meta">${(task.artifacts ?? []).length}</span></h2>
+<table><tbody>${artifacts || '<tr><td class="empty">none</td></tr>'}</tbody></table>`);
+}
+
+export function renderInboxPage(agentId: string, messages: any[], opts: { token?: string } = {}): string {
+  const t = opts.token;
+  const rows = messages.map((m: any) =>
+    `<tr><td>${escapeHtml(m.created_at)}</td><td>${escapeHtml(m.from_agent)}</td><td>${escapeHtml(m.task_id ?? "—")}</td><td>${escapeHtml(m.body)}</td></tr>`).join("\n");
+  return shell(`Inbox ${agentId}`, `
+<nav><a href="/board${tok(t)}">← board</a></nav>
+<h1>Inbox — ${escapeHtml(agentId)}</h1>
+<p class="meta">reading marks messages read · <a href="/inbox/${escapeHtml(agentId)}?all=1${tokAnd(t)}">all messages</a></p>
+<form class="inline" method="get" action="/inbox/" onsubmit="return false"><input name="agent" placeholder="agent@host" onkeydown="if(event.key==='Enter')location='/inbox/'+encodeURIComponent(this.value)+'${tok(t)}'"></form>
+<h2>Messages <span class="meta">${messages.length}</span></h2>
+<table><tbody>${rows || '<tr><td class="empty">empty</td></tr>'}</tbody></table>
+<h2>Send message</h2>
+<form class="stack" method="post" action="/messages${tok(t)}">
+<input name="to_agent" placeholder="to agent@host" required>
+<input name="from_agent" value="${escapeHtml(agentId)}" required>
+<input name="task_id" placeholder="task id (optional)">
+<textarea name="body" required></textarea><button>Send</button></form>`);
+}
+
+export interface DashboardResult { html?: string; redirect?: string; error?: string; status?: number }
+
+/** Interactive dashboard router. Returns {html} or {redirect}; errors as {error,status}. */
+export async function handleDashboardRequest(store: any, method: string, url: URL, body: URLSearchParams, token?: string): Promise<DashboardResult> {
+  const path = url.pathname;
+  const form = (k: string) => (body.get(k) ?? "").trim() || undefined;
+  if (method === "POST") {
+    const back = (id: string) => ({ redirect: `${id}${tok(token)}` });
+    if (path === "/tasks") {
+      const title = form("title");
+      if (!title) return { error: "title required", status: 400 };
+      const task = await store.createTask({ title, description: form("description"), type: form("type") ?? "feature", ac_ids: form("ac_ids")?.split(",").map(s => s.trim()).filter(Boolean), created_by: form("agent_id") ?? "dashboard" });
+      return { redirect: `/task/${task.id}${tok(token)}` };
+    }
+    if (path === "/messages") {
+      const to = form("to_agent"), from = form("from_agent"), msg = form("body");
+      if (!to || !from || !msg) return { error: "to_agent, from_agent, body required", status: 400 };
+      await store.sendMessage(to, from, msg, form("task_id"));
+      return { redirect: `/inbox/${encodeURIComponent(from)}${tok(token)}` };
+    }
+    const m = path.match(/^\/task\/([^/]+)\/(claim|release|artifact|evidence)$/);
+    if (m) {
+      const [, id, action] = m;
+      const agent = form("agent_id") ?? "dashboard";
+      let result: any;
+      if (action === "claim") result = await store.claimTask(id, agent);
+      else if (action === "release") result = await store.releaseTask(id, agent);
+      else if (action === "artifact") result = await store.postArtifact({ task_id: id, agent_id: agent, kind: form("kind") ?? "note", title: form("title"), content: form("content") ?? "" });
+      else result = await store.reportEvidence({ task_id: id, agent_id: agent, kind: form("kind") ?? "test_run", command: form("command"), exit_code: form("exit_code") !== undefined ? Number(form("exit_code")) : undefined, output: form("output"), ac_ids: form("ac_ids")?.split(",").map(s => s.trim()).filter(Boolean) });
+      if (result?.error) return { error: result.error, status: 409 };
+      return back(`/task/${id}`);
+    }
+    return { error: "unknown action", status: 404 };
+  }
+  if (path === "/" || path === "/board") {
+    const data = await store.dashboard();
+    const taskLinks = (data.tasks ?? []).map((t: any) => ({ ...t, title: t.title }));
+    const html = renderDashboard(data, { refreshSeconds: Number(url.searchParams.get("refresh") ?? 15) })
+      .replace("</main>", `
+<h2>Create task</h2>
+<form class="stack" method="post" action="/tasks${tok(token)}">
+<input name="title" placeholder="title" required>
+<textarea name="description" placeholder="description (markdown)"></textarea>
+<select name="type"><option>feature</option><option>bug</option><option>architecture</option><option>docs</option><option>tdd</option></select>
+<input name="ac_ids" placeholder="ac ids, comma-separated">
+<input name="agent_id" placeholder="created-by agent@host">
+<button>Create</button></form>
+<h2>Mailbox</h2>
+<form class="inline" method="get" onsubmit="return false"><input name="agent" placeholder="agent@host" onkeydown="if(event.key==='Enter')location='/inbox/'+encodeURIComponent(this.value)+'${tok(token)}'"><button type="button" onclick="location='/inbox/'+encodeURIComponent(this.previousSibling.value)+'${tok(token)}'">Open inbox</button></form>
+</main>`)
+      .replace(/<code>(task-[a-f0-9]+|gh-\d+|init-[a-z-]+)<\/code>/g, (_m, id) => `<a href="/task/${id}${tok(token)}"><code>${id}</code></a>`)
+      .replace("</style>", `a{color:#7dd3fc}input,select,textarea{background:#11151d;color:#d6dae2;border:1px solid #2a3342;padding:6px 8px;font:inherit;border-radius:4px}textarea{width:100%;min-height:60px}button{background:#1d4ed8;color:#fff;border:0;border-radius:4px;padding:6px 14px;font:inherit;cursor:pointer}form.stack{display:flex;flex-direction:column;gap:8px;max-width:640px}form.inline{display:inline}</style>`);
+    void taskLinks;
+    return { html };
+  }
+  const tm = path.match(/^\/task\/([^/]+)$/);
+  if (tm) {
+    const task = await store.getTask(tm[1]);
+    if (!task) return { error: "task not found", status: 404 };
+    try { task.evidence = await store.getEvidence(tm[1]); } catch { task.evidence = []; }
+    return { html: renderTaskPage(task, { token }) };
+  }
+  const im = path.match(/^\/inbox\/([^/]+)$/);
+  if (im) {
+    const agent = decodeURIComponent(im[1]);
+    const messages = await store.inbox(agent, url.searchParams.get("all") !== "1");
+    return { html: renderInboxPage(agent, messages, { token }) };
+  }
+  return { error: "not found", status: 404 };
+}
