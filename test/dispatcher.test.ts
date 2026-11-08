@@ -13,18 +13,19 @@ const root = new URL("..", import.meta.url);
 describe("dispatcher policy", () => {
   const review = { require_different_harness: true, prefer_stronger: true };
 
+  const retryOff = { kinds: [], max_attempts: 0 };
   it("stays off when the block is absent and reads on/off, cap, and idle minutes", () => {
     expect(getDispatcherPolicy({ dod: {}, enforcement: "observe" })).toEqual({
-      enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review,
+      enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review, node_retry: retryOff,
     });
     expect(getDispatcherPolicy({
       dod: {}, enforcement: "warn",
       dispatcher: { enabled: true, max_tasks_per_agent: 4, idle_minutes: 0 },
-    })).toEqual({ enabled: true, max_tasks_per_agent: 4, idle_minutes: 0, review });
+    })).toEqual({ enabled: true, max_tasks_per_agent: 4, idle_minutes: 0, review, node_retry: retryOff });
     expect(getDispatcherPolicy({
       dod: {}, enforcement: "warn",
       dispatcher: { enabled: false, max_tasks_per_agent: -3, idle_minutes: -1 },
-    })).toEqual({ enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review });
+    })).toEqual({ enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review, node_retry: retryOff });
     expect(getDispatcherPolicy({
       dod: {}, enforcement: "warn",
       dispatcher: { enabled: true, review: { require_different_harness: false, prefer_stronger: false } },

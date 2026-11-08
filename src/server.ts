@@ -47,8 +47,8 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
-  server.tool("submit_node_task", "Queue a node-targeted job. Legacy next_job consumers never receive these leases.", {
-    target_node_id: z.string().min(1).max(64),
+  server.tool("submit_node_task", "Queue a node-targeted job. Omit target_node_id to route to the best eligible approved node. Legacy next_job consumers never receive these leases.", {
+    target_node_id: z.string().min(1).max(64).optional(),
     node_spec: nodeSpecSchema,
     task_id: z.string().max(64).optional(),
     dedupe_key: z.string().min(1).max(128).optional(),

@@ -40,7 +40,8 @@ export interface SubmitJobArgs {
 }
 
 export interface SubmitNodeTaskArgs {
-  target_node_id: string;
+  /** Omit to route to the best eligible approved node (policy + capabilities). */
+  target_node_id?: string;
   node_spec: NodeSpec;
   task_id?: string;
   agent_id?: string;
