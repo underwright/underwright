@@ -64,7 +64,10 @@ and shutdown abort the group with TERM followed by KILL. Server leases mark
 unacknowledged work `lease_lost/outcome_unknown`; this is not exactly-once
 execution of arbitrary external side effects.
 
-For a Linux user service, create `~/.config/systemd/user/underwright-node.service`:
+For a Linux user service, `underwright service install node --config
+/absolute/path/node-executors.json` writes and enables the unit below (user
+manager, lingering enabled). To install by hand instead, create
+`~/.config/systemd/user/underwright-node.service`:
 
 ```ini
 [Unit]

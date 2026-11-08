@@ -1,6 +1,16 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { enrollNode, nodeStatus } from "./node-client.js";
+import {
+  installService,
+  renderUnit,
+  serviceStatus,
+  uninstallService,
+  type ServiceOptions,
+  type ServiceResult,
+  type ServiceTarget,
+} from "./service.js";
 import { runNode } from "./node-run.js";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
@@ -80,6 +90,51 @@ switch (cmd) {
         await runNode({ signal: shutdown.signal, config });
       } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
+    break;
+  }
+
+  case "service": {
+    // underwright service install [serve|node|run|runner] [--http H:P] [--config FILE]
+    //   [--url URL] [--host NAME] [--agent-id ID]
+    //   [--name N] [--system] [--run-as USER] [--env-file PATH] [--no-start]
+    // underwright service status|uninstall|print [target] [--name N] [--system]
+    const sub = args[0];
+    const target = (args[1] && !args[1].startsWith("--") ? args[1] : "serve") as ServiceTarget;
+    if (!["install", "uninstall", "status", "print"].includes(sub ?? "") || !["serve", "node", "run", "runner"].includes(target)) {
+      console.error("usage: underwright service install [serve|node|run|runner] [--http H:P] [--config FILE] [--url URL] [--host NAME] [--agent-id ID] [--name N] [--system] [--run-as USER] [--env-file PATH] [--entrypoint CLI_JS] [--no-start]\n       underwright service status|uninstall|print [serve|node|run|runner] [--name N] [--system]");
+      process.exit(1);
+    }
+    const report = (r: ServiceResult) => {
+      for (const a of r.actions) console.log(a);
+      for (const w of r.warnings) console.error(`warning: ${w}`);
+      if (!r.ok) process.exitCode = 1;
+    };
+    try {
+      const base = { target, name: flag("name"), system: args.includes("--system") };
+      if (sub === "status") console.log(JSON.stringify(serviceStatus(base), null, 2));
+      else if (sub === "uninstall") report(uninstallService(base));
+      else {
+        const config = flag("config");
+        const entrypoint = flag("entrypoint");
+        if (target === "node" && config && !existsSync(config)) throw new Error(`node config not found: ${config}`);
+        if (entrypoint && !existsSync(entrypoint)) throw new Error(`entrypoint not found: ${entrypoint}`);
+        const opts: ServiceOptions = {
+          ...base,
+          http: flag("http"),
+          config: config ? resolve(config) : undefined,
+          url: flag("url"),
+          host: flag("host"),
+          agentId: flag("agent-id"),
+          runAs: flag("run-as"),
+          envFile: flag("env-file"),
+          entrypoint,
+          start: !args.includes("--no-start"),
+          environment: target === "node" || target === "runner" ? undefined : { UNDERWRIGHT_DB: resolve(dbPath) },
+        };
+        if (sub === "print") process.stdout.write(renderUnit(opts));
+        else report(installService(opts));
+      }
+    } catch (error) { console.error(error instanceof Error ? error.message : "service command failed"); process.exitCode = 1; }
     break;
   }
 
@@ -237,6 +292,10 @@ Usage:
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
   underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
+  underwright service install    Install a systemd unit for autostart on reboot:
+                                 [serve|node|run|runner] [--http H:P] [--config FILE]
+                                 [--url URL] [--system] [--no-start].
+                                 status/uninstall/print too.
   underwright board              Print the task board.
   underwright digest             Summarize board delta since --since TS [--to AGENT] [--text].
   underwright create             Create a task, optionally from a template (--template feature).

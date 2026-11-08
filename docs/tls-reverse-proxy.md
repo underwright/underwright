@@ -239,6 +239,10 @@ WantedBy=multi-user.target
 
 ### 3. Enable and Verify
 
+`underwright service install serve --system --run-as underwright
+--env-file /etc/underwright/underwright.env --http 127.0.0.1:8741`
+generates this unit (including the hardening block) and enables it. Manually:
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now underwright.service

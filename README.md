@@ -271,7 +271,14 @@ is responsible for claiming its task; a job lease does not claim that task.
 After `complete_task`, read inbox. A message `your next task: <id>` is the
 next assignment. Work the board until idle.
 
-A host can supervise the process with systemd (set the workspace, executable
+For autostart on reboot, `underwright service install runner --url URL --host NAME
+--agent-id ID` writes and enables a systemd user unit (and enables lingering so
+it starts before login). `underwright service install` does the same for the
+control plane server, `service install node` for the node daemon, and
+`service install run` for a local job runner. Add `--system` for
+`/etc/systemd/system`, `--no-start` to enable without starting, and see
+`service status|uninstall|print`. On non-Linux hosts, supervise the process with
+an equivalent init — or hand-edit a unit (set the workspace, executable
 path, and URL for your installation; put `UNDERWRIGHT_TOKEN` in the environment
 file):
 
