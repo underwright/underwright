@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
@@ -268,18 +268,7 @@ export class PgStore implements IStore {
   }
 
   private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string; payload?: Record<string, unknown> }, capabilitiesJson?: string, observedAt?: unknown) {
-    if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
-    if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
-    try {
-      const capabilities = JSON.parse(capabilitiesJson || "{}");
-      if (spec.kind === 'launch-agent') {
-        const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
-        if (!observedAt || Date.now() - Date.parse(String(observedAt)) > 120000 || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
-      }
-      const kinds = capabilities.supported_operation_kinds;
-      if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
-    } catch { return false; }
-    return true;
+    return nodeSpecAllowed(policy, spec, capabilitiesJson, observedAt);
   }
 
   async submitNodeTask(args: SubmitNodeTaskArgs) {
@@ -289,7 +278,13 @@ export class PgStore implements IStore {
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
       await sql.unsafe('LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE');
-      const node = (await s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [args.target_node_id]))[0];
+      const targetId = args.target_node_id ?? selectNode(
+        (await s.nodeQuery("SELECT id,policy_json,capabilities_json,capabilities_observed_at,last_seen_at FROM nodes WHERE state='approved'"))
+          .map((n: any) => ({ ...n, policy_json: typeof n.policy_json === "string" ? n.policy_json : JSON.stringify(n.policy_json), capabilities_json: typeof n.capabilities_json === "string" ? n.capabilities_json : JSON.stringify(n.capabilities_json ?? {}) })) as NodeCandidate[],
+        spec,
+      );
+      if (!targetId) return nodeError(args.target_node_id ? "node unavailable" : "no capable node", 404);
+      const node = (await s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [targetId]))[0];
       if (!node) return nodeError("node unavailable", 404);
       const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
       const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
@@ -311,7 +306,7 @@ export class PgStore implements IStore {
       if (dedupe) {
         const existing = (await s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
-          [args.target_node_id, dedupe],
+          [targetId, dedupe],
         ))[0];
         if (existing) return { ...publicNodeJob(existing), deduped: true };
       }
@@ -320,20 +315,20 @@ export class PgStore implements IStore {
         await s.nodeQuery(
           `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key,retry_of)
            VALUES (?,?,?,'node','',?,?,?,?)`,
-          [id, args.task_id ?? null, args.agent_id ?? "admin", args.target_node_id, JSON.stringify(spec), dedupe, args.retry_of ?? null],
+          [id, args.task_id ?? null, args.agent_id ?? "admin", targetId, JSON.stringify(spec), dedupe, args.retry_of ?? null],
         );
       } catch (error: any) {
         if (error?.code === "23505") {
           const existing = (await s.nodeQuery(
             "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
-            [args.target_node_id, dedupe],
+            [targetId, dedupe],
           ))[0];
           if (existing) return { ...publicNodeJob(existing), deduped: true };
         }
         throw error;
       }
-      await s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: args.target_node_id, kind: spec.kind, retry_of: args.retry_of ?? null });
-      return { id, status: "queued", target_node_id: args.target_node_id };
+      await s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: targetId, kind: spec.kind, retry_of: args.retry_of ?? null });
+      return { id, status: "queued", target_node_id: targetId };
     });
   }
 
@@ -382,12 +377,47 @@ export class PgStore implements IStore {
     });
   }
 
+  private async nodeRetryDepth(jobId: string, s: PgStore = this): Promise<number> {
+    let depth = 0, cur = jobId;
+    while (depth < 100) {
+      const parent = (await s.nodeQuery("SELECT retry_of FROM jobs WHERE id=?", [cur]))[0]?.retry_of;
+      if (!parent) return depth;
+      cur = parent; depth++;
+    }
+    return depth;
+  }
+
   async sweepExpiredNodeJobs() {
-    const rows = await this.sql<{ id: string }[]>`
-      UPDATE jobs SET status='failed', finished_at=now(), outcome_reason='lease_lost/outcome_unknown', lease_expires=NULL
-      WHERE type='node' AND status='running' AND lease_expires<=now() RETURNING id`;
-    for (const row of rows) await this.log("job", row.id, "failed", "lease-sweeper", { reason: "lease_lost/outcome_unknown" });
-    return { expired: rows.map(row => row.id) };
+    return this.sql.begin(async sql => {
+      const s = new PgStore(sql as unknown as postgres.Sql);
+      await sql.unsafe('LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE');
+      const expired = await s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND status='running' AND lease_expires<=now()", []) as any[];
+      // Opt-in requeue for retryable kinds; outcome_unknown stays deliberate by default.
+      const retry = getDispatcherPolicy().node_retry;
+      const retried: string[] = [];
+      for (const job of expired) {
+        let successor: string | undefined;
+        let spec: any = {};
+        try { spec = typeof job.node_spec === "string" ? JSON.parse(job.node_spec || "{}") : (job.node_spec ?? {}); } catch {}
+        if (retry.max_attempts > 1 && retry.kinds.includes(spec.kind) && await s.nodeRetryDepth(job.id) + 1 < retry.max_attempts) {
+          successor = `job-${randomUUID().slice(0, 8)}`;
+          await s.nodeQuery(
+            `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key,retry_of)
+             VALUES (?,?,?,'node','',?,?,?,?)`,
+            [successor, job.task_id ?? null, job.agent_id, job.target_node_id, typeof job.node_spec === "string" ? job.node_spec : JSON.stringify(job.node_spec), job.dedupe_key ?? null, job.id],
+          );
+          retried.push(successor);
+        }
+        const reason = successor ? "lease_lost/requeued" : "lease_lost/outcome_unknown";
+        await s.nodeQuery(
+          `UPDATE jobs SET status='failed', finished_at=now(), outcome_reason=?, lease_expires=NULL WHERE id=?`,
+          [reason, job.id],
+        );
+        await s.log("job", job.id, "failed", "lease-sweeper", { reason, ...(successor ? { successor } : {}) });
+      }
+      return { expired: expired.map((row: any) => row.id as string), retried };
+    });
   }
 
   private async leaseNodeJob(token: string, sessionId: string) {
@@ -1231,7 +1261,16 @@ export class PgStore implements IStore {
       FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`;
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;
-    return { tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))), job_counts, helpers_registered: n, nodes: await this.listNodes() };
+    const unread = await this.sql`SELECT to_agent, COUNT(*)::int AS n FROM messages WHERE read=false GROUP BY to_agent`;
+    const activity = await this.sql`SELECT actor, MAX(created_at) AS last_at FROM events GROUP BY actor ORDER BY last_at DESC LIMIT 50`;
+    return {
+      tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))),
+      job_counts,
+      helpers_registered: n,
+      nodes: await this.listNodes(),
+      unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
+      agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
+    };
   }
 
   async digest(sinceOrArgs?: string | DigestArgs): Promise<DigestResult> {

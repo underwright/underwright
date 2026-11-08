@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -161,18 +161,7 @@ export class SqliteStore implements IStore {
   }
 
   private nodePolicyAllows(policy: NodePolicy, spec: { kind: string; workspace_id?: string; payload?: Record<string, unknown> }, capabilitiesJson?: string, observedAt?: unknown) {
-    if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
-    if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
-    try {
-      const capabilities = JSON.parse(capabilitiesJson || "{}");
-      if (spec.kind === 'launch-agent') {
-        const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
-        if (!observedAt || Date.now() - Date.parse(String(observedAt)) > 120000 || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
-      }
-      const kinds = capabilities.supported_operation_kinds;
-      if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
-    } catch { return false; }
-    return true;
+    return nodeSpecAllowed(policy, spec, capabilitiesJson, observedAt);
   }
 
   submitNodeTask(args: SubmitNodeTaskArgs) {
@@ -180,7 +169,12 @@ export class SqliteStore implements IStore {
     if (!parsed.success) return nodeError("invalid node_spec", 400);
     const spec = parsed.data;
     return this.nodeTransaction(s => {
-      const node = (s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [args.target_node_id]))[0];
+      const targetId = args.target_node_id ?? selectNode(
+        s.nodeQuery("SELECT id,policy_json,capabilities_json,capabilities_observed_at,last_seen_at FROM nodes WHERE state='approved'") as NodeCandidate[],
+        spec,
+      );
+      if (!targetId) return nodeError(args.target_node_id ? "node unavailable" : "no capable node", 404);
+      const node = (s.nodeQuery("SELECT * FROM nodes WHERE id=? AND state='approved'", [targetId]))[0];
       if (!node) return nodeError("node unavailable", 404);
       const policy = JSON.parse(node.policy_json) as NodePolicy;
       if (!s.nodePolicyAllows(policy, spec, node.capabilities_json, node.capabilities_observed_at)) return nodeError(spec.kind === "launch-agent" ? "launch requires fresh ready capability and approved policy" : "operation not permitted", 403);
@@ -201,7 +195,7 @@ export class SqliteStore implements IStore {
       if (dedupe) {
         const existing = (s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
-          [args.target_node_id, dedupe],
+          [targetId, dedupe],
         ))[0];
         if (existing) return { ...publicNodeJob(existing), deduped: true };
       }
@@ -210,18 +204,18 @@ export class SqliteStore implements IStore {
         s.nodeQuery(
           `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key,retry_of)
            VALUES (?,?,?,'node','',?,?,?,?)`,
-          [id, args.task_id ?? null, args.agent_id ?? "admin", args.target_node_id, JSON.stringify(spec), dedupe, args.retry_of ?? null],
+          [id, args.task_id ?? null, args.agent_id ?? "admin", targetId, JSON.stringify(spec), dedupe, args.retry_of ?? null],
         );
       } catch {
         const existing = (s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
-          [args.target_node_id, dedupe],
+          [targetId, dedupe],
         ))[0];
         if (existing) return { ...publicNodeJob(existing), deduped: true };
         throw new Error("node task insert failed");
       }
-      s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: args.target_node_id, kind: spec.kind, retry_of: args.retry_of ?? null });
-      return { id, status: "queued", target_node_id: args.target_node_id };
+      s.log("job", id, "submitted", args.agent_id ?? "admin", { type: "node", target_node_id: targetId, kind: spec.kind, retry_of: args.retry_of ?? null });
+      return { id, status: "queued", target_node_id: targetId };
     });
   }
 
@@ -270,16 +264,45 @@ export class SqliteStore implements IStore {
     });
   }
 
+  private nodeRetryDepth(jobId: string, s = this): number {
+    let depth = 0, cur = jobId;
+    while (depth < 100) {
+      const parent = s.nodeQuery("SELECT retry_of FROM jobs WHERE id=?", [cur])[0]?.retry_of;
+      if (!parent) return depth;
+      cur = parent; depth++;
+    }
+    return depth;
+  }
+
   sweepExpiredNodeJobs() {
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
-      const rows = s.nodeQuery(
-        `UPDATE jobs SET status='failed', finished_at=?, outcome_reason='lease_lost/outcome_unknown', lease_expires=NULL
-         WHERE type='node' AND status='running' AND lease_expires<=? RETURNING id`,
-        [now, now],
-      );
-      for (const row of rows) s.log("job", row.id, "failed", "lease-sweeper", { reason: "lease_lost/outcome_unknown" });
-      return { expired: rows.map((row: any) => row.id as string) };
+      const expired = s.nodeQuery(
+        `SELECT * FROM jobs WHERE type='node' AND status='running' AND lease_expires<=?`, [now]) as any[];
+      // Opt-in requeue for retryable kinds; outcome_unknown stays deliberate by default.
+      const retry = getDispatcherPolicy().node_retry;
+      const retried: string[] = [];
+      for (const job of expired) {
+        let successor: string | undefined;
+        let spec: any = {};
+        try { spec = JSON.parse(job.node_spec || "{}"); } catch {}
+        if (retry.max_attempts > 1 && retry.kinds.includes(spec.kind) && s.nodeRetryDepth(job.id) + 1 < retry.max_attempts) {
+          successor = `job-${randomUUID().slice(0, 8)}`;
+          s.nodeQuery(
+            `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key,retry_of)
+             VALUES (?,?,?,'node','',?,?,?,?)`,
+            [successor, job.task_id ?? null, job.agent_id, job.target_node_id, job.node_spec, job.dedupe_key ?? null, job.id],
+          );
+          retried.push(successor);
+        }
+        const reason = successor ? "lease_lost/requeued" : "lease_lost/outcome_unknown";
+        s.nodeQuery(
+          `UPDATE jobs SET status='failed', finished_at=?, outcome_reason=?, lease_expires=NULL WHERE id=?`,
+          [now, reason, job.id],
+        );
+        s.log("job", job.id, "failed", "lease-sweeper", { reason, ...(successor ? { successor } : {}) });
+      }
+      return { expired: expired.map((row: any) => row.id as string), retried };
     });
   }
 
@@ -1371,7 +1394,16 @@ export class SqliteStore implements IStore {
       .all();
     const jobs = this.db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all();
     const helpers = (this.db.prepare("SELECT COUNT(*) n FROM helpers").get() as any).n;
-    return { tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })), job_counts: jobs, helpers_registered: helpers, nodes: this.listNodes() };
+    const unread = this.db.prepare("SELECT to_agent, COUNT(*) n FROM messages WHERE read=0 GROUP BY to_agent").all() as any[];
+    const activity = this.db.prepare("SELECT actor, MAX(created_at) last_at FROM events GROUP BY actor ORDER BY last_at DESC LIMIT 50").all() as any[];
+    return {
+      tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })),
+      job_counts: jobs,
+      helpers_registered: helpers,
+      nodes: this.listNodes(),
+      unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
+      agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
+    };
   }
 
   /** Standup-style summary of board delta since a timestamp, optionally sent to an agent's mailbox. */

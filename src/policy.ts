@@ -34,6 +34,9 @@ export interface DispatcherRule {
   /** How long a "your next task" message may sit while that task is unclaimed. */
   idle_minutes?: number;
   review?: ReviewRoutingRule;
+  /** Opt-in requeue for node jobs lost to lease expiry. Absent/empty = deliberate
+   *  retry_of only (side effects stay admin-approved). */
+  node_retry?: { kinds?: string[]; max_attempts?: number };
 }
 
 export interface ReviewRoutingPolicy {
@@ -46,6 +49,9 @@ export interface DispatcherPolicy {
   max_tasks_per_agent: number;
   idle_minutes: number;
   review: ReviewRoutingPolicy;
+  /** kinds: operation kinds eligible for automatic requeue; max_attempts:
+   *  total executions including the original. kinds empty = retry off. */
+  node_retry: { kinds: string[]; max_attempts: number };
 }
 
 const DEFAULT_REVIEW_ROUTING: ReviewRoutingPolicy = {
@@ -150,15 +156,20 @@ export function getDispatcherPolicy(policy: Policy = loadPolicy()): DispatcherPo
   const raw = policy.dispatcher;
   const review = reviewRoutingFrom(raw);
   if (!raw || typeof raw !== "object") {
-    return { enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review };
+    return { enabled: false, max_tasks_per_agent: 0, idle_minutes: 15, review, node_retry: { kinds: [], max_attempts: 0 } };
   }
   const max = Number(raw.max_tasks_per_agent);
   const idle = Number(raw.idle_minutes);
+  const retry = raw.node_retry;
   return {
     enabled: raw.enabled === true,
     max_tasks_per_agent: Number.isFinite(max) && max > 0 ? Math.floor(max) : 0,
     idle_minutes: Number.isFinite(idle) && idle >= 0 ? Math.floor(idle) : 15,
     review,
+    node_retry: {
+      kinds: Array.isArray(retry?.kinds) ? retry.kinds.filter(k => typeof k === "string") : [],
+      max_attempts: Math.max(0, Math.floor(Number(retry?.max_attempts) || 0)),
+    },
   };
 }
 

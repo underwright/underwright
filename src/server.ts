@@ -10,7 +10,7 @@ import { openStore } from "./store.js";
 import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
-import { renderDashboard } from "./dashboard.js";
+import { handleDashboardRequest } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 
 // cli.ts reaches the store through this module so the edge stays cli → server → store.
@@ -47,8 +47,8 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
-  server.tool("submit_node_task", "Queue a node-targeted job. Legacy next_job consumers never receive these leases.", {
-    target_node_id: z.string().min(1).max(64),
+  server.tool("submit_node_task", "Queue a node-targeted job. Omit target_node_id to route to the best eligible approved node. Legacy next_job consumers never receive these leases.", {
+    target_node_id: z.string().min(1).max(64).optional(),
     node_spec: nodeSpecSchema,
     task_id: z.string().max(64).optional(),
     dedupe_key: z.string().min(1).max(128).optional(),
@@ -358,7 +358,8 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
       return;
     }
-    // Read-only dashboard. Mutations stay on the MCP surface only.
+    // Interactive dashboard: reads and form-posted mutations share the
+    // dashboard token rule (bearer header or ?token= when a token exists).
     let url: URL;
     try {
       url = new URL(req.url ?? "/", "http://underwright.local");
@@ -366,11 +367,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       res.writeHead(400).end();
       return;
     }
-    if (url.pathname === "/" || url.pathname === "/board") {
-      if (req.method !== "GET") {
-        res.writeHead(405, { allow: "GET" }).end();
-        return;
-      }
+    if (/^\/(board|task|inbox|tasks|messages)(\/|$)/.test(url.pathname) || url.pathname === "/") {
       const authorized = !token
         || req.headers.authorization === `Bearer ${token}`
         || url.searchParams.get("token") === token;
@@ -378,12 +375,31 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
         res.writeHead(401, { "www-authenticate": "Bearer" }).end('{"error":"unauthorized"}');
         return;
       }
-      const html = renderDashboard(await store.dashboard());
-      res.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-        "x-underwright-dashboard": "read-only",
-      }).end(html);
+      let body = new URLSearchParams();
+      if (req.method === "POST") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk as Buffer);
+        const raw = Buffer.concat(chunks).toString("utf8");
+        if (raw.length > 512 * 1024) { res.writeHead(413).end(); return; }
+        body = new URLSearchParams(raw);
+      }
+      let result;
+      try {
+        result = await handleDashboardRequest(store, req.method ?? "GET", url, body, token ? url.searchParams.get("token") ?? undefined : undefined);
+      } catch (error) {
+        console.error("[underwright] dashboard request failed:", error);
+        res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: "dashboard error" }));
+        return;
+      }
+      if (result.redirect) {
+        res.writeHead(303, { location: result.redirect }).end();
+        return;
+      }
+      if (result.error) {
+        res.writeHead(result.status ?? 400, { "content-type": "application/json" }).end(JSON.stringify({ error: result.error }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(result.html);
       return;
     }
     res.writeHead(404).end();

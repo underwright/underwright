@@ -162,3 +162,61 @@ export async function sleepSignal(ms: number, signal?: AbortSignal) {
     signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
+
+/** Node fields needed for capability routing — what submit_node_task selects over. */
+export interface NodeCandidate {
+  id: string;
+  policy_json: string;
+  capabilities_json?: string | null;
+  capabilities_observed_at?: string | null;
+  last_seen_at?: string | null;
+}
+
+/** Shared policy+capability gate: may this node run spec?
+ *  Mirrors the per-store nodePolicyAllows; kept here so both stores and the
+ *  router apply one rule. Launch-agent additionally needs fresh capability
+ *  observation plus an installed/auth-ready harness. */
+export function nodeSpecAllowed(
+  policy: NodePolicy,
+  spec: { kind: string; workspace_id?: string; payload?: Record<string, unknown> },
+  capabilitiesJson?: string,
+  observedAt?: unknown,
+  now = Date.now(),
+): boolean {
+  if (!policy.allowed_task_types.includes(spec.kind as NodePolicy["allowed_task_types"][number])) return false;
+  if (spec.workspace_id && !policy.workspace_ids.includes(spec.workspace_id)) return false;
+  try {
+    const capabilities = JSON.parse(capabilitiesJson || "{}");
+    if (spec.kind === 'launch-agent') {
+      const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
+      const observed = observedAt ? Date.parse(isoTimestamp(observedAt) ?? '') : NaN;
+      if (!Number.isFinite(observed) || now - observed > NODE_STALE_MS || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
+    }
+    const kinds = capabilities.supported_operation_kinds;
+    if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;
+  } catch { return false; }
+  return true;
+}
+
+/** Pick the best eligible approved node for spec, or null when none can run it.
+ *  Preference: online nodes with a free slot first, then online-busy, then
+ *  offline (work queues until they return); deterministic id order breaks ties. */
+export function selectNode(candidates: NodeCandidate[], spec: NodeSpec, now = Date.now()): string | null {
+  const eligible = candidates.filter(n => {
+    try { return nodeSpecAllowed(JSON.parse(n.policy_json), spec, n.capabilities_json ?? "{}", n.capabilities_observed_at, now); }
+    catch { return false; }
+  });
+  if (!eligible.length) return null;
+  const rank = (n: NodeCandidate) => {
+    const online = nodePresence(n.last_seen_at, now) === 'online' ? 2 : 0;
+    let free = 0;
+    try {
+      const caps = JSON.parse(n.capabilities_json || "{}");
+      const max = Number(caps.max_concurrency ?? 1), cur = Number(caps.current_slots ?? 0);
+      free = Number.isFinite(max) && Number.isFinite(cur) && cur < max ? 1 : 0;
+    } catch { free = 1; }
+    return online + free;
+  };
+  eligible.sort((a, b) => rank(b) - rank(a) || a.id.localeCompare(b.id));
+  return eligible[0].id;
+}
