@@ -91,6 +91,15 @@ actually does in this system — and what it deliberately does not do:
   `omni run --harness <id> [-p <prompt>]`. Uncovered harnesses fall back to
   the raw CLI, so adding a new agent is an incremental decision, not an
   integration project.
+
+  That coverage is earned, not aspirational. Where the agent plane lacked
+  first-class support for a harness this fleet installs, we contributed the
+  missing native harness upstream — Command Code, Grok, and Cline each
+  arrived as a first-class Omnigent harness by our PRs, not as private
+  patches.[^harness-upstream] The discipline matters for the claim itself:
+  the control plane's coverage guarantee holds only as long as the agent
+  plane accepts new harnesses, and upstreaming is what keeps that guarantee
+  true over time rather than forking it away.
 - **Session and usage accounting.** Every `omni run` is a supervised session
   with token and cost telemetry. The runner extracts the session marker from
   the transcript and links it back to the job, which is what makes the
@@ -295,3 +304,11 @@ document, like much of the codebase, exists because a task said it should.
 
 *Underwright is open source under Apache 2.0. The open-core boundary and
 roadmap are documented in `COMMERCIAL.md` and `docs/adr/`.*
+
+[^harness-upstream]: Upstream contributions to `omnigent-ai/omnigent`:
+    [PR #13163](https://github.com/omnigent-ai/omnigent/pull/13163) Command
+    Code native harness · [PR #13616](https://github.com/omnigent-ai/omnigent/pull/13616)
+    Grok Build native-server harness · [PR #13754](https://github.com/omnigent-ai/omnigent/pull/13754)
+    Cline native harness (hub transport) · [PR #13542](https://github.com/omnigent-ai/omnigent/pull/13542)
+    XAI_API_KEY passthrough fix. Pending merge, the work lives on the fork
+    `alandennis1024/omnigent`; after merge the PR links alone suffice.
