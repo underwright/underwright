@@ -10,13 +10,31 @@ same utility twice, a third "finishes" work it only half did, and a fourth
 stalls silently the moment nobody is watching. Each individual agent may be
 excellent. The system of agents is not.
 
+It is worth being honest about the current state of the art, because the
+marketing is ahead of the reality. Today's coding agents are far from
+*autonomous* agents in any useful sense of the word. They work on a task —
+sometimes a list of tasks — and then they find a reason to stop: a claim they
+cannot take, a test that failed in a confusing way, a prompt-shaped hole in
+the instructions, or simply the end of a turn with nothing telling them to
+begin another. The system works beautifully right up to the moment it needs
+someone to type "continue."
+
+That puts the human in a degrading role: the reminder. Days dissolve into a
+rhythm of "continue," "go," "yes, do the next one" — prompts that carry no
+information, make no judgment, and exist only because nothing else in the
+system decides that the work should keep moving. A manager who has to tell
+each employee to resume working after every completed task does not have an
+autonomous team; they have a notification queue with extra steps.
+
 The reason is that the bottleneck in autonomous software work is no longer the
 agent's ability to write code. It is everything around the code: who owns what,
 what counts as done, what happens at 3am when a claim expires, whether the
-output is verified or merely self-reported. These are coordination problems,
-and coordination is what software engineering has always built tooling for —
-issue trackers, CI gates, code review, release processes. Agents, so far, have
-mostly bypassed that tooling rather than been governed by it.
+output is verified or merely self-reported — and, above all, whether anything
+in the system owns the decision to keep going. These are coordination
+problems, and coordination is what software engineering has always built
+tooling for — issue trackers, CI gates, code review, release processes.
+Agents, so far, have mostly bypassed that tooling rather than been governed
+by it.
 
 Underwright exists to close that gap. It is not another coding agent. It is
 the control plane that makes *any* coding agent — Claude Code, Codex,
@@ -132,7 +150,9 @@ describing because every step exists to prevent a specific, observed failure:
    where the policy asks for it.
 6. **Work until idle.** After completion the agent reads its inbox, picks
    up the next assigned task, and repeats. The loop terminates only when the
-   board has nothing for it.
+   board has nothing for it. This step is the direct answer to the
+   "reminder" problem: the decision to continue is a rule — keep working
+   while work exists — owned by the system, not by a human typing "go."
 
 ## Autonomy is rule-driven by design
 
