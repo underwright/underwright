@@ -1,15 +1,119 @@
 {
   "dod": {
-    "feature":      { "evidence": ["test_run", "coverage", "review"], "tdd": true, "min_coverage": 80 },
-    "bug":          { "evidence": ["test_run", "review"], "tdd": true },
-    "deploy":       { "evidence": ["deploy", "smoke_test"] },
-    "architecture": { "artifacts": ["design"], "evidence": ["review"] },
-    "docs":         { "evidence": ["review"] },
-    "tdd":          { "evidence": ["test_run"], "tdd": true },
-    "review":       { "artifacts": ["review"] },
-    "default":      { "evidence": ["test_run"] }
+    "feature": {
+      "evidence": [
+        "test_run",
+        "coverage",
+        "review"
+      ],
+      "tdd": true,
+      "min_coverage": 80
+    },
+    "bug": {
+      "evidence": [
+        "test_run",
+        "review"
+      ],
+      "tdd": true
+    },
+    "deploy": {
+      "evidence": [
+        "deploy",
+        "smoke_test"
+      ]
+    },
+    "architecture": {
+      "artifacts": [
+        "design"
+      ],
+      "evidence": [
+        "review"
+      ]
+    },
+    "docs": {
+      "evidence": [
+        "review"
+      ]
+    },
+    "tdd": {
+      "evidence": [
+        "test_run"
+      ],
+      "tdd": true
+    },
+    "review": {
+      "artifacts": [
+        "review"
+      ]
+    },
+    "default": {
+      "evidence": [
+        "test_run"
+      ]
+    }
   },
   "enforcement": "warn",
+  "lifecycle": {
+    "enabled": true,
+    "design_estimates": [
+      "L"
+    ],
+    "pipelines": {}
+  },
+  "sdlc": {
+    "retro": {
+      "enabled": true,
+      "every_days": 7
+    },
+    "grooming": {
+      "enabled": true,
+      "every_minutes": 60,
+      "stale_open_days": 14,
+      "stale_claim_minutes": 120,
+      "reset_estimates": false
+    }
+  },
+  "watch": {
+    "max_inflight": 14,
+    "max_agent_jobs_per_day": 80,
+    "codex_seats": [
+      "/home/alan/.codex-seat-gmail",
+      "/home/alan/.codex-seat-covasant"
+    ],
+    "unblock": {
+      "enabled": true,
+      "stale_hours": 24,
+      "reblock_hours": 12,
+      "escalate_to": "human",
+      "rules": [
+        {
+          "dep_satisfied": true,
+          "action": "reopen",
+          "note": "all dependency blockers done"
+        },
+        {
+          "match": "database is locked",
+          "action": "reopen",
+          "note": "transient sqlite contention"
+        },
+        {
+          "match": "SQLITE_BUSY",
+          "action": "reopen",
+          "note": "transient sqlite contention"
+        },
+        {
+          "match": "claim_task refused",
+          "action": "escalate",
+          "note": "dependency still unmet"
+        },
+        {
+          "match_regex": "5.?hour|quota|rate.?limit|429",
+          "action": "escalate",
+          "note": "quota — needs seat failover or human"
+        }
+      ]
+    }
+  },
   "dor": {
     "require_type": true,
     "require_ac_ids": true,
@@ -18,27 +122,116 @@
   },
   "dispatcher": {
     "enabled": true,
-    "max_tasks_per_agent": 0,
+    "max_tasks_per_agent": 3,
     "idle_minutes": 15,
     "review": {
       "require_different_harness": true,
       "prefer_stronger": true
+    },
+    "node_retry": {
+      "kinds": [
+        "run-script"
+      ],
+      "max_attempts": 2
     }
   },
   "harness_matrix": {
     "agents": {
-      "codex@laptop-2":   { "harness": "codex", "backend": "omnigent" },
-      "claude@minipc":    { "harness": "claude-sdk", "backend": "omnigent" },
-      "grok@alandesktop": { "harness": "grok" },
-      "agy@alandesktop":  { "harness": "agy" },
-      "kimi@alandesktop": { "harness": "kimi" },
-      "cmdc@winbox":      { "harness": "cmdc" }
+      "codex@laptop-2": {
+        "harness": "codex",
+        "backend": "omnigent"
+      },
+      "claude@minipc": {
+        "harness": "claude-sdk",
+        "backend": "omnigent"
+      },
+      "grok@alandesktop": {
+        "harness": "grok"
+      },
+      "agy@alandesktop": {
+        "harness": "agy"
+      },
+      "kimi@alandesktop": {
+        "harness": "kimi"
+      },
+      "cmdc@winbox": {
+        "harness": "cmdc"
+      }
     },
     "coverage": {
       "codex": true,
       "claude-sdk": true,
-      "cmdc": false
-
+      "cmdc": true,
+      "kimi": true,
+      "agy": true,
+      "opencode": true,
+      "pi": true
+    }
+  },
+  "github_status": {
+    "status_comments": true,
+    "digest_hours": 24,
+    "repo": "underwright/underwright"
+  },
+  "model_routing": {
+    "enabled": true,
+    "default_tier": "standard",
+    "rules": [
+      {
+        "type": [
+          "architecture",
+          "design"
+        ],
+        "tier": "heavy"
+      },
+      {
+        "review_kind": [
+          "design"
+        ],
+        "tier": "heavy"
+      },
+      {
+        "estimate": [
+          "L"
+        ],
+        "tier": "heavy"
+      },
+      {
+        "min_ac": 6,
+        "tier": "heavy"
+      },
+      {
+        "paths": [
+          "src/schema.ts",
+          "src/store.ts",
+          "src/pstore.ts"
+        ],
+        "tier": "heavy"
+      },
+      {
+        "estimate": [
+          "S"
+        ],
+        "tier": "light"
+      },
+      {
+        "type": [
+          "docs"
+        ],
+        "tier": "light"
+      }
+    ],
+    "models": {
+      "claude": {
+        "light": "haiku",
+        "standard": "sonnet",
+        "heavy": "opus"
+      },
+      "codex": {
+        "light": "gpt-5.4-mini",
+        "standard": "gpt-5.4",
+        "heavy": "gpt-5.4"
+      }
     }
   }
 }
