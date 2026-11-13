@@ -35,6 +35,24 @@ tasks one agent is given (completions plus active claims; `0` means no cap).
 reassigns that task if it is still unclaimed, or logs `dispatch_idle` when
 nobody else can take it.
 
+## Where work comes from
+
+GitHub issues are the system of truth for work items. Board tasks exist to
+coordinate execution of an issue, not as a separate backlog. Under normal
+flow a board item is a `gh-*` task synced from an issue via
+`underwright github sync` (or the repo webhook). When you discover work that
+has no issue — a bug, a gap, follow-up work — raise it:
+
+1. `gh issue create` in the affected repo with a clear title and scope.
+2. `underwright github sync --repo <owner/name>` to pull it onto the board
+   as a `gh-<n>` task (webhook-synced repos skip this — the task appears on
+   its own).
+3. Claim and work the board task as usual; link the issue in artifacts.
+
+Use `create_task` directly only for board-internal bookkeeping that does not
+belong on the issue tracker (review tasks, probes, ephemeral coordination).
+If in doubt, it belongs on GitHub.
+
 ## Anti-escalation
 
 Escalation is a last resort and goes through the mailbox. Never stop silently.
@@ -45,6 +63,31 @@ Before escalating:
 2. Check artifacts and handoffs already posted on the task. `get_task` returns them.
 3. Try the alternate harness CLI path (claude, codex, grok, agy, or cmdc; see `docs/multi-harness.md`).
 4. If still blocked, `post_artifact` with kind `blocked` recording what was tried, `send_message` the human, then `release_task` so the dispatcher assigns the next task. Read `inbox` and continue. Do not go idle.
+
+**Wrong model for the job?** Agent jobs run at a model tier routed from the
+task (`model_routing` in the policy: estimate S/docs → light, architecture,
+design review, L, or core-store paths → heavy). If the task is beyond your
+model, do not thrash. Post a `blocked` artifact whose content includes
+`needs-stronger-model` and says why, then `release_task`. The watch
+re-dispatches the task one tier heavier. At the heavy tier it goes to the
+human instead.
+
+## Git hygiene
+
+Work happens on branches, never as dirty files on `main`:
+
+1. **Branch before editing.** Work in a `feat/gh-<n>-*` branch or a `uw-*`
+   worktree — never accumulate uncommitted changes in the `main` checkout.
+   `git status` on `main` must be empty when you stop for the day.
+2. **Push when done.** When a task completes, commit and push its branch (or
+   the merge to `main` when that's the flow). Do not leave finished work
+   local-only — an unpushed commit is undelivered work.
+3. **No orphans.** Uncommitted work you're not finishing right now goes to a
+   named branch or a labeled stash with a `post_artifact` noting where it
+   lives. Never leave files dirty on `main` with no record.
+4. **Stale branches are board items.** If you create or find a stale
+   `feat/*`/`worktree-*` branch, note it in a handoff artifact so the
+   hygiene sweep can classify it.
 
 ## Stack
 
