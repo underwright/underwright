@@ -102,7 +102,7 @@ describe("dashboard blocked surface", () => {
     expect(html).toContain('<tr class="blocked">');
     const events = html.split("Recent events")[1] ?? "";
     expect(events).toContain('<tr class="blocked">');
-    expect(events).toContain("<tr><td>2026-01-01</td>");
+    expect(events).toContain('<tr><td data-label="Time">2026-01-01</td>');
   });
 });
 

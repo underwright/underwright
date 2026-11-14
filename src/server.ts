@@ -10,8 +10,13 @@ import { openStore } from "./store.js";
 import type { IStore } from "./istore.js";
 import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
-import { handleDashboardRequest } from "./dashboard.js";
+import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
+
+const isDashboardPath = (path: string | undefined): boolean => {
+  const p = (path ?? "").split("?")[0];
+  return p === "/" || /^\/(board|task|inbox|tasks|messages|chat|login|logout)(\/|$)/.test(p);
+};
 
 // cli.ts reaches the store through this module so the edge stays cli → server → store.
 export { openStore };
@@ -376,12 +381,22 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       res.writeHead(400).end();
       return;
     }
-    if (/^\/(board|task|inbox|tasks|messages)(\/|$)/.test(url.pathname) || url.pathname === "/") {
-      const authorized = !token
-        || req.headers.authorization === `Bearer ${token}`
-        || url.searchParams.get("token") === token;
-      if (!authorized) {
+    if (isDashboardPath(url.pathname)) {
+      if (url.pathname === "/logout") {
+        res.writeHead(303, { location: "/board", "set-cookie": `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0` }).end();
+        return;
+      }
+      const auth = dashboardAuth(token, req.headers, url);
+      if (!auth.ok) {
         res.writeHead(401, { "www-authenticate": "Bearer" }).end('{"error":"unauthorized"}');
+        return;
+      }
+      if (url.pathname === "/login") {
+        // Trade ?token= for a session cookie so phone bookmarks/QR links stay token-free afterwards.
+        const secure = req.headers["x-forwarded-proto"] === "https" || Boolean((req.socket as { encrypted?: boolean }).encrypted);
+        const headers: Record<string, string> = { location: "/board", "cache-control": "no-store" };
+        if (token) headers["set-cookie"] = sessionCookie(token, secure);
+        res.writeHead(303, headers).end();
         return;
       }
       let body = new URLSearchParams();
