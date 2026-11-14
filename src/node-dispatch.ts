@@ -33,6 +33,14 @@ export interface DispatchMeta {
   skipped: Partial<Record<SkipReason, number>>;
 }
 
+/** Flatten skip counters into telemetry attrs (skip_no_workspace: 2, …). */
+export function matchAttrs(meta: DispatchMeta & { formed?: boolean }): Record<string, number | boolean> {
+  const out: Record<string, number | boolean> = { eligible: meta.eligible, considered: meta.considered };
+  for (const [k, v] of Object.entries(meta.skipped)) out[`skip_${k}`] = v as number;
+  if (meta.formed !== undefined) out.formed = meta.formed;
+  return out;
+}
+
 /** "owner/repo" from a GitHub spec_ref URL; null for non-URL refs. */
 export function repoFromSpecRef(specRef: string | null | undefined): string | null {
   if (!specRef) return null;

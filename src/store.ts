@@ -4,7 +4,8 @@ import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
@@ -136,7 +137,7 @@ export class SqliteStore implements IStore {
 
   listNodes(): any[] {
     const now = Date.now();
-    const rows = this.nodeQuery(`SELECT n.id,n.name,n.state,n.policy_json,n.created_at,n.last_seen_at,n.session_expires_at,
+    const rows = this.nodeQuery(`SELECT n.id,n.name,n.state,n.policy_json,n.created_at,n.last_seen_at,n.last_poll_at,n.session_expires_at,
       n.capabilities_json,n.capabilities_version,n.capabilities_observed_at,
       (SELECT id FROM jobs j WHERE j.type='node' AND j.target_node_id=n.id AND j.status='running' LIMIT 1) AS current_job_id
       FROM nodes n ORDER BY n.created_at DESC LIMIT 1000`);
@@ -338,7 +339,7 @@ export class SqliteStore implements IStore {
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
-      s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+      s.nodeQuery("UPDATE nodes SET last_seen_at=?, last_poll_at=? WHERE id=?", [now, now, principal.node_id]);
       const node = (s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1. Running
@@ -363,7 +364,10 @@ export class SqliteStore implements IStore {
         // board tasks to this node's live capabilities and form one.
         const meta = this.dispatchToNode(s, principal.node_id, node, now);
         if (meta.formed) queued = (s.nodeQuery(queuedSql, [principal.node_id]))[0];
-        if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+        if (!queued) {
+          telemetry().event("node.poll", { node_id: principal.node_id, outcome: "empty", held: !!held, ...matchAttrs(meta) });
+          return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+        }
       }
       if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
       let spec: any = {};
@@ -397,9 +401,10 @@ export class SqliteStore implements IStore {
    *  pollers lose the live_job check and skip. Returns match metadata so empty
    *  polls can explain starvation. */
   private dispatchToNode(s: SqliteStore, nodeId: string, node: any, now: string): DispatchMeta & { formed: boolean } {
+    const span = telemetry().span("dispatch.match", { node_id: nodeId, node: node.name ?? nodeId });
     const meta: DispatchMeta & { formed: boolean } = { formed: false, eligible: 0, considered: 0, skipped: {} };
     const dispatch = getDispatchPolicy();
-    if (!dispatch.enabled) return meta;
+    if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
     const candidates = s.nodeQuery(
       `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
@@ -453,8 +458,10 @@ export class SqliteStore implements IStore {
         harness: m.harness, tier: m.tier, model: m.model ?? null, workspace: m.workspace,
       });
       meta.formed = true;
+      span.end("ok", undefined, { ...matchAttrs(meta), task_id: task.id, harness: m.harness, tier: m.tier, model: m.model ?? null, job_id: id });
       return meta;
     }
+    span.end("ok", undefined, matchAttrs(meta));
     return meta;
   }
 
@@ -556,9 +563,9 @@ export class SqliteStore implements IStore {
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
     this.db.exec(SCHEMA);
+    this.db.exec(NODES_SCHEMA);   // before migrate: v10 alters nodes
     this.migrate();
     this.db.exec(JOBS_INDEXES);
-    this.db.exec(NODES_SCHEMA);
   }
 
   /** Schema versioning via PRAGMA user_version. */
@@ -675,6 +682,15 @@ export class SqliteStore implements IStore {
       if (!cols.has("review_kind")) this.db.exec("ALTER TABLE tasks ADD COLUMN review_kind TEXT;");
       this.db.exec("CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of);");
       this.db.exec("PRAGMA user_version = 9;");
+    }
+    if (v < 10) {
+      // v10: gh-136 — poll liveness distinct from generic last_seen_at so
+      // "heartbeating but not polling" is a queryable condition.
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('nodes')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("last_poll_at")) this.db.exec("ALTER TABLE nodes ADD COLUMN last_poll_at TEXT;");
+      this.db.exec("PRAGMA user_version = 10;");
     }
   }
 

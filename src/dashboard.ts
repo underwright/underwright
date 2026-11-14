@@ -185,6 +185,9 @@ td code{color:#7dd3fc}
 tr.blocked{background:#3a2416}
 tr.blocked td,tr.blocked .title{color:#f6c27a}
 .badge-blocked{display:inline-block;margin-left:6px;padding:0 6px;border:1px solid #a16207;border-radius:999px;color:#f6c27a;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
+.poll-silent{color:#f87171;font-weight:600}
+.poll-ok{color:#4ade80}
+.muted{color:#6f7a89}
 ${MOBILE_CSS}
 </style>
 </head>
@@ -224,6 +227,10 @@ ${section("Nodes", nodes, [
   { label: "State", render: field("state") },
   { label: "Liveness", render: field("liveness") },
   { label: "Last heartbeat", render: field("last_seen_at", "—") },
+  { label: "Poll", render: (n) => {
+    const cls = n.poll_liveness === 'silent' ? 'poll-silent' : n.poll_liveness === 'polling' ? 'poll-ok' : 'muted';
+    return `<span class="${cls}">${escapeHtml(n.poll_liveness ?? 'unknown')}</span> <span class="muted">${escapeHtml(n.last_poll_at ?? '—')}</span>`;
+  } },
   { label: "Current job", render: field("current_job_id", "—") },
   { label: "Capabilities", render: field("capabilities_freshness") },
   { label: "Harnesses", render: (n) => escapeHtml((n.harnesses ?? []).map((h: any) => h.id).join(", ") || "—") },

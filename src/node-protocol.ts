@@ -116,8 +116,17 @@ export function nodePresence(lastSeenAt: unknown, now = Date.now()) {
 }
 export function projectNode(node: any, now = Date.now()) {
   const last_seen_at = isoTimestamp(node.last_seen_at);
+  const last_poll_at = isoTimestamp(node.last_poll_at);
   const capabilities_observed_at = isoTimestamp(node.capabilities_observed_at);
   const presence = nodePresence(last_seen_at, now);
+  // gh-136: heartbeat alive + poll silent is the wedge shape — surface it as
+  // its own signal instead of conflating with generic liveness.
+  const pollAge = last_poll_at ? now - Date.parse(last_poll_at) : Number.POSITIVE_INFINITY;
+  const seenAge = last_seen_at ? now - Date.parse(last_seen_at) : Number.POSITIVE_INFINITY;
+  const poll_liveness = !last_poll_at ? 'unknown'
+    : pollAge <= NODE_STALE_MS ? 'polling'
+    : seenAge <= NODE_ONLINE_MS ? 'silent'   // heartbeating but not polling — wedge
+    : presence;
   const liveness = node.state === 'revoked' ? 'revoked' : node.state === 'draining' ? `draining:${presence}` : presence;
   const capAge = capabilities_observed_at ? now - Date.parse(capabilities_observed_at) : Number.POSITIVE_INFINITY;
   const capabilities_freshness = !capabilities_observed_at ? 'unknown' : capAge <= NODE_STALE_MS ? 'fresh' : 'stale';
@@ -131,6 +140,7 @@ export function projectNode(node: any, now = Date.now()) {
   return {
     id: node.id, name: node.name, state: node.state, liveness,
     last_seen_at, last_heartbeat_age_ms: last_seen_at ? now - Date.parse(last_seen_at) : null,
+    last_poll_at, poll_liveness,
     current_job_id: node.current_job_id ?? null,
     capabilities_version: node.capabilities_version ?? 0,
     capabilities_freshness, capabilities_observed_at,

@@ -4,7 +4,8 @@ import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
@@ -226,7 +227,7 @@ export class PgStore implements IStore {
 
   async listNodes(): Promise<any[]> {
     const now = Date.now();
-    const rows = await this.nodeQuery(`SELECT n.id,n.name,n.state,n.policy_json,n.created_at,n.last_seen_at,n.session_expires_at,
+    const rows = await this.nodeQuery(`SELECT n.id,n.name,n.state,n.policy_json,n.created_at,n.last_seen_at,n.last_poll_at,n.session_expires_at,
       n.capabilities_json,n.capabilities_version,n.capabilities_observed_at,
       (SELECT id FROM jobs j WHERE j.type='node' AND j.target_node_id=n.id AND j.status='running' LIMIT 1) AS current_job_id
       FROM nodes n ORDER BY n.created_at DESC LIMIT 1000`);
@@ -435,7 +436,7 @@ export class PgStore implements IStore {
     if ("error" in principal) return principal;
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
-      await s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [new Date().toISOString(), principal.node_id]);
+      await s.nodeQuery("UPDATE nodes SET last_seen_at=now(), last_poll_at=now() WHERE id=?", [principal.node_id]);
       const node = (await s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1.
@@ -457,7 +458,10 @@ export class PgStore implements IStore {
         // gh-126 pull-through dispatch: match eligible tasks to this node.
         const meta = await s.dispatchToNode(principal.node_id, node);
         if (meta.formed) queued = (await s.nodeQuery(queuedSql, [principal.node_id]))[0];
-        if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+        if (!queued) {
+          telemetry().event("node.poll", { node_id: principal.node_id, outcome: "empty", held: !!held, ...matchAttrs(meta) });
+          return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+        }
       }
       if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
       let spec: any = queued.node_spec;
@@ -490,9 +494,10 @@ export class PgStore implements IStore {
   /** gh-126 pull-through dispatch — pg twin of SqliteStore.dispatchToNode.
    *  Postgres `?` placeholders translate to $n in nodeQuery. */
   private async dispatchToNode(nodeId: string, node: any): Promise<DispatchMeta & { formed: boolean }> {
+    const span = telemetry().span("dispatch.match", { node_id: nodeId, node: node.name ?? nodeId });
     const meta: DispatchMeta & { formed: boolean } = { formed: false, eligible: 0, considered: 0, skipped: {} };
     const dispatch = getDispatchPolicy();
-    if (!dispatch.enabled) return meta;
+    if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
     const candidates = (await this.nodeQuery(
       `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
@@ -541,8 +546,10 @@ export class PgStore implements IStore {
         harness: m.harness, tier: m.tier, model: m.model ?? null, workspace: m.workspace,
       });
       meta.formed = true;
+      span.end("ok", undefined, { ...matchAttrs(meta), task_id: task.id, harness: m.harness, tier: m.tier, model: m.model ?? null, job_id: id });
       return meta;
     }
+    span.end("ok", undefined, matchAttrs(meta));
     return meta;
   }
 
@@ -666,6 +673,7 @@ export class PgStore implements IStore {
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_of TEXT`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_kind TEXT`;
+    await sql`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS last_poll_at TEXT`;
     await sql`CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of)`;
     return new PgStore(sql);
   }
