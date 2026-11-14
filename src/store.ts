@@ -871,6 +871,14 @@ export class SqliteStore implements IStore {
     return rows;
   }
 
+  conversation(a: string, b: string, limit = 200) {
+    const rows = this.db.prepare(
+      `SELECT * FROM messages WHERE (to_agent=? AND from_agent=?) OR (to_agent=? AND from_agent=?)
+       ORDER BY id DESC LIMIT ?`,
+    ).all(a, b, b, a, Math.max(1, Math.min(1000, Math.floor(limit)))) as any[];
+    return rows.reverse();
+  }
+
   watchTask(agentId: string, taskId: string) {
     this.db.prepare("INSERT OR IGNORE INTO watches (agent_id, task_id) VALUES (?,?)").run(agentId, taskId);
     this.log("watch", taskId, "watching", agentId);

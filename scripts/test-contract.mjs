@@ -75,8 +75,9 @@ async function matrix(token) {
       assert.equal((await request('/')).status, 200);
     }
     const authedPost = { method: 'POST', ...(token ? { headers: { authorization: `Bearer ${token}` } } : {}) };
-    assert.equal((await request('/board', authedPost)).status, 405);
-    assert.equal((await request('/', authedPost)).status, 405);
+    // Dashboard pages accept POSTs for form actions; an unrecognized action is a 404, not a method error.
+    assert.equal((await request('/board', authedPost)).status, 404);
+    assert.equal((await request('/', authedPost)).status, 404);
     const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream',
       ...(token ? { authorization: `Bearer ${token}` } : {}) };
     if (token) {
@@ -205,7 +206,8 @@ async function matrix(token) {
     assert.equal((await call('release_task', { task_id, agent_id: agent })).released, task_id);
     assert.equal((await call('get_task', { task_id })).status, 'open');
     await call('claim_task', { task_id, agent_id: agent });
-
+    await call('record_progress', { task_id, agent_id: agent, status: 'progress',
+      summary: 'contract progress', operation_id: 'contract-op-1' });
     const resources = ['contract/resource.ts'];
     assert.deepEqual(await call('check_locks', { resources }), []);
     assert.deepEqual((await call('claim_resources', { resources, agent_id: agent, task_id })).claimed, resources);
@@ -320,7 +322,9 @@ async function matrix(token) {
     assert.equal(digest.sent_to, other);
     assert(digest.counts.tasks_completed >= 1);
     assert.match(digest.summary, new RegExp(task_id));
-    const dashAfter = await (await request(dashPath)).text();
+    // The completed task only appears with an explicit non-active status filter.
+    const dashAll = `${dashPath}${dashPath.includes('?') ? '&' : '?'}status=all`;
+    const dashAfter = await (await request(dashAll)).text();
     assert.match(dashAfter, /Updated HTTP matrix/);
     assert.match(dashAfter, /queued/);
     assert.deepEqual([...exercised].sort(), listed.tools.map(t => t.name).sort(),
