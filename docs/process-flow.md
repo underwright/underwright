@@ -112,19 +112,19 @@ sequenceDiagram
     end
 
     opt job returned
-      D->>S: POST /nodes/v1/jobs/{id}/worker → scoped worker credential
+      D->>S: POST /nodes/v1/jobs/{id}/worker - scoped worker credential
       D->>H: spawn executor with the job spec
       loop while executing — lease timer
         D->>S: POST /nodes/v1/jobs/{id}/renew (lease_token)
       end
       H-->>D: outcome (done | failed, result, metadata)
       D->>S: POST /nodes/v1/jobs/{id}/finish
-      S->>B: job closed → task status / evidence → dependents unblocked → next match
+      S->>B: job closed - task status, evidence, dependents unblocked, next match
       S-->>D: finish receipt
     end
   end
 
-  Note over D: crash/restart → journal replay; outcome_unknown never auto-replays
+  Note over D: crash or restart replays journal — outcome_unknown never auto-replays
 ```
 
 The poll handler runs the match — there is no separate producer daemon:
