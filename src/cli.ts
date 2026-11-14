@@ -160,7 +160,18 @@ switch (cmd) {
         } else if (sub === "attest") {
           save(attestHarnesses(load()));
           console.log(`attested harnesses in ${configPath} (auth_status stays operator-set)`);
-        } else throw new Error("usage: underwright node config validate|init|set|add|remove|attest [--config FILE]");
+        } else if (sub === "set-auth") {
+          const [id, status] = args.slice(2);
+          if (!id || !["ready", "unknown", "error", "expired"].includes(status)) throw new Error("set-auth HARNESS_ID ready|unknown|error|expired");
+          const config = attestHarnesses(load());
+          const hs = ((config as any).inventory?.harnesses ?? []) as any[];
+          const h = hs.find((x) => x.id === id);
+          if (!h) throw new Error(`harness ${id} not configured — 'node config add harness ${id} --exec PATH' first`);
+          if (status === "ready" && !h.installed) throw new Error(`harness ${id} does not resolve — fix its executable before marking ready`);
+          h.auth_status = status;
+          save(config);
+          console.log(`${id} auth_status = ${status}`);
+        } else throw new Error("usage: underwright node config validate|init|set|add|remove|attest|set-auth [--config FILE]");
       } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run | node config <cmd>");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;
@@ -365,7 +376,7 @@ Usage:
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
   underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
-  underwright node config        Manage node-executors.json: validate|init|set|add|remove|attest
+  underwright node config        Manage node-executors.json: validate|init|set|add|remove|attest|set-auth
                                  [--config FILE] (default ~/.config/underwright/node-executors.json).
   underwright service install    Install a systemd unit for autostart on reboot:
                                  [serve|node|run|runner] [--http H:P] [--config FILE]
