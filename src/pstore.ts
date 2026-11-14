@@ -504,6 +504,12 @@ export class PgStore implements IStore {
     const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json || "{}") : node.policy_json;
     const capsJson = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
     const now = new Date().toISOString();
+    const avoid = new Set(
+      ((await this.nodeQuery(
+        "SELECT agent_id FROM jobs WHERE type='node' AND target_node_id=? AND dedupe_key LIKE 'dispatch:%' AND status='failed' AND finished_at > now() - interval '15 minutes'",
+        [nodeId],
+      )) as Array<{ agent_id: string }>).map(r => r.agent_id.split("@")[0]),
+    );
     for (const task of candidates) {
       meta.considered++;
       if ((await this.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
@@ -515,7 +521,7 @@ export class PgStore implements IStore {
         policy,
         capabilitiesJson: capsJson,
         capabilitiesObservedAt: node.capabilities_observed_at,
-      }, dispatch, routing, Date.parse(now));
+      }, dispatch, routing, Date.parse(now), avoid);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
       const id = `job-${randomUUID().slice(0, 8)}`;

@@ -116,12 +116,14 @@ export function matchTaskToNode(
   dispatch = getDispatchPolicy(),
   routing = getModelRouting(loadPolicy()),
   now = Date.now(),
+  avoidHarnesses: ReadonlySet<string> = new Set(),
 ): { match: DispatchMatch } | { skip: SkipReason } {
   const workspace = workspaceForTask(task, dispatch.workspaces, dispatch.default_workspace);
   if (!workspace || !((node.policy as { workspace_ids?: string[] })?.workspace_ids ?? []).includes(workspace)) {
     return { skip: "no_workspace" };
   }
-  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now);
+  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now)
+    .filter(h => !avoidHarnesses.has(h));
   // Model args only ship to daemons that attest launch-model-flag — older
   // strict payload schemas reject unknown keys ("invalid task parameters").
   const modelFlagOk = (() => {
