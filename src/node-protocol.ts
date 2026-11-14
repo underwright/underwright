@@ -98,6 +98,9 @@ export const nodeInventorySchema = z.object({
   max_concurrency: z.number().int().min(1).max(NODE_MAX_CONCURRENCY).default(1),
   current_slots: z.number().int().min(0).max(NODE_MAX_CONCURRENCY).default(0),
   harnesses: z.array(nodeHarnessSchema).max(16).default([]),
+  /** Optional feature tokens the daemon supports — lets the server ship newer
+   *  spec fields only to daemons that can parse them (e.g. "launch-model-flag"). */
+  features: z.array(z.string().max(64)).max(32).default([]),
 }).strict();
 export const nodeCapabilitiesSchema = z.object({
   session_id: z.string().min(1).max(64),
