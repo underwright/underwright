@@ -162,15 +162,28 @@ switch (cmd) {
           console.log(`attested harnesses in ${configPath} (auth_status stays operator-set)`);
         } else if (sub === "set-auth") {
           const [id, status] = args.slice(2);
-          if (!id || !["ready", "unknown", "error", "expired"].includes(status)) throw new Error("set-auth HARNESS_ID ready|unknown|error|expired");
+          if (!id || !["ready", "missing", "unknown"].includes(status)) throw new Error("set-auth HARNESS_ID ready|missing|unknown [--quota available|exhausted|unknown] [--resets ISO|+Nm|+Nh|+Nd]");
+          const quota = flag("quota");
+          if (quota && !["available", "exhausted", "unknown"].includes(quota)) throw new Error("--quota must be available|exhausted|unknown");
+          const resets = flag("resets");
+          let resetsAt: string | undefined;
+          if (resets) {
+            const rel = resets.match(/^\+(\d+)(m|h|d)$/);
+            const ts = rel
+              ? Date.now() + Number(rel[1]) * ({ m: 60_000, h: 3_600_000, d: 86_400_000 } as const)[rel[2] as "m" | "h" | "d"]
+              : Date.parse(resets);
+            if (!Number.isFinite(ts)) throw new Error("--resets must be an ISO timestamp or relative like +9h, +30m, +2d");
+            resetsAt = new Date(ts).toISOString();
+          }
           const config = attestHarnesses(load());
           const hs = ((config as any).inventory?.harnesses ?? []) as any[];
           const h = hs.find((x) => x.id === id);
           if (!h) throw new Error(`harness ${id} not configured — 'node config add harness ${id} --exec PATH' first`);
           if (status === "ready" && !h.installed) throw new Error(`harness ${id} does not resolve — fix its executable before marking ready`);
           h.auth_status = status;
+          if (quota || resetsAt) h.quota = { ...(h.quota ?? {}), ...(quota ? { state: quota } : {}), ...(resetsAt ? { resets_at: resetsAt } : {}), observed_at: new Date().toISOString() };
           save(config);
-          console.log(`${id} auth_status = ${status}`);
+          console.log(`${id} auth_status = ${status}${quota ? ` quota = ${quota}` : ""}${resetsAt ? ` resets_at = ${resetsAt}` : ""}`);
         } else throw new Error("usage: underwright node config validate|init|set|add|remove|attest|set-auth [--config FILE]");
       } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run | node config <cmd>");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
