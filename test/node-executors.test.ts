@@ -125,3 +125,14 @@ it('runOnce aborts its process and refuses stale finish when transport renewal i
   await expect(reg.runOnce(transport)).rejects.toThrow('lease lost');
   expect(finishes).toBe(0);
 });
+
+it('model flag precedes config args so flag-value pairs stay adjacent to the prompt', async () => {
+  const { cfg, policy } = setup();
+  // grok-style: `--single` expects its value next; inserting the model flag
+  // between it and the prompt (--single -m X <prompt>) orphans the flag.
+  cfg.harnesses = { groklike: { executable: '/bin/echo', args: ['--single'] } };
+  const r = await createExecutorRegistry(policy, cfg).execute(
+    task('launch-agent', { workspace_id: 'w1', harness: 'groklike', prompt: 'PROMPT-XYZ', model: 'grok-4.7', model_flag: '-m' }));
+  expect(r.status).toBe('done');
+  expect(r.result.trim()).toBe('-m grok-4.7 --single PROMPT-XYZ');
+});

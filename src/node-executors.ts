@@ -100,9 +100,11 @@ export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig
     case 'launch-agent': {
       const h = approved(cfg.harnesses, p.harness, 'harness');
       // gh-126: dispatch may pin a concrete model; the flag is shipped in the
-      // payload (model_routing.flags) and inserted before the prompt.
+      // payload (model_routing.flags). It goes BEFORE the config args — between
+      // them and the prompt it would split pairs like `--single <prompt>` whose
+      // value must stay adjacent to its flag.
       const modelArgs = p.model && p.model_flag ? [p.model_flag, p.model] : [];
-      return { executable: h.executable, args: [...(h.args ?? []), ...modelArgs, p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
+      return { executable: h.executable, args: [...modelArgs, ...(h.args ?? []), p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
     }
     case 'provision': {
       if (!(policy.repository_ids ?? []).includes(p.repository_id)) throw new PolicyError(`repository ${p.repository_id} not approved`);
