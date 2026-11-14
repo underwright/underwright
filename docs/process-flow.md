@@ -70,6 +70,36 @@ quota signatures (`codex_seats`).
 seat fields, `harness_matrix` (which agent runs which backend; omnigent
 coverage table decides `omni run` vs raw CLI).
 
+#### Node execution — pull-through dispatch 📐 (gh-126)
+
+Nodes are pullers, not push targets. The daemon's lifecycle on every host:
+
+```
+connect/re-auth session → attest capabilities (vendors, slots, quota state)
+   → per-slot long-poll  POST /nodes/v1/poll { held_job_ids, wait:25s }
+   → execute matched job → finish/renew → repeat
+```
+
+The poll handler runs the match — there is no separate producer daemon:
+
+```
+/nodes/v1/poll → 1. pre-queued job for this node? → return it
+                 2. else eligible_tasks × node capability → form job → return
+                 3. else long-poll wait, re-evaluate on wake
+```
+
+Eligibility is maintained by synchronous hooks (task→open, last blocker
+done, quota transitions); the **match** runs at pull time against the
+polling node's live state — attested vendors, free slot, per-harness quota,
+node policy allowlist. The job spec emitted carries **task + vendor +
+concrete model + prompt**, which is both the dispatch decision and the
+usage-attribution key (gh-61). Match metadata explains starvation
+("3 eligible, 2 need cline, 1 quota-exhausted") instead of returning empty.
+
+Today only stages 1 and 3 exist — `submit_node_task`/`submit_job` are the
+sole producers, so an empty queue stays empty (observed: reconnected node
+with 8 slots pulling nothing while the board held 89 open tasks).
+
 ### 5. Work — claim, context, build ✅
 
 The agent claims (lease, not flag — renews, expires, gets reclaimed),
@@ -144,7 +174,7 @@ evidence-gate comment), post status comments + digests
 |---|---|
 | `underwright` | control plane: MCP `:8741/mcp`, board `:8741/board`, webhook, in-process sweeper, GitHub status loop |
 | `underwright-runner` | pulls queued agent jobs, spawns `omni run`/raw CLI, renews lease, posts result |
-| `underwright-node` | polls `/nodes/v1`, runs node-kind jobs on this host |
+| `underwright-node` | session → capability attest (60s) → heartbeat (15s) → per-slot long-poll `/nodes/v1/poll`; executes matched jobs |
 | `underwright-watch.timer` / `underwright-daily.timer` | the alongside loops above |
 
 ## Customization reference — the whole policy surface
