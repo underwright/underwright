@@ -45,16 +45,22 @@ it("records idempotent progress events, validates writer, and surfaces on get_ta
   expect(task.ledger[0].summary).toBe("halfway");
 });
 
-it("worker-scoped record_progress auto-fills task, agent, job and attempt (gh-112)", async () => {
-  const { store } = fixture();
+function nodeFixture(store: any) {
   const secret = randomBytes(32).toString("hex");
   const e = store.createNodeEnrollment({ version: 1, name: "n1", device_secret_hash: hash(secret), platform: "linux", arch: "x64" });
   store.approveNodeEnrollment(e.id, e.code, { allowed_task_types: ["launch-agent"], workspace_ids: ["w"] }, "admin");
   const issued = store.exchangeNodeEnrollment(e.id, secret);
-  store.createTask({ id: "t1", title: "agent task" });
   const session = store.startNodeSession(issued.token);
   store.putNodeCapabilities(issued.token, session.session_id, 1, { protocol_version: 1, harnesses: [{ id: "codex", installed: true, auth_status: "ready", quota: { state: "available" } }] });
-  store.submitNodeTask({ task_id: "t1", agent_id: "worker-1", target_node_id: issued.node_id, node_spec: { version: 1, kind: "launch-agent", workspace_id: "w", payload: { workspace_id: "w", harness: "codex", prompt: "go" } } });
+  return { issued, session };
+}
+const launchSpec = { version: 1, kind: "launch-agent", workspace_id: "w", payload: { workspace_id: "w", harness: "codex", prompt: "go" } };
+
+it("worker-scoped record_progress auto-fills task, agent, job and attempt (gh-112)", async () => {
+  const { store } = fixture();
+  const { issued, session } = nodeFixture(store);
+  store.createTask({ id: "t1", title: "agent task" });
+  store.submitNodeTask({ task_id: "t1", agent_id: "worker-1", target_node_id: issued.node_id, node_spec: launchSpec });
   const job = await store.pollNodeJob(issued.token, session.session_id, 0);
   const worker = store.issueNodeWorker(issued.token, session.session_id, job.id, job.lease_token);
   const row = store.workerTool(worker.token, "record_progress", { status: "progress", summary: "mid-run", operation_id: "op-w1" });
@@ -65,4 +71,22 @@ it("worker-scoped record_progress auto-fills task, agent, job and attempt (gh-11
   expect(row.attempt_id).toBe(job.attempt_id);
   // The admin surface sees the same event.
   expect(store.listLedger("t1")[0].summary).toBe("mid-run");
+});
+
+it("retry_of prepends prior ledger events to the launch prompt (gh-112)", async () => {
+  const { store } = fixture();
+  const { issued } = nodeFixture(store);
+  store.createTask({ id: "t1", title: "agent task" });
+  store.recordProgress({ task_id: "t1", agent_id: "a1", status: "started", summary: "began work" });
+  store.recordProgress({ task_id: "t1", agent_id: "a1", status: "blocked", summary: "needs schema fix" });
+  const first = store.submitNodeTask({ task_id: "t1", agent_id: "worker-1", target_node_id: issued.node_id, node_spec: launchSpec });
+  expect(first.id).toBeDefined();
+  store.nodeQuery("UPDATE jobs SET status='done' WHERE id=?", [first.id]);
+  const retry = store.submitNodeTask({ task_id: "t1", agent_id: "worker-2", target_node_id: issued.node_id, node_spec: launchSpec, retry_of: first.id });
+  const stored = store.nodeQuery("SELECT node_spec FROM jobs WHERE id=?", [retry.id])[0];
+  const prompt = JSON.parse(stored.node_spec).payload.prompt;
+  expect(prompt).toContain("Prior ledger for t1");
+  expect(prompt).toContain("[started] began work");
+  expect(prompt).toContain("[blocked] needs schema fix");
+  expect(prompt.endsWith("go")).toBe(true);
 });

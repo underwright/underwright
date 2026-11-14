@@ -207,6 +207,13 @@ export class SqliteStore implements IStore {
       if (args.retry_of) {
         const prior = (s.nodeQuery("SELECT id FROM jobs WHERE id=? AND type='node'", [args.retry_of]))[0];
         if (!prior) return nodeError("retry_of not found", 404);
+        if (spec.kind === 'launch-agent' && args.task_id) {
+          const priorEvents = (s.nodeQuery("SELECT status,summary FROM task_ledger WHERE task_id=? ORDER BY rowid DESC LIMIT 20", [args.task_id]) as any[]).reverse();
+          if (priorEvents.length) spec.payload.prompt =
+            `Prior ledger for ${args.task_id} (continue from it, do not restart): ` +
+            priorEvents.map(e => `[${e.status}] ${e.summary}`).join(' | ') +
+            '\n\n' + spec.payload.prompt;
+        }
       }
       const dedupe = spec.kind === 'launch-agent' ? 'launch:' + nodeHash(args.task_id + ':' + args.agent_id) : args.dedupe_key ?? spec.idempotency_key ?? null;
       if (dedupe) {
