@@ -231,7 +231,21 @@
         "light": "gpt-5.4-mini",
         "standard": "gpt-5.4",
         "heavy": "gpt-5.4"
+      },
+      "grok": {
+        "light": "grok-4.7-build-fast",
+        "standard": "grok-4.7",
+        "heavy": "grok-4.7"
+      },
+      "cursor": {
+        "light": "gpt-5.3-codex-low",
+        "standard": "composer-2.5",
+        "heavy": "claude-sonnet-5-thinking-high"
       }
+    },
+    "flags": {
+      "grok": "-m",
+      "cursor": "--model"
     }
   }
 }
