@@ -238,9 +238,9 @@
         "heavy": "grok-4.7"
       },
       "cursor": {
-        "light": "gpt-5.3-codex-low",
+        "light": "gpt-5.4-nano",
         "standard": "composer-2.5",
-        "heavy": "claude-sonnet-5-thinking-high"
+        "heavy": "claude-opus-5"
       }
     },
     "flags": {
