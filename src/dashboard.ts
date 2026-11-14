@@ -266,6 +266,9 @@ export async function handleDashboardRequest(store: any, method: string, url: UR
       if (result?.error) return { error: result.error, status: 409 };
       return back(`/task/${id}`);
     }
+    if (path === "/" || path === "/board" || /^\/(task|inbox)\//.test(path)) {
+      return { error: "method not allowed", status: 405 };
+    }
     return { error: "unknown action", status: 404 };
   }
   if (path === "/" || path === "/board") {
