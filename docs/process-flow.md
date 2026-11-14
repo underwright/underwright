@@ -74,10 +74,57 @@ coverage table decides `omni run` vs raw CLI).
 
 Nodes are pullers, not push targets. The daemon's lifecycle on every host:
 
-```
-connect/re-auth session → attest capabilities (vendors, slots, quota state)
-   → per-slot long-poll  POST /nodes/v1/poll { held_job_ids, wait:25s }
-   → execute matched job → finish/renew → repeat
+```mermaid
+sequenceDiagram
+  autonumber
+  participant D as Node daemon
+  participant S as Control plane :8741
+  participant B as Board / store
+  participant H as Harness (omni / CLI)
+
+  Note over D,S: Enrollment — once per credential
+  D->>S: POST /nodes/enroll (name, --allow-insecure)
+  S-->>D: enrollment id + compare code
+  Note over S: operator approves on the board
+  D->>S: POST /nodes/redeem
+  S-->>D: node credential (~/.local/state/underwright/node)
+
+  Note over D,B: Session — re-auth on expiry/401, never exits (gh-110)
+  D->>S: POST /nodes/v1/session
+  S-->>D: session_id + expiry
+  D->>S: PUT /nodes/v1/capabilities (vendors, slots, quota state)
+  loop every 15 s
+    D->>S: POST /nodes/v1/heartbeat (active_job_id, phase)
+  end
+  loop every 60 s
+    D->>S: PUT /nodes/v1/capabilities (version++)
+  end
+
+  loop per concurrency slot — staggered starts
+    D->>S: POST /nodes/v1/poll { held_job_ids, wait: 25s }
+    alt pre-queued job for this node
+      S-->>D: job { id, lease_token, spec }
+    else eligible tasks × node capability — pull-through match 📐 gh-126
+      S->>B: open + DoR + blockers done vs vendors / slots / quota / policy
+      S-->>D: formed job (task + vendor + model + prompt)
+    else nothing eligible
+      S-->>D: hold until wait_seconds, then empty
+    end
+
+    opt job returned
+      D->>S: POST /nodes/v1/jobs/{id}/worker → scoped worker credential
+      D->>H: spawn executor with the job spec
+      loop while executing — lease timer
+        D->>S: POST /nodes/v1/jobs/{id}/renew (lease_token)
+      end
+      H-->>D: outcome (done | failed, result, metadata)
+      D->>S: POST /nodes/v1/jobs/{id}/finish
+      S->>B: job closed → task status / evidence → dependents unblocked → next match
+      S-->>D: finish receipt
+    end
+  end
+
+  Note over D: crash/restart → journal replay; outcome_unknown never auto-replays
 ```
 
 The poll handler runs the match — there is no separate producer daemon:
