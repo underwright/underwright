@@ -399,7 +399,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
         res.writeHead(result.status ?? 400, { "content-type": "application/json" }).end(JSON.stringify({ error: result.error }));
         return;
       }
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }).end(result.html);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-underwright-dashboard": "interactive" }).end(result.html);
       return;
     }
     res.writeHead(404).end();
