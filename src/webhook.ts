@@ -9,6 +9,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { IStore } from "./istore.js";
+import { evidencePack } from "./evidence-pack.js";
 
 export const WEBHOOK_PATH = "/github/webhook";
 export const WEBHOOK_SECRET_ENV = "UNDERWRIGHT_GITHUB_WEBHOOK_SECRET";
@@ -22,12 +23,23 @@ const FAILING = new Set([
 ]);
 
 export type WebhookEffect = {
-  action: "created" | "synced" | "evidence" | "ignored" | "skipped";
+  action: "created" | "synced" | "evidence" | "posted" | "ignored" | "skipped";
   task_id?: string;
   evidence_id?: string;
   kind?: string;
   reason?: string;
+  pr?: number;
 };
+
+/** Posts a markdown body as a comment on repo#number via a GitHub App installation. */
+export type EvidencePublisher = (
+  repo: string,
+  number: number,
+  body: string,
+  installationId: number,
+) => Promise<void>;
+
+export type DispatchMeta = { delivery?: string; actor?: string; publish?: EvidencePublisher };
 
 export type WebhookDispatch = { event: string; effects: WebhookEffect[] };
 
@@ -71,19 +83,25 @@ export async function dispatchGithubEvent(
   store: IStore,
   event: string,
   payload: any,
-  meta: { delivery?: string; actor?: string } = {},
+  meta: DispatchMeta = {},
 ): Promise<WebhookDispatch> {
   const name = event.trim();
   const actor = meta.actor ?? ACTOR;
   switch (name) {
     case "check_run":
       return { event: name, effects: await onCheck(store, name, payload?.check_run, actor, meta.delivery) };
-    case "check_suite":
-      return { event: name, effects: await onCheck(store, name, payload?.check_suite, actor, meta.delivery) };
+    case "check_suite": {
+      const effects = await onCheck(store, name, payload?.check_suite, actor, meta.delivery);
+      if (meta.publish) effects.push(...(await publishPacks(store, payload, effects, meta.publish)));
+      return { event: name, effects };
+    }
     case "issues":
       return { event: name, effects: await onIssue(store, payload, actor) };
     case "pull_request_review":
       return { event: name, effects: await onReview(store, payload, actor, meta.delivery) };
+    case "installation":
+    case "installation_repositories":
+      return { event: name, effects: [{ action: "ignored", reason: `${name} ${payload?.action ?? ""}`.trim() }] };
     default:
       return { event: name, effects: [{ action: "ignored", reason: "unhandled event" }] };
   }
@@ -94,6 +112,7 @@ export async function handleGithubWebhookHttp(
   req: IncomingMessage,
   res: ServerResponse,
   secret: string,
+  options: { publish?: EvidencePublisher } = {},
 ): Promise<void> {
   if (req.method !== "POST") {
     send(res, 405, { error: "method not allowed" }, { allow: "POST" });
@@ -146,6 +165,7 @@ export async function handleGithubWebhookHttp(
   try {
     const result = await dispatchGithubEvent(store, event, payload, {
       delivery: header(req, "x-github-delivery"),
+      publish: options.publish,
     });
     send(res, 200, { ok: true, ...result });
   } catch (err) {
@@ -196,6 +216,42 @@ async function onCheck(
     effects.push({ action: "evidence", task_id: task.id, evidence_id: ev.id, kind: "ci_check" });
   }
   return effects;
+}
+
+/** On a completed check suite from a GitHub App installation, comment each
+ *  linked task's evidence pack on every PR in the suite. A failed comment
+ *  becomes a `skipped` effect and does not fail the delivery. */
+async function publishPacks(
+  store: IStore,
+  payload: any,
+  effects: WebhookEffect[],
+  publish: EvidencePublisher,
+): Promise<WebhookEffect[]> {
+  if (payload?.action !== "completed") return [];
+  const installationId = asNumber(payload?.installation?.id);
+  const repo = payload?.repository?.full_name;
+  if (installationId == null || typeof repo !== "string" || !repo) return [];
+  const suite = payload?.check_suite;
+  const prs: number[] = (Array.isArray(suite?.pull_requests) ? suite.pull_requests : [])
+    .map((pr: any) => asNumber(pr?.number))
+    .filter((n: number | undefined): n is number => n != null);
+  if (!prs.length) return [];
+
+  const taskIds = [...new Set(effects.filter((e) => e.action === "evidence" && e.task_id).map((e) => e.task_id!))];
+  const out: WebhookEffect[] = [];
+  for (const taskId of taskIds) {
+    const body = await evidencePack(store, taskId);
+    if (!body) continue;
+    for (const pr of prs) {
+      try {
+        await publish(repo, pr, body, installationId);
+        out.push({ action: "posted", task_id: taskId, pr });
+      } catch (err) {
+        out.push({ action: "skipped", task_id: taskId, pr, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  }
+  return out;
 }
 
 async function onIssue(store: IStore, payload: any, actor: string): Promise<WebhookEffect[]> {

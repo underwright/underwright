@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { SqliteStore } from "../src/store.js";
 import { PgStore } from "../src/pstore.js";
 import type { IStore } from "../src/istore.js";
-import { chooseReassignAgent, chooseReviewer, harnessOf, leaseActive, linkedReviewArgs, nextTaskMessage } from "../src/dispatcher.js";
+import { chooseReassignAgent, chooseReviewer, contributorsFromRecords, harnessOf, leaseActive, linkedReviewArgs, nextTaskMessage } from "../src/dispatcher.js";
 import { evaluateDoD, getDispatcherPolicy } from "../src/policy.js";
 
 const root = new URL("..", import.meta.url);
@@ -69,6 +69,34 @@ describe("dispatcher policy", () => {
     expect(chooseReviewer({
       implementer: "claude@minipc", agents: [{ id: "codex@laptop", workload: 1 }],
       max: 1, requireDifferentHarness: true, preferStronger: true, designReview: true,
+    })).toBeNull();
+
+    // gh-68 harness-family: session variants can't sidestep the different-harness gate.
+    expect(harnessOf("claude-sdk@minipc")).toBe("claude");
+    expect(harnessOf("claude-2@minipc")).toBe("claude");
+    expect(harnessOf("Codex2@laptop")).toBe("codex");
+    expect(harnessOf("grok_beta@box")).toBe("grok");
+    expect(harnessOf("agent-A")).toBe("agent");
+    expect(harnessOf("42@x")).toBe("42");
+    expect(chooseReviewer({
+      implementer: "claude@alan-wsl",
+      agents: [{ id: "claude-sdk@minipc", workload: 0 }, { id: "claude-2@minipc", workload: 0 }],
+      max: 0, requireDifferentHarness: true, preferStronger: true, designReview: true,
+    })).toBeNull();
+
+    // gh-68 next-task-review-gate: every contributor's harness is excluded, not only the picked implementer.
+    const records = { lastClaimedBy: "codex-2@alan-wsl", artifactAuthor: "claude@alan-wsl", createdBy: "devin@alan-wsl" };
+    expect(contributorsFromRecords(records)).toEqual(["codex-2@alan-wsl", "claude@alan-wsl"]);
+    expect(contributorsFromRecords({ createdBy: "devin@alan-wsl" })).toEqual(["devin@alan-wsl"]);
+    expect(contributorsFromRecords({ completedBy: "dispatcher", createdBy: "github-sync" })).toEqual([]);
+    const mixed = [{ id: "claude-sdk@minipc", workload: 0 }, { id: "codex@laptop", workload: 0 }, { id: "agy@box", workload: 3 }];
+    expect(chooseReviewer({
+      implementer: "codex-2@alan-wsl", contributors: contributorsFromRecords(records), agents: mixed,
+      max: 0, requireDifferentHarness: true, preferStronger: true, designReview: true,
+    })).toBe("agy@box");
+    expect(chooseReviewer({
+      implementer: "codex-2@alan-wsl", contributors: contributorsFromRecords(records), agents: mixed.slice(0, 2),
+      max: 0, requireDifferentHarness: true, preferStronger: true, designReview: true,
     })).toBeNull();
 
     expect(linkedReviewArgs({ title: "rev", review_of: "task-1" }, null).error).toMatch(/not found/);
@@ -381,6 +409,27 @@ for (const backend of ["sqlite", "postgres"] as const) {
       const result = await finish(feature.id, "grok@alandesktop") as { dispatched?: { task_id: string } };
       expect((await store.getTask(review.id)).claim).toBeNull();
       expect(result.dispatched).toEqual({ task_id: follow.id, agent_id: "grok@alandesktop" });
+    });
+
+    it("never hands a review to a session of the design author's harness on next-task dispatch (gh-68)", async () => {
+      const arch = await ready("arch", { type: "architecture" });
+      await store.postArtifact({ task_id: arch.id, agent_id: "claude@alan-wsl", kind: "design", content: "ADR" });
+      // A different harness claimed and released the subject: it is the last claimer, not the author.
+      await store.claimTask(arch.id, "codex-2@alan-wsl");
+      await store.releaseTask(arch.id, "codex-2@alan-wsl");
+      const design = await store.createTask({
+        title: "design review", review_of: arch.id, ac_ids: ["ac"], estimate: "S", priority: 0,
+      });
+      // Only Claude/Codex sessions are live: the review must stay open.
+      const mine = await ready("mine", { priority: 3 });
+      await store.claimTask(mine.id, "claude-sdk@minipc");
+      const result = await finish(mine.id, "claude-sdk@minipc") as { dispatched?: { task_id: string } };
+      expect(result.dispatched?.task_id).not.toBe(design.id);
+      expect((await store.getTask(design.id)).claim).toBeNull();
+      expect((await store.inbox("claude-sdk@minipc")).map((m: any) => m.body)).not.toContain(nextTaskMessage(design.id));
+      // Once a different-harness agent is live, the next dispatch routes the review to it.
+      await register("agy@box");
+      expect((await store.getTask(design.id)).claim?.agent_id).toBe("agy@box");
     });
 
     it("routes a design review of an architecture task to a high-tier harness before the subject is done", async () => {

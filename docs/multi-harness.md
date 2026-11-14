@@ -485,3 +485,57 @@ need independent review evidence before merge (peer-review policy).
 
 Review tasks route to a different harness than the implementer, preferring
 a stronger tier. Design reviews prefer a high-tier harness.
+
+## Model-complexity routing (gh-54)
+
+Harness choice sets the cost tier. Model choice sets how much capability you
+pay for within a harness. The policy `model_routing` block maps task signals
+to a model tier, and the tier to a model name for each harness:
+
+```json
+"model_routing": {
+  "enabled": true,
+  "default_tier": "standard",
+  "rules": [
+    { "type": ["architecture", "design"], "tier": "heavy" },
+    { "review_kind": ["design"], "tier": "heavy" },
+    { "estimate": ["L"], "tier": "heavy" },
+    { "min_ac": 6, "tier": "heavy" },
+    { "paths": ["src/schema.ts", "src/store.ts"], "tier": "heavy" },
+    { "estimate": ["S"], "tier": "light" },
+    { "type": ["docs"], "tier": "light" }
+  ],
+  "models": {
+    "claude": { "light": "haiku", "standard": "sonnet", "heavy": "opus" },
+    "codex":  { "light": "gpt-5.4-mini", "standard": "gpt-5.4", "heavy": "gpt-5.4" }
+  },
+  "flags": { "grok": "--model" }
+}
+```
+
+- **Rules.** The first rule whose fields all match decides the tier. The
+  fields are `estimate`, `type`, `review_kind`, `min_ac` (number of
+  acceptance criteria), and `paths` (globs matched against the task's
+  `ownership.paths`, which is the repo area). When no rule matches, the task
+  gets `default_tier`. Leaving out `rules` uses the built-in defaults: the
+  list above without the `paths` rule.
+- **Dispatch.** `submit_job` for an agent job that names a `task_id` stamps
+  `agent.model_tier` from the task, unless the spec already carries `model`
+  or `model_tier`. Both stores do this.
+- **Runner.** `uw-runner` resolves `spec.model`, or else
+  `models[harness][model_tier]` with a fallback to the harness family
+  (`claude-sdk` → `claude`). Omnigent launches pass it as
+  `omni run --model`. Raw launches use the CLI's own flag: `--model` for
+  claude and kimi, `-m` for codex and opencode, or the `flags` override.
+  Harnesses with no known flag, and args that already set a model, are left
+  alone.
+- **Escalation.** If the model can't handle the task, the agent posts a
+  `blocked` artifact containing `needs-stronger-model` and releases the task.
+  `runModelEscalation` (in the watch pass) re-submits the task's latest agent
+  job one tier heavier. It handles each artifact once. At the heavy tier it
+  messages the human instead.
+- **Metrics.** The `model_report` MCP tool rolls up tokens per task by tier
+  and by tier × estimate. Token counts come from evidence whose output
+  carries `tokens_in`/`tokens_out` (the gh-44 cost evidence shape). Use it
+  to check whether light-tier S tasks really are cheaper, and whether heavy
+  routing pays for itself.

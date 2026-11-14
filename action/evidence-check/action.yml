@@ -1,0 +1,52 @@
+name: underwright evidence-check
+description: Post a CI result to an Underwright control plane as ci_check or smoke_test evidence on the linked task.
+author: underwright
+branding:
+  icon: check-circle
+  color: green
+inputs:
+  url:
+    description: Control plane URL (base URL or the /mcp endpoint). Falls back to UNDERWRIGHT_MCP_URL / UNDERWRIGHT_URL. Skips when unset.
+    required: false
+  token:
+    description: Bearer token for the control plane. Falls back to UNDERWRIGHT_TOKEN.
+    required: false
+  task-id:
+    description: Task to attach evidence to. Defaults to UNDERWRIGHT_TASK_ID, then `uw:<id>` in the PR body, then a branch like feat/task-xxxx or fix/gh-N. Skips when none resolve.
+    required: false
+  agent-id:
+    description: Reporting agent id. Defaults to ci@<github actor>.
+    required: false
+  kind:
+    description: Evidence kind, ci_check or smoke_test.
+    required: false
+    default: ci_check
+  ac-ids:
+    description: Acceptance criterion ids this result proves (comma or space separated).
+    required: false
+  status:
+    description: Job status, normally `${{ job.status }}`. success maps to exit code 0, anything else to 1.
+    required: false
+    default: success
+  exit-code:
+    description: Explicit exit code. Overrides status.
+    required: false
+  command:
+    description: Command that produced the result, recorded on the evidence.
+    required: false
+  output:
+    description: Raw output to attach.
+    required: false
+  output-file:
+    description: File whose contents are attached (appended after `output`).
+    required: false
+  fail-on-error:
+    description: Fail the step when the post fails. When false, failures are warnings.
+    required: false
+    default: "true"
+outputs:
+  evidence-id:
+    description: Id of the evidence row created on the control plane.
+runs:
+  using: node20
+  main: index.mjs

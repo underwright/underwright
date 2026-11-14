@@ -2,7 +2,14 @@
 # install-ai-agents.sh
 # Install, authenticate, verify, and inspect quota/usage for:
 #   Codex CLI, Claude Code, Google Antigravity (agy), Kimi Code CLI,
-#   OpenCode, Command Code, Cline CLI, Grok Build CLI, and Cursor Agent.
+#   OpenCode, Command Code, Cline CLI, Grok Build CLI, Cursor Agent, and
+#   GitHub Copilot CLI.
+#
+# Provisioning playbook: this is the reviewed resource the node `install-harness`
+# executor runs (`install --agents ID --yes --no-open`, see docs/node-executors.md).
+# Gate provisioning on `verify --agents ID`: it exits non-zero when any selected
+# harness is missing or fails its auth check. Exit codes: 0 ok, 1 a step failed,
+# 2 usage error.
 #
 # Security model:
 #   - This script never asks for, reads, prints, writes, or copies API keys/tokens.
@@ -27,7 +34,7 @@ OPEN_DASHBOARDS=0
 SELECTED_CSV="all"
 FAILURES=0
 
-ALL_AGENTS=(codex claude antigravity kimi opencode command-code cline grok cursor)
+ALL_AGENTS=(codex claude antigravity kimi opencode command-code cline grok cursor copilot devin)
 SELECTED_AGENTS=()
 
 # Official references, also printed by `sources`.
@@ -49,6 +56,8 @@ URL_GROK_DOCS="https://docs.x.ai/build/overview"
 URL_XAI_CONSOLE="https://console.x.ai/"
 URL_CURSOR_DOCS="https://cursor.com/docs/cli/overview"
 URL_CURSOR_DASHBOARD="https://cursor.com/dashboard"
+URL_COPILOT_DOCS="https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli"
+URL_COPILOT_SETTINGS="https://github.com/settings/copilot"
 
 # Add common user-level installer locations to this process only.
 export PATH="$HOME/.local/bin:$HOME/.claude/bin:$HOME/.cursor/bin:$PATH"
@@ -76,6 +85,7 @@ Actions:
   install   Install or update selected agents
   auth      Guide authentication using each agent's native secure flow
   verify    Show versions and verify authentication where the CLI exposes a safe check
+            (exits 1 if any selected agent is missing or fails its check)
   quota     Check/report quota and usage for every selected agent
   doctor    Run non-destructive installation and authentication diagnostics
   list      List supported agent IDs
@@ -85,7 +95,7 @@ Actions:
 Options:
   --agents LIST        Comma-separated IDs, or "all"
                        IDs: codex,claude,antigravity,kimi,opencode,
-                            command-code,cline,grok,cursor
+                            command-code,cline,grok,cursor,copilot
   -y, --yes            Skip install/update confirmation prompts
   --force              Run installers even when an agent is already installed
   --interactive-quota  Open native TUIs for slash-command quota panels, one at a time
@@ -129,6 +139,8 @@ agent_label() {
     cline) echo "Cline CLI" ;;
     grok) echo "Grok Build CLI" ;;
     cursor) echo "Cursor Agent" ;;
+    copilot) echo "GitHub Copilot CLI" ;;
+    devin) echo "Devin CLI" ;;
     *) echo "$1" ;;
   esac
 }
@@ -196,6 +208,7 @@ resolve_bin() {
     cline) native_bin cline 2>/dev/null || true ;;
     grok) native_bin grok 2>/dev/null || true ;;
     cursor) native_bin agent 2>/dev/null || true ;;
+    copilot) native_bin copilot 2>/dev/null || true ;;
   esac
 }
 
@@ -308,12 +321,24 @@ install_agent() {
       ;;
     grok) run_official_installer "$label" "https://x.ai/cli/install.sh" ;;
     cursor) run_official_installer "$label" "https://cursor.com/install" ;;
+    devin)
+      require_npm_and_node 18 "$label" || return 1
+      require_writable_npm_prefix "$label" || return 1
+      npm install --global devin
+      ;;
+    copilot)
+      require_npm_and_node 22 "$label" || return 1
+      require_writable_npm_prefix "$label" || return 1
+      npm install --global @github/copilot
+      ;;
   esac
   local rc=$?
   hash -r 2>/dev/null || true
   if (( rc == 0 )); then
     ok "$label installer completed."
-    safe_version "$agent" || warn "$label installed, but its binary is not visible yet. Open a new shell or add ~/.local/bin to PATH."
+    # Provisioning gates on this: an installer that exits 0 but leaves no
+    # runnable binary on PATH is a failure, not a success.
+    safe_version "$agent" || { err "$label installed, but its binary is not on PATH. Open a new shell or add ~/.local/bin (or the npm prefix bin) to PATH."; return 1; }
   else
     err "$label installation failed (exit $rc)."
     return "$rc"
@@ -388,6 +413,11 @@ auth_agent() {
       say "Cursor opens its browser login. Set NO_OPEN_BROWSER=1 yourself for a printed URL in headless environments."
       "$bin" login || rc=$?
       ;;
+    copilot)
+      say "Copilot signs in with your GitHub account via its /login device flow."
+      say "Headless alternative: export a fine-grained PAT with the Copilot Requests permission as COPILOT_GITHUB_TOKEN yourself."
+      launch_tui_instruction "$label" "$bin" "/login (complete the device flow), then /exit" || rc=$?
+      ;;
   esac
 
   if (( rc == 0 )); then ok "$label authentication flow completed or returned successfully."; else warn "$label authentication flow exited with status $rc."; fi
@@ -407,7 +437,8 @@ verify_auth_agent() {
   local agent=$1 label bin rc=0
   label=$(agent_label "$agent")
   section "Verify authentication: $label"
-  bin=$(installed_or_skip "$agent") || return 0
+  # A missing harness fails verify so provisioning can gate on the exit code.
+  bin=$(installed_or_skip "$agent") || return 1
   safe_version "$agent" || true
 
   case "$agent" in
@@ -418,6 +449,9 @@ verify_auth_agent() {
     claude)
       "$bin" auth status || rc=$?
       print_env_presence ANTHROPIC_API_KEY
+      ;;
+    devin)
+      "$bin" auth status 2>/dev/null || "$bin" whoami 2>/dev/null || print_env_presence DEVIN_API_TOKEN
       ;;
     antigravity)
       print_env_presence GEMINI_API_KEY
@@ -457,6 +491,12 @@ verify_auth_agent() {
     cursor)
       "$bin" status || rc=$?
       print_env_presence CURSOR_API_KEY
+      ;;
+    copilot)
+      print_env_presence COPILOT_GITHUB_TOKEN
+      print_env_presence GH_TOKEN
+      print_env_presence GITHUB_TOKEN
+      say "Copilot CLI has no documented non-interactive auth-status command. Run it and use /login or /usage to verify."
       ;;
   esac
 
@@ -552,6 +592,12 @@ quota_agent() {
       say "Cursor account/usage dashboard: $URL_CURSOR_DASHBOARD"
       open_url "$URL_CURSOR_DASHBOARD" || true
       ;;
+    copilot)
+      say "Copilot CLI /usage shows premium-request usage for the session."
+      quota_tui "$agent" "/usage"
+      say "Copilot plan and premium-request allowance: $URL_COPILOT_SETTINGS"
+      open_url "$URL_COPILOT_SETTINGS" || true
+      ;;
   esac
 }
 
@@ -567,6 +613,7 @@ Official references used by this script:
   Cline CLI:          $URL_CLINE_DOCS
   Grok Build CLI:     $URL_GROK_DOCS
   Cursor CLI:         $URL_CURSOR_DOCS
+  GitHub Copilot CLI: $URL_COPILOT_DOCS
 EOF
 }
 

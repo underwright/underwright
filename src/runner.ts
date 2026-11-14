@@ -1,7 +1,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentBackend, AgentJobSpec } from "./istore.js";
-import { getHarnessBackend, getHarnessMatrix, type Policy } from "./policy.js";
+import { getHarnessBackend, getHarnessMatrix, loadPolicy, type Policy } from "./policy.js";
+import { getModelRouting, modelFlag, resolveModel, withModelArgs } from "./model-routing.js";
 
 export type JobCall = (name: string, args: Record<string, unknown>) => Promise<any>;
 
@@ -11,8 +12,15 @@ export type JobCall = (name: string, args: Record<string, unknown>) => Promise<a
 export const OMNIGENT_HARNESS_SUPPORT: Record<string, boolean> = {
   codex: true,
   "claude-sdk": true,
-  cmdc: false, // pending the new omnigent support landing
+  cmdc: true,
+  kimi: true,
+  agy: true,
+  opencode: true,
+  pi: true,
 };
+
+/** Underwright harness id → `omni --harness` name when they differ. */
+const OMNI_HARNESS_ALIASES: Record<string, string> = { cmdc: "commandcode", agy: "antigravity" };
 
 /** True when the `omni` CLI resolves on PATH. Probed per call: one spawn against a
  *  multi-minute job is noise, and it keeps tests hermetic through PATH. */
@@ -37,6 +45,10 @@ export interface AgentInvocation {
   backend: AgentBackend;
   harness?: string;
   server?: string | null;
+  env?: Record<string, string>;
+  cwd?: string;
+  /** Model passed to the harness (gh-54), when one resolved and the CLI has a flag. */
+  model?: string;
 }
 
 const executableBase = (path: string) => path.split(/[\\/]/).pop() ?? path;
@@ -49,24 +61,31 @@ const executableBase = (path: string) => path.split(/[\\/]/).pop() ?? path;
 export function agentInvocation(job: any, agentId: string, host: string, context: InvocationContext = {}): AgentInvocation {
   const spec: AgentJobSpec = typeof job.agent_spec === "string" ? JSON.parse(job.agent_spec) : job.agent_spec;
   if (!spec?.executable || !Array.isArray(spec.args) || !spec.prompt) throw new Error("invalid agent job specification");
-  const values: Record<string, string> = { task_id: job.task_id ?? "", agent_id: agentId, host, job_id: job.id };
-  const prompt = spec.prompt.replace(/\{\{(task_id|agent_id|host|job_id)\}\}/g, (_, key) => values[key]);
-  const matrix = getHarnessMatrix(context.policy);
+  const values: Record<string, string> = { task_id: job.task_id ?? "", agent_id: agentId, host, job_id: job.id, cwd: spec.cwd ?? process.cwd() };
+  const prompt = spec.prompt.replace(/\{\{(task_id|agent_id|host|job_id|cwd)\}\}/g, (_, key) => values[key]);
+  const policy = context.policy ?? loadPolicy();
+  const matrix = getHarnessMatrix(policy);
   const pref = matrix.agents[agentId] ?? matrix.agents["*"] ?? {};
   const harness = spec.harness ?? pref.harness ?? executableBase(spec.executable);
   const coverage = { ...OMNIGENT_HARNESS_SUPPORT, ...matrix.coverage };
   const backend = spec.backend ?? pref.backend ?? (coverage[harness] === true ? "omnigent" : "raw");
   const server = spec.server ?? pref.server;
+  // gh-54: explicit model wins, else the routed tier mapped through policy model_routing.models.
+  const routing = getModelRouting(policy);
+  const model = spec.model ?? resolveModel(harness, spec.model_tier, routing);
   if (backend === "omnigent" && (context.omniAvailable ?? omniAvailable()) && coverage[harness] === true) {
-    const args = ["run", "--harness", harness];
+    const args = ["run", "--harness", OMNI_HARNESS_ALIASES[harness] ?? harness];
     if (server) args.push("--server", server);
+    if (model) args.push("--model", model);
     args.push("-p", prompt);
-    return { executable: "omni", args, backend: "omnigent", harness, server: server ?? null };
+    return { executable: "omni", args, backend: "omnigent", harness, server: server ?? null, env: spec.env, cwd: spec.cwd, ...(model ? { model } : {}) };
   }
+  const flag = model ? modelFlag(harness, routing) : null;
+  const base = model && flag ? withModelArgs(spec.args, flag, model) : spec.args;
   // An explicit {{prompt}} argv slot is optional; by default append the prompt.
-  const args = spec.args.map(arg => arg === "{{prompt}}" ? prompt : arg);
-  if (!spec.args.includes("{{prompt}}")) args.push(prompt);
-  return { executable: spec.executable, args, backend: "raw", harness };
+  const args = base.map(arg => arg === "{{prompt}}" ? prompt : arg);
+  if (!base.includes("{{prompt}}")) args.push(prompt);
+  return { executable: spec.executable, args, backend: "raw", harness, env: spec.env, cwd: spec.cwd, ...(model && base !== spec.args ? { model } : {}) };
 }
 
 const SESSION_MARKER = /omnigent session[:\s]+(\S+)/i;
@@ -100,6 +119,8 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
   if (options.signal?.aborted) return;
   const child = spawn(invocation.executable, invocation.args, {
     shell: job.type !== "agent", detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
+    env: invocation.env ? { ...process.env, ...invocation.env } : process.env,
+    cwd: invocation.cwd ?? process.cwd(),
   });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");

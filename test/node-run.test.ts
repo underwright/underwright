@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { SqliteStore } from "../src/store.js";
 import { saveNodeCredential } from "../src/node-client.js";
-import { runNode } from "../src/node-run.js";
-import { NODE_ONLINE_MS, NODE_STALE_MS, nodeSecret } from "../src/node-protocol.js";
+import { probeInventory, runNode } from "../src/node-run.js";
+import { NODE_ONLINE_MS, NODE_STALE_MS, nodeInventorySchema, nodeSecret } from "../src/node-protocol.js";
 import { renderDashboard } from "../src/dashboard.js";
 import { serveHttp } from "../src/server.js";
 
@@ -77,6 +77,25 @@ it("heartbeats independently while a job is running and redacts inventory secret
   expect(JSON.stringify(store.auditLog(200))).not.toContain(node.token);
   shutdown.abort();
   await running.catch(() => undefined);
+});
+
+it("probes configured harnesses for real install/version instead of reporting a static stub", async () => {
+  const inventory: any = await probeInventory({
+    workspaces: { kraftina: tmpdir() },
+    harnesses: {
+      claude: { executable: process.execPath, args: ["-p"], auth: "ready" },
+      codex: { executable: "/nonexistent/uw-codex-binary" },
+      hang: { executable: process.execPath, args: [] },
+    },
+  }, { timeoutMs: 300, versionArgs: { hang: ["-e", "setTimeout(()=>{},10000)"] } });
+  const byId = Object.fromEntries(inventory.harnesses.map((h: any) => [h.id, h]));
+  expect(byId.claude).toMatchObject({ installed: true, version: process.version, auth_status: "ready" });
+  expect(byId.codex).toMatchObject({ installed: false, version: "unknown", auth_status: "missing" });
+  expect(byId.hang).toMatchObject({ installed: false, auth_status: "missing" });
+  expect(inventory.approved_workspace_ids).toEqual(["kraftina"]);
+  expect(nodeInventorySchema.safeParse(inventory).success).toBe(true);
+  // An explicit operator snapshot still wins.
+  expect(await probeInventory({ workspaces: {}, inventory: { harnesses: [] } })).toEqual({ harnesses: [] });
 });
 
 it("escapes node names on the dashboard and refuses credential-bearing inventory", async () => {

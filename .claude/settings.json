@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__underwright__*",
+      "Bash(node /home/alan/code/underwright/dist/cli.js *)",
+      "Bash(node dist/cli.js *)",
+      "Bash(npm *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(rg *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Read",
+      "Write",
+      "Edit",
+      "Glob",
+      "Grep",
+      "WebFetch",
+      "TodoWrite",
+      "mcp__underwright-aura4__*"
+    ]
+  }
+}

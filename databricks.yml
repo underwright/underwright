@@ -1,0 +1,46 @@
+# Databricks Asset Bundle: underwright as a Databricks App (gh-51).
+#   databricks bundle deploy -t dev --var lakebase_instance=<instance>
+#   databricks bundle run underwright -t dev
+# See docs/databricks-app.md for the secret + Lakebase setup.
+bundle:
+  name: underwright
+
+variables:
+  secret_scope:
+    description: Secret scope holding the Lakebase connection string
+    default: underwright
+  secret_key:
+    description: Secret key whose value is the postgres:// URL for Lakebase
+    default: database-url
+  lakebase_instance:
+    description: Lakebase database instance name
+  lakebase_database:
+    description: Postgres database on that instance
+    default: databricks_postgres
+
+resources:
+  apps:
+    underwright:
+      name: underwright
+      description: "Underwright control plane: governed agent coordination (MCP + dashboard)"
+      source_code_path: .
+      resources:
+        - name: lakebase-url
+          description: DATABASE_URL for PgStore
+          secret:
+            scope: ${var.secret_scope}
+            key: ${var.secret_key}
+            permission: READ
+        - name: lakebase
+          description: Lakebase instance the app's service principal connects to
+          database:
+            instance_name: ${var.lakebase_instance}
+            database_name: ${var.lakebase_database}
+            permission: CAN_CONNECT_AND_CREATE
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production

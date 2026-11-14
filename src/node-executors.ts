@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { NodePolicy } from './node-protocol.js';
+import { prepareHarnessWorkspace, type HarnessPrepOptions } from './harness-permissions.js';
 
 export const NODE_TASK_TYPES = ['launch-agent', 'provision', 'install-harness', 'run-script'] as const;
 export type NodeTaskType = (typeof NODE_TASK_TYPES)[number];
@@ -29,10 +30,15 @@ export interface ExecutorConfig {
   inventory?: unknown;                                     // operator-approved readiness probe snapshot
   workspaces: Record<string, string>;                       // workspace id -> absolute root
   repositories?: Record<string, string>;                    // repository id -> clone URL
-  harnesses?: Record<string, { executable: string; args?: string[] }>;   // launch-agent targets
+  /** launch-agent targets; `auth` is the operator's declaration of vendor-auth readiness,
+   *  reported in the capability inventory (it cannot be probed without reading credentials). */
+  harnesses?: Record<string, { executable: string; args?: string[]; auth?: 'ready' | 'missing' | 'unknown' }>;
   installers?: Record<string, { executable: string; args?: string[] }>;  // install-harness targets
   scripts?: Record<string, { executable: string; args?: string[] }>;     // run-script targets
   envAllow?: string[];                                      // extra env names to pass through
+  /** Before launch-agent, pre-answer the harness's trust/MCP/tool-permission gates for the
+   *  launch directory (see harness-permissions.ts). `true` uses defaults. Off when absent. */
+  prepareHarnesses?: boolean | HarnessPrepOptions;
   timeoutMs?: number;
   onSpawn?: (pid: number) => void;
   maxOutput?: number;
@@ -75,7 +81,7 @@ export function containedPath(root: string, sub: string): string {
   return target;
 }
 
-interface Plan { executable: string; args: string[]; cwd?: string; env?: Record<string, string> }
+interface Plan { executable: string; args: string[]; cwd?: string; env?: Record<string, string>; harness?: string }
 
 export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig): Plan {
   if (!policy.allowed_task_types.includes(task.type)) throw new PolicyError(`task type ${task.type} not allowed for this node`);
@@ -96,7 +102,7 @@ export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig
   switch (task.type) {
     case 'launch-agent': {
       const h = approved(cfg.harnesses, p.harness, 'harness');
-      return { executable: h.executable, args: [...(h.args ?? []), p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
+      return { executable: h.executable, args: [...(h.args ?? []), p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd), harness: p.harness };
     }
     case 'provision': {
       if (!(policy.repository_ids ?? []).includes(p.repository_id)) throw new PolicyError(`repository ${p.repository_id} not approved`);
@@ -171,6 +177,11 @@ export function createExecutorRegistry(policy: NodePolicy, cfg: ExecutorConfig):
     let plan: Plan;
     try { plan = planTask(task, policy, cfg); }
     catch (e) { return { status: 'failed', result: e instanceof PolicyError ? `denied: ${e.message}` : 'invalid task parameters' }; }
+    if (cfg.prepareHarnesses && plan.harness && plan.cwd) {
+      // A headless agent stuck on a trust/permission prompt is worse than a clean failure.
+      try { prepareHarnessWorkspace(plan.harness, plan.cwd, { ...(typeof cfg.prepareHarnesses === 'object' ? cfg.prepareHarnesses : {}), executable: plan.executable }); }
+      catch (e) { return { status: 'failed', result: `harness setup failed: ${e instanceof Error ? e.message : String(e)}` }; }
+    }
     plan.env = task.worker;
     return runPlan(plan, cfg, signal);
   };

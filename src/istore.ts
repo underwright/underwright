@@ -1,6 +1,7 @@
 // The control-plane store contract. Call sites always `await` results;
 // implementations may be sync (SQLite) or async (Postgres/Lakebase).
 
+import type { Attestation, AuditAttestation, RegisterKeyInput } from "./agent-identity.js";
 import type { NodeEnrollmentInput, NodePolicy, NodePrincipal, NodeError, NodeEnrollment, NodeSpec } from "./node-protocol.js";
 
 type Awaitable<T> = T | Promise<T>;
@@ -21,6 +22,15 @@ export interface CreateTaskArgs {
   review_kind?: "code" | "design";
 }
 
+export interface CreateSprintArgs {
+  id?: string; name: string; starts_at: string; ends_at: string; goal?: string; actor: string;
+}
+
+export interface RetroArgs {
+  /** Window bounds (ISO or YYYY-MM-DD). Default: the last sdlc.retro.every_days. */
+  since?: string; until?: string; actor: string;
+}
+
 export type AgentBackend = "raw" | "omnigent";
 
 export interface AgentJobSpec {
@@ -33,6 +43,15 @@ export interface AgentJobSpec {
   backend?: AgentBackend;
   /** Remote omnigent server URL, passed as `omni run --server`. */
   server?: string;
+  /** Extra environment for the spawned process (e.g. CODEX_HOME per seat). */
+  env?: Record<string, string>;
+  /** Working directory for the spawned process — the task's repo. Agent sessions
+   *  launch here so they load that repo's .mcp.json and see its files. */
+  cwd?: string;
+  /** Model tier routed from task difficulty (gh-54); the runner maps it per harness. */
+  model_tier?: "light" | "standard" | "heavy";
+  /** Explicit model name; wins over model_tier. Passed via the harness's model flag. */
+  model?: string;
 }
 export interface SubmitJobArgs {
   task_id?: string; agent_id: string; type: string; command?: string;
@@ -47,6 +66,14 @@ export interface SubmitNodeTaskArgs {
   agent_id?: string;
   dedupe_key?: string;
   retry_of?: string;
+}
+
+/** Keyset paging over the audit log (events.id is monotonic per workspace). */
+export interface AuditPage {
+  /** Only events with id > after_id, oldest first. */
+  after_id?: number;
+  /** Only events with id < before_id. */
+  before_id?: number;
 }
 
 export interface DigestArgs {
@@ -86,7 +113,41 @@ export interface DigestResult {
   sent_to: string | null;
 }
 
+/** Row of the github_status mirror table (see GITHUB_STATUS_SCHEMA). */
+export interface GithubStatusRow {
+  task_id: string;
+  issue_ref: string;
+  last_status: string;
+  last_comment_at: string | null;
+  last_digest_at: string | null;
+  attempts: number;
+  last_attempt_at: string | null;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export type GithubStatusPatch = Partial<Omit<GithubStatusRow, "task_id" | "updated_at">> & { issue_ref: string; last_status: string };
+
+export interface VerifyAgentActionArgs {
+  action: string;
+  agent_id: string;
+  task_id: string;
+  /** Tool arguments the signature covers (agent_id/task_id/attestation excluded from the digest). */
+  args: Record<string, unknown>;
+  attestation?: Attestation;
+}
+
+export type VerifyAgentActionResult = { ok: true; attestation?: AuditAttestation } | { error: string };
+
 export interface IStore {
+  // Agent identity & attestation (gh-20).
+  /** TOFU registration or signed rotation of an agent's Ed25519 key. */
+  registerAgentKey(a: RegisterKeyInput): Awaitable<any>;
+  listAgentKeys(agentId?: string): Awaitable<any[]>;
+  /** Admin reset: retire every key for an agent so it can re-register. */
+  revokeAgentKeys(agentId: string, actor: string): Awaitable<any>;
+  /** Check (and consume, for replay) an action's attestation. */
+  verifyAgentAction(a: VerifyAgentActionArgs): Awaitable<VerifyAgentActionResult>;
   createNodeEnrollment(a: NodeEnrollmentInput): Awaitable<NodeEnrollment | NodeError>;
   listNodeEnrollments(): Awaitable<any[]>;
   approveNodeEnrollment(id: string, code: string, policy: NodePolicy, actor: string): Awaitable<any>;
@@ -117,13 +178,32 @@ export interface IStore {
   releaseTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;
   renewLease(taskId: string, agentId: string, ttlSeconds?: number): Awaitable<any>;
   sweepExpiredClaims(): Awaitable<{ reclaimed: string[] }>;
+  /** Single-instance lease for in-process loops (sweeper). True when caller holds it. */
+  sweeperLeadership?(instanceId: string, ttlSeconds?: number): Awaitable<boolean>;
   /** Reassign dispatcher "your next task" mail whose task is still unclaimed. */
   sweepIdleDispatches(): Awaitable<{ reassigned: string[]; logged: string[] }>;
+  // SDLC ceremonies (gh-56): sprint scope, retro, backlog grooming.
+  createSprint(a: CreateSprintArgs): Awaitable<any>;
+  listSprints(): Awaitable<any[]>;
+  /** Move tasks into a sprint (null removes them). Carry-over is logged. */
+  assignSprint(taskIds: string[], sprintId: string | null, actor: string): Awaitable<any>;
+  /** Burndown for a sprint; the active one when no id is given. */
+  sprintReport(sprintId?: string): Awaitable<any>;
+  /** Tokens per task by model tier and tier × estimate (gh-54). */
+  modelReport(): Awaitable<any>;
+  /** Create (idempotently, one per window end day) a retro task with stats. */
+  runRetro(a: RetroArgs): Awaitable<any>;
+  /** Flag stale open tasks, surface stale claims, re-validate dependency edges. */
+  groomBacklog(actor: string): Awaitable<any>;
+  /** Run retro / grooming when the policy `sdlc` block says they are due. */
+  sweepSdlc(): Awaitable<{ retro?: string; groomed?: boolean }>;
   claimResources(resources: string[], agentId: string, taskId?: string, ttlSeconds?: number): Awaitable<any>;
   releaseResources(resources: string[], agentId: string): Awaitable<any>;
   checkLocks(resources: string[]): Awaitable<any[]>;
   sendMessage(to: string, from: string, body: string, taskId?: string): Awaitable<any>;
   inbox(agentId: string, unreadOnly?: boolean): Awaitable<any[]>;
+  /** Messages exchanged between two agents, oldest first (last `limit`). Read-only: never marks mail read. */
+  conversation(a: string, b: string, limit?: number): Awaitable<any[]>;
   watchTask(agentId: string, taskId: string): Awaitable<any>;
   notifyWatchers(taskId: string, body: string): Awaitable<void>;
   log(entityType: string, entityId: string, action: string, actor: string, data?: unknown): Awaitable<void>;
@@ -152,6 +232,17 @@ export interface IStore {
   board(): Awaitable<any>;
   digest(args?: string | DigestArgs): Awaitable<DigestResult>;
   dashboard(eventsLimit?: number): Awaitable<any>;
-  auditLog(limit?: number): Awaitable<any[]>;
+  /** Audit events. Default newest first; `before_id` pages older. With `after_id`
+   *  the order is oldest first (an incremental ingest cursor: pass the last id seen). */
+  auditLog(limit?: number, page?: AuditPage): Awaitable<any[]>;
+  /** Audit events for one task, oldest first, optionally after an ISO timestamp. */
+  taskEvents(taskId: string, sinceIso?: string): Awaitable<any[]>;
+  /** Most recent audit events an agent acted in, oldest first: events it is
+   *  the actor of, messages sent to it, and events stamped with it as the
+   *  platform principal (gh-23 agent timeline). */
+  agentEvents(agentId: string, limit?: number): Awaitable<any[]>;
+  listGithubStatus(): Awaitable<GithubStatusRow[]>;
+  /** Upsert the mirror row for a task; audit-logged as github_status/<task>. */
+  putGithubStatus(taskId: string, patch: GithubStatusPatch, actor: string): Awaitable<GithubStatusRow>;
   close(): Awaitable<void>;
 }

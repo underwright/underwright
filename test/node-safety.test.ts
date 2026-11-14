@@ -38,12 +38,20 @@ it.each(['shutdown', 'lease'])('stops a TERM-resistant real child on %s and jour
   f.config.scripts.fixture.args = ['-e', `require('fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));process.on('SIGTERM',()=>{});setInterval(()=>{},1000)`];
   const job = f.submit(); const running = f.start();
   await until(() => existsSync(pidPath)); const pid = Number(readFileSync(pidPath, 'utf8'));
+  const leased = f.store.getJob(job.id);
+  const journal = new AttemptJournal(join(f.dir, 'attempts'));
   if (why === 'shutdown') f.shutdown.abort();
-  else (f.store as any).nodeQuery('UPDATE jobs SET lease_expires=? WHERE id=?', ['2000-01-01T00:00:00Z', job.id]);
+  else {
+    // A lost lease stops the child but not the daemon (task-570d289b: only shutdown ends runNode).
+    let exited = false; running.finally(() => { exited = true; });
+    (f.store as any).nodeQuery('UPDATE jobs SET lease_expires=? WHERE id=?', ['2000-01-01T00:00:00Z', job.id]);
+    await until(() => journal.read(job.id, leased.attempt_id)?.phase === 'finished', 8000);
+    expect(exited).toBe(false);
+    f.shutdown.abort();
+  }
   await running;
   expect(() => process.kill(pid, 0)).toThrow();
-  const leased = f.store.getJob(job.id);
-  const record = new AttemptJournal(join(f.dir, 'attempts')).read(job.id, leased.attempt_id)!;
+  const record = journal.read(job.id, leased.attempt_id)!;
   expect(record.phase).toBe('finished'); expect(record.outcome?.status).toBe('failed');
 }, 12000);
 it('executes all four typed operations through real HTTP daemon leases with literal argv and worker-only credentials', async () => {

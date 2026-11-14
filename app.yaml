@@ -1,0 +1,13 @@
+# Databricks App runtime config (gh-51). Deployed by databricks.yml.
+# The Apps runtime runs `npm install` + `npm run build` (tsc → dist/), then this
+# command. A bare host makes `serve --http` listen on DATABRICKS_APP_PORT.
+command: ["node", "dist/cli.js", "serve", "--http", "0.0.0.0"]
+env:
+  # The Apps proxy authenticates every request and forwards the workspace user;
+  # this mode gates /mcp and the dashboard on that identity (docs/databricks-app.md).
+  - name: UNDERWRIGHT_AUTH_MODE
+    value: databricks
+  # Lakebase Postgres connection string, from the `lakebase-url` app resource
+  # (a secret). Its presence switches the store to PgStore.
+  - name: DATABASE_URL
+    valueFrom: lakebase-url

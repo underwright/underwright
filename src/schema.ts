@@ -20,6 +20,19 @@ CREATE TABLE IF NOT EXISTS task_dependencies (
 CREATE INDEX IF NOT EXISTS task_dependencies_blocker ON task_dependencies(blocker_id);
 `;
 
+/** Sprint windows (gh-56). Tasks join one through tasks.sprint. Portable DDL. */
+export const SPRINTS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS sprints (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  starts_at   TEXT NOT NULL,
+  ends_at     TEXT NOT NULL,
+  goal        TEXT NOT NULL DEFAULT '',
+  created_by  TEXT NOT NULL DEFAULT 'human',
+  created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+`;
+
 export const JOBS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS jobs (
   id           TEXT PRIMARY KEY,
@@ -237,6 +250,40 @@ END $$;
 ALTER TABLE artifacts ADD CONSTRAINT artifacts_kind_check CHECK (kind IN (${ARTIFACT_KIND_SQL}));
 `;
 
+/** Board→GitHub status mirror (task-cfc5f333). One row per linked task: the
+ *  status last reported on the issue, the last digest time, and retry state.
+ *  Portable across SQLite and Postgres (ISO TEXT timestamps). */
+export const GITHUB_STATUS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS github_status (
+  task_id         TEXT PRIMARY KEY,
+  issue_ref       TEXT NOT NULL,
+  last_status     TEXT NOT NULL,
+  last_comment_at TEXT,
+  last_digest_at  TEXT,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  last_error      TEXT,
+  updated_at      TEXT NOT NULL
+);
+`;
+
+/** Agent signing keys (gh-20). One active key per agent; retired keys stay for
+ *  re-verifying old audit events. last_ts is epoch ms of the newest accepted
+ *  attestation (replay guard). Portable across SQLite and Postgres. */
+export const AGENT_KEYS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS agent_keys (
+  key_id      TEXT PRIMARY KEY,
+  agent_id    TEXT NOT NULL,
+  public_key  TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('active','retired')),
+  binding     TEXT NOT NULL,
+  last_ts     BIGINT NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL,
+  retired_at  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_keys_one_active ON agent_keys(agent_id) WHERE status = 'active';
+`;
+
 /** Portable additive node enrollment schema. ISO timestamps sort consistently on both stores. */
 export const NODES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS nodes (
@@ -264,5 +311,9 @@ CREATE TABLE IF NOT EXISTS node_workers (
 );
 CREATE TABLE IF NOT EXISTS node_rate_limits (
   bucket TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cp_leader (
+  role TEXT PRIMARY KEY, instance_id TEXT NOT NULL, expires_at TEXT NOT NULL
 );
 `;

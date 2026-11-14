@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import type { IStore, TaskStatus } from "./istore.js";
 import { getAutoMergePolicy, loadPolicy, type Policy } from "./policy.js";
+import { evidencePack } from "./evidence-pack.js";
 
 // GitHub adapter v1: issue & PR sync + review gates via the `gh` CLI.
 // Requires `gh` to be installed and authenticated — no token plumbing here.
@@ -430,23 +431,14 @@ export async function checkPRGate(
   };
 }
 
-/** Render a task's evidence pack as markdown (for PR/issue comments or review gates). */
-export async function evidencePack(store: IStore, taskId: string) {
-  const task = await store.getTask(taskId);
-  if (!task) return null;
-  const rows = await store.getEvidence(taskId);
-  const lines = [
-    `### Evidence pack — ${task.id}`,
-    `**${task.title}**`,
-    "",
-    ...rows.map(
-      (e) =>
-        `- **${e.kind}** by ${e.agent_id} — \`${e.command}\` → exit ${e.exit_code}` +
-        (e.ac_ids !== "[]" ? ` (proves: ${e.ac_ids})` : "") +
-        (e.output ? `\n  \`\`\`\n  ${String(e.output).slice(0, 500)}\n  \`\`\`` : "")
-    ),
-  ];
-  return lines.join("\n");
+export { evidencePack };
+
+/** Issue commenter over the gh CLI, for the status mirror's CLI path (no GitHub App). */
+export function ghIssuePoster(runner: GhRunner = defaultGhRunner) {
+  return async (repo: string, number: number, body: string) => {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repo) || !Number.isInteger(number)) throw new Error(`invalid issue ${repo}#${number}`);
+    return runner(`issue comment ${number} --repo ${repo} --body-file -`, body);
+  };
 }
 
 /** Post a task's evidence pack as a comment on its linked issue/PR. */

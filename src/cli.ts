@@ -12,17 +12,26 @@ import {
   type ServiceTarget,
 } from "./service.js";
 import { runNode } from "./node-run.js";
+import { prepareHarnessWorkspace } from "./harness-permissions.js";
 import { hostname } from "node:os";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
 import { formatInitResult, initWorkspace } from "./init.js";
+import { exportToPath, importFromPath, snapshotTargetFromEnv } from "./snapshot.js";
 import {
   syncIssues,
   syncPRs,
   checkPRGate,
   linkPR,
   postEvidenceComment,
+  ghIssuePoster,
 } from "./github.js";
+import { appCredsFromEnv, appIssuePoster, githubAppManifest } from "./github-app.js";
+import { postIssueDigests, publishStatusChanges } from "./github-status.js";
+import { getGithubStatusPolicy } from "./policy.js";
+import { parseHttpAddr } from "./platform-auth.js";
+import { formatFindings, installPreCommitHook, scanFiles, scanStaged } from "./secret-scan.js";
+import { agentKeyDir, createAgentKeyFile, readAgentKeyFile, rotateAgentKeyFile, signAction } from "./agent-identity.js";
 
 const [cmd, ...args] = process.argv.slice(2);
 const dbPath = process.env.UNDERWRIGHT_DB ?? "underwright.db";
@@ -67,8 +76,9 @@ switch (cmd) {
   case "serve": {
     const httpIdx = args.indexOf("--http");
     if (httpIdx !== -1) {
-      const [host, port] = (args[httpIdx + 1] ?? "127.0.0.1:8741").split(":");
-      await serveHttp(dbPath, host, Number(port), process.env.UNDERWRIGHT_TOKEN);
+      const next = args[httpIdx + 1];
+      const { host, port } = parseHttpAddr(next?.startsWith("--") ? undefined : next);
+      await serveHttp(dbPath, host, port, process.env.UNDERWRIGHT_TOKEN);
     } else {
       await serve(dbPath);
     }
@@ -80,7 +90,35 @@ switch (cmd) {
       if (args[0] === "enroll") {
         await enrollNode(flag("url") ?? "", flag("name") ?? hostname(), args.includes("--allow-insecure"));
       } else if (args[0] === "status") console.log(JSON.stringify(nodeStatus(), null, 2));
-      else if (args[0] === "run") {
+      else if (args[0] === "approve") {
+        const id = args[1], code = args[2];
+        if (!id || !code) throw new Error("usage: underwright node approve ENROLL_ID CODE [--url ORIGIN] [--policy JSON]");
+        const url = flag("url") ?? "http://127.0.0.1:8741";
+        const token = process.env.UNDERWRIGHT_TOKEN;
+        const policy = flag("policy") ? JSON.parse(flag("policy")!)
+          : { allowed_task_types: ["launch-agent", "provision", "install-harness", "run-script"], workspace_ids: ["underwright", "kraftina", "aura4"], repository_ids: [] };
+        const res = await fetch(url + "/mcp", {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...(token ? { authorization: "Bearer " + token } : {}) },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "approve_node_enrollment", arguments: { enrollment_id: id, code, policy } } }),
+        });
+        const text = await res.text();
+        const data = [...text.matchAll(/^data: (.+)$/gm)].map(m => JSON.parse(m[1])).pop()
+          ?? JSON.parse(text);
+        console.log(JSON.stringify(data?.result ?? data, null, 2));
+      } else if (args[0] === "enrollments") {
+        const url = flag("url") ?? "http://127.0.0.1:8741";
+        const token = process.env.UNDERWRIGHT_TOKEN;
+        const res = await fetch(url + "/mcp", {
+          method: "POST",
+          headers: { "content-type": "application/json", accept: "application/json, text/event-stream", ...(token ? { authorization: "Bearer " + token } : {}) },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_node_enrollments", arguments: {} } }),
+        });
+        const text = await res.text();
+        const data = [...text.matchAll(/^data: (.+)$/gm)].map(m => JSON.parse(m[1])).pop()
+          ?? JSON.parse(text);
+        console.log(JSON.stringify(data?.result ?? data, null, 2));
+      } else if (args[0] === "run") {
         const shutdown = new AbortController();
         process.once("SIGINT", () => shutdown.abort());
         process.once("SIGTERM", () => shutdown.abort());
@@ -90,6 +128,70 @@ switch (cmd) {
         await runNode({ signal: shutdown.signal, config });
       } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
+    break;
+  }
+
+  case "harness": {
+    // underwright harness prepare [--harness claude] [--workspace DIR] [--allow a,b,c] [--claude-json PATH] [--shared]
+    if (args[0] !== "prepare") {
+      console.error("usage: underwright harness prepare [--harness claude] [--workspace DIR] [--allow Tool,Tool] [--claude-json PATH] [--shared]");
+      process.exit(1);
+    }
+    try {
+      const result = prepareHarnessWorkspace(flag("harness") ?? "claude", resolve(flag("workspace") ?? process.cwd()), {
+        allow: flag("allow")?.split(",").map((s) => s.trim()).filter(Boolean),
+        claudeJson: flag("claude-json"),
+        settingsFile: args.includes("--shared") ? "settings.json" : "settings.local.json",
+      });
+      console.log(JSON.stringify(result, null, 2));
+      if (!result.supported) console.error(`[underwright] no permission prep needed/known for harness ${result.harness}`);
+    } catch (error) { console.error(error instanceof Error ? error.message : "harness prepare failed"); process.exitCode = 1; }
+    break;
+  }
+
+  case "agent-key": {
+    // gh-20: underwright agent-key gen|show|sign|rotate --agent ID [...]
+    const usage = "usage: underwright agent-key gen --agent ID [--force] | show --agent ID | sign --agent ID --action ACTION --task TASK [--args JSON] | rotate --agent ID";
+    try {
+      const agent = flag("agent") ?? "";
+      const dir = agentKeyDir();
+      if (args[0] === "gen") {
+        const k = createAgentKeyFile(agent, dir, args.includes("--force"));
+        console.log(JSON.stringify({ ...k, next: "call register_agent_key with agent_id and public_key" }, null, 2));
+      } else if (args[0] === "show") {
+        const { private_key: _p, ...k } = readAgentKeyFile(agent, dir);
+        console.log(JSON.stringify(k, null, 2));
+      } else if (args[0] === "sign") {
+        const action = flag("action");
+        if (!action) throw new Error(usage);
+        const toolArgs = flag("args") ? JSON.parse(flag("args")!) : {};
+        const { private_key } = readAgentKeyFile(agent, dir);
+        console.log(JSON.stringify(signAction(private_key, action, agent, flag("task") ?? "", toolArgs)));
+      } else if (args[0] === "rotate") {
+        console.log(JSON.stringify(rotateAgentKeyFile(agent, dir), null, 2));
+      } else throw new Error(usage);
+    } catch (error) { console.error(error instanceof Error ? error.message : "agent-key failed"); process.exitCode = 1; }
+    break;
+  }
+
+  case "secret-scan": {
+    // underwright secret-scan [--staged] [FILE...] | secret-scan install-hook [--force]
+    try {
+      if (args[0] === "install-hook") {
+        const r = installPreCommitHook(process.cwd(), process.argv[1], { force: args.includes("--force") });
+        console.log(r.installed ? `installed ${r.path}` : `not installed: ${r.reason} (${r.path})`);
+        if (!r.installed) process.exitCode = 1;
+        break;
+      }
+      const files = args.filter((a) => !a.startsWith("--"));
+      if (!args.includes("--staged") && !files.length) {
+        console.error("usage: underwright secret-scan --staged | secret-scan FILE... | secret-scan install-hook [--force]");
+        process.exit(1);
+      }
+      const findings = [...(args.includes("--staged") ? scanStaged() : []), ...scanFiles(files)];
+      (findings.length ? console.error : console.log)(formatFindings(findings));
+      if (findings.length) process.exitCode = 1;
+    } catch (error) { console.error(error instanceof Error ? error.message : "secret-scan failed"); process.exitCode = 2; }
     break;
   }
 
@@ -135,6 +237,35 @@ switch (cmd) {
         else report(installService(opts));
       }
     } catch (error) { console.error(error instanceof Error ? error.message : "service command failed"); process.exitCode = 1; }
+    break;
+  }
+
+  case "export": {
+    // underwright export [--out FILE]   (NDJSON snapshot; stdout by default)
+    const counts = await exportToPath(snapshotTargetFromEnv(dbPath), flag("out"));
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    console.error(`exported ${total} rows from ${Object.keys(counts).length} tables`);
+    break;
+  }
+
+  case "import": {
+    // underwright import FILE|-   (into a fresh store; ids preserved)
+    const file = args[0];
+    if (!file) {
+      console.error("usage: underwright import FILE|-   (target: UNDERWRIGHT_DB or DATABASE_URL; must be empty)");
+      process.exit(1);
+    }
+    try {
+      const result = await importFromPath(snapshotTargetFromEnv(dbPath), file);
+      const total = Object.values(result.counts).reduce((a, b) => a + b, 0);
+      for (const [table, cols] of Object.entries(result.dropped_columns)) {
+        console.error(`warning: ${table}: columns not in target schema were dropped: ${cols.join(", ")}`);
+      }
+      console.error(`imported ${total} rows into ${Object.keys(result.counts).length} tables`);
+    } catch (e) {
+      console.error((e as Error).message);
+      process.exit(1);
+    }
     break;
   }
 
@@ -236,9 +367,44 @@ switch (cmd) {
 
   case "github": {
     const sub = args[0];
-    const repo = args[args.indexOf("--repo") + 1];
+    if (sub === "app-manifest") {
+      const urlIdx = args.indexOf("--url");
+      const base = urlIdx !== -1 ? args[urlIdx + 1] : process.env.UNDERWRIGHT_PUBLIC_URL;
+      if (!base) {
+        console.error("usage: underwright github app-manifest --url https://host[:port] [--name NAME]");
+        process.exit(1);
+      }
+      const nameIdx = args.indexOf("--name");
+      console.log(JSON.stringify(githubAppManifest({ baseUrl: base, name: nameIdx !== -1 ? args[nameIdx + 1] : undefined }), null, 2));
+      break;
+    }
+    if (sub === "status" || sub === "digest") {
+      // Board→GitHub mirror, one pass. GitHub App when creds are exported, else gh CLI.
+      const gp = getGithubStatusPolicy();
+      const repoArg = args.includes("--repo") ? args[args.indexOf("--repo") + 1] : gp.repo;
+      const creds = appCredsFromEnv();
+      const post = args.includes("--dry-run")
+        ? async (r: string, n: number, body: string) => { console.error(`--- ${r}#${n}\n${body}\n`); }
+        : creds ? appIssuePoster(creds) : ghIssuePoster();
+      const s = await openStore(dbPath);
+      try {
+        const out = sub === "status"
+          ? await publishStatusChanges(s, { post, defaultRepo: repoArg })
+          : await postIssueDigests(s, {
+              post, defaultRepo: repoArg, force: args.includes("--force"),
+              everyHours: args.includes("--due") ? gp.digest_hours : 0,
+              only: args.includes("--task") ? [args[args.indexOf("--task") + 1]] : undefined,
+            });
+        console.log(JSON.stringify(out, null, 2));
+      } finally {
+        await s.close();
+      }
+      break;
+    }
+    const repo = args.includes("--repo") ? args[args.indexOf("--repo") + 1] : undefined;
     if (!repo) {
       console.error("usage: underwright github sync|sync-prs|gate|post-evidence|link-pr --repo owner/name [--task ID] [--pr NUM]");
+      console.error("       underwright github status|digest [--repo owner/name] [--dry-run] [--task ID] [--force] [--due]");
       process.exit(1);
     }
     const store = await openStore(dbPath);
@@ -292,10 +458,17 @@ Usage:
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
   underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
+  underwright harness prepare    Pre-accept Claude trust + MCP server + tool allowlist for --workspace DIR (default cwd).
   underwright service install    Install a systemd unit for autostart on reboot:
                                  [serve|node|run|runner] [--http H:P] [--config FILE]
                                  [--url URL] [--system] [--no-start].
                                  status/uninstall/print too.
+  underwright secret-scan        Block secrets: --staged (pre-commit) or FILE...; exit 1 on findings.
+                                 install-hook [--force] writes .git/hooks/pre-commit.
+  underwright agent-key          Agent signing keys (gh-20): gen --agent ID | show | rotate |
+                                 sign --agent ID --action claim_task --task T [--args JSON].
+  underwright export            NDJSON snapshot of every table, ids preserved; [--out FILE] (default stdout).
+  underwright import FILE|-      Load a snapshot into a fresh store (UNDERWRIGHT_DB or DATABASE_URL).
   underwright board              Print the task board.
   underwright digest             Summarize board delta since --since TS [--to AGENT] [--text].
   underwright create             Create a task, optionally from a template (--template feature).
@@ -304,7 +477,15 @@ Usage:
 
 Env:
   UNDERWRIGHT_DB      Path to workspace DB (default: ./underwright.db)
+  UNDERWRIGHT_KEY_DIR Agent private keys (default: ~/.underwright/keys)
   UNDERWRIGHT_GITHUB_WEBHOOK_SECRET
                       HMAC secret for POST /github/webhook.
-                      GITHUB_WEBHOOK_SECRET is the fallback. See docs/webhook.md.`);
+                      GITHUB_WEBHOOK_SECRET is the fallback. See docs/webhook.md.
+  UNDERWRIGHT_GITHUB_APP_ID, UNDERWRIGHT_GITHUB_APP_PRIVATE_KEY (\\n-escaped PEM)
+  or UNDERWRIGHT_GITHUB_APP_PRIVATE_KEY_FILE
+                      GitHub App credentials. When set, completed check suites
+                      post evidence packs on their PRs. Create the app in one
+                      click at GET /github/app/install[?org=ORG].
+  UNDERWRIGHT_PUBLIC_URL
+                      Public base URL used in the app manifest.`);
 }

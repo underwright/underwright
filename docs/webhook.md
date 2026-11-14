@@ -26,6 +26,60 @@ the bearer token when `UNDERWRIGHT_TOKEN` is set.
 
 Bodies larger than 2 MB are rejected with `413`.
 
+## GitHub App (recommended)
+
+A GitHub App delivers the same events as a repository webhook. It covers every
+repository you install it on, uses scoped permissions, and lets Underwright
+post evidence packs back on pull requests.
+
+Permissions requested by the manifest:
+
+| Permission | Access | Why |
+|---|---|---|
+| Metadata | read | Required by GitHub for every app |
+| Issues | write | Comment evidence packs (PR comments use the issues API) |
+| Pull requests | write | Comment on pull requests |
+| Checks | read | Receive `check_run` / `check_suite` |
+
+Subscribed events: `issues`, `check_run`, `check_suite`, `pull_request_review`.
+
+### One-click install
+
+1. Run `underwright serve --http` behind HTTPS as described below. Set
+   `UNDERWRIGHT_PUBLIC_URL=https://<your-host>` so the manifest points GitHub
+   at the right URL. Without it, the request `Host` header and
+   `X-Forwarded-Proto` are used.
+2. Open `https://<your-host>/github/app/install` in a browser. For an
+   organization-owned app, use `/github/app/install?org=<org>`. The page
+   submits the app manifest to GitHub. Confirm the name and create the app.
+3. GitHub redirects to `/github/app/callback`. That page shows the three
+   lines to export. Nothing is stored on the server:
+
+   ```bash
+   export UNDERWRIGHT_GITHUB_APP_ID=123456
+   export UNDERWRIGHT_GITHUB_WEBHOOK_SECRET='…'
+   export UNDERWRIGHT_GITHUB_APP_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----\n…'
+   ```
+
+   You can save the PEM to a file and set
+   `UNDERWRIGHT_GITHUB_APP_PRIVATE_KEY_FILE=/path/key.pem` instead.
+   The callback page shows the private key once, so copy it before you close the page.
+4. Restart `underwright serve --http` with those variables. Then follow the
+   install link on the callback page to install the app on your repositories.
+
+To create the app by hand, print the manifest with
+`underwright github app-manifest --url https://<your-host>`.
+
+### Evidence packs on pull requests
+
+When app credentials are set, a `check_suite` delivery with action
+`completed` that carries `installation.id` does two things. First it appends
+`ci_check` evidence as usual. Then it comments the evidence pack of each
+linked task on every pull request in the suite. Each comment adds a `posted`
+effect to the response. A failed comment adds a `skipped` effect with the
+GitHub error and does not fail the delivery. `installation` and
+`installation_repositories` deliveries are acknowledged and ignored.
+
 ## Repository webhook setup
 
 1. Run the control plane where GitHub can reach it, over HTTPS. See

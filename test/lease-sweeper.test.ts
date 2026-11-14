@@ -65,7 +65,9 @@ function sweepContract(open: () => Promise<IStore>) {
       await store.claimTask(task.id, "holder", -1);
       await store.setTaskStatus(task.id, status, "reviewer");
     }
-    expect((await store.sweepExpiredClaims()).reclaimed.sort()).toEqual(ids.sort());
+    // Moving to done drops the claim immediately (as completeTask does), so
+    // only the in_review and blocked claims are left for the sweeper.
+    expect((await store.sweepExpiredClaims()).reclaimed.sort()).toEqual(ids.slice(0, 2).sort());
     for (const id of ids) {
       const task = await store.getTask(id);
       expect(task.status).toBe(task.title);

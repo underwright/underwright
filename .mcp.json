@@ -2,8 +2,23 @@
   "mcpServers": {
     "underwright": {
       "command": "node",
-      "args": ["dist/cli.js", "serve"],
-      "env": { "UNDERWRIGHT_DB": "underwright.db" }
+      "args": [
+        "dist/cli.js",
+        "serve"
+      ],
+      "env": {
+        "UNDERWRIGHT_DB": "underwright.db"
+      }
+    },
+    "underwright-aura4": {
+      "command": "node",
+      "args": [
+        "/home/alan/code/underwright/dist/cli.js",
+        "serve"
+      ],
+      "env": {
+        "UNDERWRIGHT_DB": "/home/alan/aura4_slice5/underwright.db"
+      }
     }
   }
 }

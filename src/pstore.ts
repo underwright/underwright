@@ -1,14 +1,21 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
-import { NODES_SCHEMA } from "./schema.js";
+import { NODES_SCHEMA, GITHUB_STATUS_SCHEMA, AGENT_KEYS_SCHEMA } from "./schema.js";
+import type { GithubStatusRow, GithubStatusPatch, VerifyAgentActionArgs, VerifyAgentActionResult } from "./istore.js";
+import { planRegistration, planVerification, type AgentKeyRow, type RegisterKeyInput } from "./agent-identity.js";
+import { getIdentityPolicy } from "./policy.js";
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, SPRINTS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { buildRetro, findingKeys, getSdlcPolicy, groomFindings, groomMarkdown, isDue, newFindings, retroMarkdown, retroTaskId, sprintReport, validateSprint } from "./sdlc.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy, type Policy } from "./policy.js";
+import { modelTierReport, routeAgentSpec } from "./model-routing.js";
+import { checkTransition, getLifecyclePolicy } from "./lifecycle.js";
 import { parseCoverage } from "./coverage.js";
-import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { chooseReassignAgent, chooseReviewer, contributorsFromRecords, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
+import { withPrincipal } from "./principal.js";
+import type { IStore, TaskStatus, CreateSprintArgs, RetroArgs, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult, AuditPage } from "./istore.js";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -540,7 +547,8 @@ export class PgStore implements IStore {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
-    await this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // Sliding session (task-570d289b): see SqliteStore.nodeHeartbeat.
+    await this.nodeQuery("UPDATE nodes SET last_seen_at=?, session_expires_at=? WHERE id=? AND session_epoch=?", [now, nodeExpiry(3600), principal.node_id, sessionId]);
     await this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = await this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
@@ -570,6 +578,8 @@ export class PgStore implements IStore {
     const sql = postgres(url, { max: 5 });
     await sql.unsafe(DDL);
     await sql.unsafe(NODES_SCHEMA);
+    await sql.unsafe(GITHUB_STATUS_SCHEMA);
+    await sql.unsafe(AGENT_KEYS_SCHEMA);
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
@@ -578,11 +588,14 @@ export class PgStore implements IStore {
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_of TEXT`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_kind TEXT`;
     await sql`CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of)`;
+    await sql.unsafe(SPRINTS_SCHEMA);
+    await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS sprint TEXT`;
+    await sql`CREATE INDEX IF NOT EXISTS tasks_sprint ON tasks(sprint)`;
     return new PgStore(sql);
   }
 
   async log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
-    await this.sql`INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES (${entityType},${entityId},${action},${actor},${this.sql.json(data as any)})`;
+    await this.sql`INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES (${entityType},${entityId},${action},${actor},${this.sql.json(withPrincipal(data) as any)})`;
   }
 
   private async dependencyTransaction(work: (store: PgStore) => Promise<any>): Promise<any> {
@@ -692,8 +705,15 @@ export class PgStore implements IStore {
     if (!t) return { error: `task ${id} not found` };
     const [raw] = await this.sql`SELECT status FROM tasks WHERE id=${id}`;
     if (raw.status === status) return { id, status };
+    const illegal = checkTransition(
+      { task: { ...t, status: raw.status }, artifacts: await this.listArtifacts(id) as any[] },
+      status, "status", getLifecyclePolicy(loadPolicy()));
+    if (illegal) return { error: illegal };
     await this.sql`UPDATE tasks SET status=${status}, updated_at=now() WHERE id=${id}`;
-    await this.log("task", id, `status:${status}`, actor);
+    // An open or done task holds no claim; a leftover row would block re-claim
+    // and count against the dispatcher cap until its lease expired.
+    if (status === "open" || status === "done") await this.sql`DELETE FROM claims WHERE task_id=${id}`;
+    await this.log("task", id, `status:${status}`, actor, { from: raw.status });
     await this.notifyWatchers(id, `task ${id} → ${status}`);
     if (status === "done" && t.status !== "done") await this.unblockDependents(id, actor);
     return { id, status };
@@ -754,10 +774,13 @@ export class PgStore implements IStore {
       return { error: `task ${taskId} is blocked by unfinished tasks: ${task.unfinished_blockers.join(", ")}` };
     }
 
-    const dor = evaluateDoR(task, loadPolicy());
+    const policy = loadPolicy();
+    const dor = evaluateDoR(task, policy);
     if (!dor.ready) {
       return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
     }
+    const illegal = checkTransition({ task }, "claimed", "claim", getLifecyclePolicy(policy));
+    if (illegal) return { error: illegal };
 
     if (task.type === "review" && task.review_of && claim?.agent_id !== agentId) {
       const independence = reviewIndependenceError(agentId, await this.implementerOf(task.review_of), task.review_of);
@@ -828,6 +851,7 @@ export class PgStore implements IStore {
     if (!claim || claim.agent_id !== agentId) return { error: `task ${taskId} not claimed by ${agentId}` };
     const expires = new Date(Date.now() + ttlSeconds * 1000);
     await this.sql`UPDATE claims SET lease_expires=${expires} WHERE task_id=${taskId}`;
+    await this.log("task", taskId, "lease_renewed", agentId, { ttlSeconds });
     return { task_id: taskId, lease_expires: expires.toISOString() };
   }
 
@@ -926,6 +950,10 @@ export class PgStore implements IStore {
     const claim = task.claim;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     const rows = await this.getEvidence(taskId);
+    const policy = loadPolicy();
+    const artifacts = await this.listArtifacts(taskId) as any[];
+    const illegal = checkTransition({ task, evidence: rows, artifacts }, "done", "complete", getLifecyclePolicy(policy));
+    if (illegal) return { error: illegal };
     const proven = new Set(rows.flatMap((r: any) => r.ac_ids as string[]));
     const acs = task.ac_ids as string[];
     const missing = acs.filter((ac) => !proven.has(ac));
@@ -936,8 +964,6 @@ export class PgStore implements IStore {
       return { error: "no evidence attached. Done requires proof." };
     }
 
-    const policy = loadPolicy();
-    const artifacts = await this.listArtifacts(taskId);
     const dod = evaluateDoD({
       task, evidence: rows, artifacts,
       claimAgent: claim?.agent_id ?? agentId, policy,
@@ -973,6 +999,15 @@ export class PgStore implements IStore {
   }
 
   private async implementerOf(subjectId: string): Promise<string | null> {
+    return implementerFromRecords(await this.subjectRecords(subjectId));
+  }
+
+  /** Agents whose harness a review of subjectId must avoid (gh-68). */
+  private async contributorsOf(subjectId: string): Promise<string[]> {
+    return contributorsFromRecords(await this.subjectRecords(subjectId));
+  }
+
+  private async subjectRecords(subjectId: string) {
     const [completed] = await this.sql<{ actor: string }[]>`
       SELECT actor FROM events WHERE entity_type='task' AND entity_id=${subjectId} AND action='completed' ORDER BY id DESC LIMIT 1`;
     const [claim] = await this.sql<{ agent_id: string }[]>`SELECT agent_id FROM claims WHERE task_id=${subjectId}`;
@@ -981,13 +1016,13 @@ export class PgStore implements IStore {
     const [artifact] = await this.sql<{ agent_id: string }[]>`
       SELECT agent_id FROM artifacts WHERE task_id=${subjectId} AND kind IN ('design','spec') ORDER BY created_at DESC LIMIT 1`;
     const [created] = await this.sql<{ created_by: string }[]>`SELECT created_by FROM tasks WHERE id=${subjectId}`;
-    return implementerFromRecords({
+    return {
       completedBy: completed?.actor,
       claimAgent: claim?.agent_id,
       lastClaimedBy: claimed?.actor,
       artifactAuthor: artifact?.agent_id,
       createdBy: created?.created_by,
-    });
+    };
   }
 
   /** Assign the next open task. Review tasks go to a different harness than the implementer. */
@@ -1012,6 +1047,7 @@ export class PgStore implements IStore {
       }
       const reviewer = chooseReviewer({
         implementer: meta.review_of ? await this.implementerOf(meta.review_of) : null,
+        contributors: meta.review_of ? await this.contributorsOf(meta.review_of) : [],
         agents: (await this.knownAgentWorkloads()).filter((a) => !(capped && a.id === agentId)),
         max: policy.max_tasks_per_agent,
         requireDifferentHarness: policy.review.require_different_harness,
@@ -1140,6 +1176,7 @@ export class PgStore implements IStore {
       const next = meta?.type === "review"
         ? chooseReviewer({
           implementer: meta.review_of ? await this.implementerOf(meta.review_of) : null,
+          contributors: meta.review_of ? await this.contributorsOf(meta.review_of) : [],
           agents: (await this.knownAgentWorkloads()).filter((a) => a.id !== row.assignee),
           max: policy.max_tasks_per_agent,
           requireDifferentHarness: policy.review.require_different_harness,
@@ -1203,10 +1240,14 @@ export class PgStore implements IStore {
     return out;
   }
 
-  async submitJob(a: SubmitJobArgs) {
+  async submitJob(a: SubmitJobArgs, policy?: Policy) {
     if (a.type === "node") return { error: "use submit_node_task for node jobs" };
     if (a.type === "agent" ? !a.agent?.executable || !a.agent.prompt : !a.command)
       return { error: "command required, or executable and prompt for agent jobs" };
+    if (a.type === "agent" && a.agent && a.task_id) {
+      // gh-54: stamp the model tier routed from the task's difficulty signals.
+      a = { ...a, agent: routeAgentSpec(a.agent, await this.getTask(a.task_id) as any, policy ?? loadPolicy()) };
+    }
     const id = `job-${randomUUID().slice(0, 8)}`;
     await this.sql`INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec)
       VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.type},${a.command ?? ""},${a.host ?? null},
@@ -1256,7 +1297,7 @@ export class PgStore implements IStore {
 
   async board() {
     const tasks = await this.sql`
-      SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
+      SELECT t.id, t.title, t.status, t.priority, t.sprint, c.agent_id AS claimed_by, c.lease_expires,
              (SELECT COUNT(*)::int FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
       FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`;
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
@@ -1270,7 +1311,168 @@ export class PgStore implements IStore {
       nodes: await this.listNodes(),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
       agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
+      sprint: await this.sprintReport(),
     };
+  }
+
+  // ------------------------------------------------ SDLC ceremonies (gh-56)
+
+  async createSprint(args: CreateSprintArgs) {
+    const invalid = validateSprint(args);
+    if (invalid) return { error: invalid };
+    const id = args.id?.trim() || `sprint-${randomUUID().slice(0, 8)}`;
+    const [row] = await this.sql<any[]>`INSERT INTO sprints (id, name, starts_at, ends_at, goal, created_by)
+      VALUES (${id}, ${args.name.trim()}, ${args.starts_at}, ${args.ends_at}, ${args.goal ?? ""}, ${args.actor})
+      ON CONFLICT (id) DO NOTHING RETURNING *`;
+    if (!row) return { error: `sprint ${id} already exists` };
+    await this.log("sprint", id, "created", args.actor, { name: args.name, starts_at: args.starts_at, ends_at: args.ends_at });
+    return row;
+  }
+
+  async listSprints() {
+    const now = Date.now();
+    const rows = await this.sql<any[]>`SELECT * FROM sprints ORDER BY starts_at DESC, id`;
+    return rows.map((s) => ({ ...s, state: sprintReport(s, [], now).state }));
+  }
+
+  async assignSprint(taskIds: string[], sprintId: string | null, actor: string) {
+    return this.sql.begin(async (sql) => {
+      const tx = new PgStore(sql as unknown as postgres.Sql);
+      const [sprint] = sprintId ? await tx.sql<any[]>`SELECT * FROM sprints WHERE id=${sprintId}` : [null];
+      if (sprintId && !sprint) return { error: `sprint ${sprintId} not found` };
+      if (sprint && sprintReport(sprint, [], Date.now()).state === "closed") {
+        return { error: `sprint ${sprintId} is closed — assign to an active or planned sprint` };
+      }
+      const rows = await tx.sql<any[]>`SELECT id, status, sprint FROM tasks WHERE id IN ${tx.sql(taskIds)} FOR UPDATE`;
+      const byId = new Map(rows.map((r) => [r.id, r]));
+      const missing = taskIds.filter((id) => !byId.has(id));
+      if (missing.length) return { error: `tasks not found: ${missing.join(", ")}` };
+      const assigned: string[] = [];
+      const carried: string[] = [];
+      for (const id of taskIds) {
+        const t = byId.get(id);
+        if ((t.sprint ?? null) === sprintId || assigned.includes(id)) continue;
+        await tx.sql`UPDATE tasks SET sprint=${sprintId}, updated_at=now() WHERE id=${id}`;
+        const carry = !!t.sprint && !!sprintId && t.status !== "done";
+        if (carry) carried.push(id);
+        assigned.push(id);
+        await tx.log("task", id, "sprint_assigned", actor, { from: t.sprint ?? null, to: sprintId, carry_over: carry });
+      }
+      return { sprint: sprintId, assigned, carried_over: carried };
+    });
+  }
+
+  /** gh-54 metrics: tokens per task by model tier and tier × estimate. */
+  async modelReport() {
+    const jobs = await this.sql<any[]>`SELECT j.id AS job_id, j.task_id, t.estimate, j.agent_spec FROM jobs j JOIN tasks t ON t.id=j.task_id
+        WHERE j.type='agent' ORDER BY j.created_at, j.id`;
+    const tokens = await this.sql<any[]>`SELECT task_id, output FROM evidence WHERE output LIKE '%tokens%'`;
+    return modelTierReport(jobs, tokens);
+  }
+
+  async sprintReport(sprintId?: string) {
+    const now = Date.now();
+    const sprint = sprintId
+      ? (await this.sql<any[]>`SELECT * FROM sprints WHERE id=${sprintId}`)[0]
+      : (await this.sql<any[]>`SELECT * FROM sprints ORDER BY starts_at DESC, id`)
+        .find((s) => sprintReport(s, [], now).state === "active");
+    if (!sprint) return sprintId ? { error: `sprint ${sprintId} not found` } : null;
+    const tasks = await this.sql<any[]>`SELECT t.id, t.status,
+        (SELECT MAX(e.created_at) FROM events e WHERE e.entity_type='task' AND e.entity_id=t.id
+           AND e.action IN ('completed','status:done')) AS completed_at
+      FROM tasks t WHERE t.sprint=${sprint.id} ORDER BY t.id`;
+    const carriedIn = await this.sql<any[]>`SELECT entity_id FROM events WHERE entity_type='task' AND action='sprint_assigned'
+      AND data->>'to'=${sprint.id} AND (data->>'carry_over')::boolean`;
+    return sprintReport(sprint, tasks, now, carriedIn.map((r) => r.entity_id));
+  }
+
+  async runRetro(args: RetroArgs) {
+    const sdlc = getSdlcPolicy(loadPolicy());
+    const until = args.until ? Date.parse(args.until) : Date.now();
+    const since = args.since ? Date.parse(args.since) : until - sdlc.retro.every_days * 86_400_000;
+    if (!Number.isFinite(until) || !Number.isFinite(since) || since >= until) return { error: "invalid retro window" };
+    const from = new Date(since).toISOString();
+    const events = await this.sql<any[]>`SELECT * FROM events WHERE entity_type='task' AND created_at >= ${from}`;
+    const evidence = await this.sql<any[]>`SELECT task_id, kind, exit_code, agent_id, created_at FROM evidence WHERE created_at >= ${from}`;
+    const stats = buildRetro({ since, until, events, evidence });
+    const id = retroTaskId(until);
+    const [exists] = await this.sql`SELECT 1 FROM tasks WHERE id=${id}`;
+    if (exists) return { task_id: id, existing: true, stats };
+    const body = retroMarkdown(stats);
+    const created = await this.createTask({
+      id, title: `Retro ${stats.since.slice(0, 10)} → ${stats.until.slice(0, 10)}`, description: body,
+      type: "retro", estimate: "S", ac_ids: ["actions"], created_by: args.actor, priority: 2,
+    }) as any;
+    if (created?.error) return created;
+    await this.postArtifact({ task_id: id, agent_id: args.actor, kind: "note", title: "Retro stats",
+      content: `${body}\n\n\`\`\`json\n${JSON.stringify(stats, null, 2)}\n\`\`\`` });
+    await this.log("sdlc", "retro", "retro_created", args.actor, { task_id: id, since: stats.since, until: stats.until });
+    return { task_id: id, stats };
+  }
+
+  async groomBacklog(actor: string) {
+    const now = Date.now();
+    const policy = getSdlcPolicy(loadPolicy()).grooming;
+    return this.sql.begin(async (sql) => {
+      const tx = new PgStore(sql as unknown as postgres.Sql);
+      const tasks = await tx.sql<any[]>`SELECT t.id, t.status, t.estimate, t.updated_at,
+          (SELECT MAX(e.created_at) FROM events e WHERE e.entity_type='task' AND e.entity_id=t.id
+             AND e.action NOT IN ('groom_stale','stale_claim','dependency_issue')) AS last_activity
+        FROM tasks t WHERE t.status='open'`;
+      const claims = await tx.sql<any[]>`SELECT c.task_id, c.agent_id, c.lease_expires, c.created_at AS claimed_at,
+          (SELECT MAX(e.created_at) FROM events e WHERE e.actor=c.agent_id
+             AND (e.entity_id=c.task_id OR e.data->>'task_id'=c.task_id)) AS last_holder_activity
+        FROM claims c`;
+      const edges = await tx.sql<any[]>`SELECT d.task_id, t.status AS task_status, d.blocker_id, b.status AS blocker_status
+        FROM task_dependencies d JOIN tasks t ON t.id=d.task_id JOIN tasks b ON b.id=d.blocker_id`;
+      const findings = groomFindings({ now, tasks, claims, edges, policy });
+      const prevRow = (await tx.sql<any[]>`SELECT data FROM events WHERE entity_type='sdlc' AND action='groomed'
+        ORDER BY id DESC LIMIT 1`)[0];
+      const prevData = typeof prevRow?.data === "string" ? JSON.parse(prevRow.data) : prevRow?.data;
+      // Only act on findings the previous pass did not already report.
+      const fresh = newFindings(findings, Array.isArray(prevData?.keys) ? prevData.keys : []);
+      const reset: string[] = [];
+      for (const t of fresh.stale_open) {
+        if (policy.reset_estimates && t.estimate) {
+          await tx.sql`UPDATE tasks SET estimate='', updated_at=now() WHERE id=${t.task_id}`;
+          reset.push(t.task_id);
+        }
+        await tx.log("task", t.task_id, "groom_stale", actor, { ...t, estimate_reset: reset.includes(t.task_id) });
+      }
+      for (const c of fresh.stale_claims) {
+        await tx.log("task", c.task_id, "stale_claim", actor, c);
+        await tx.sendMessage(c.agent_id, actor,
+          `stale claim on ${c.task_id}: no activity for ${c.idle_minutes}m — renew_lease with progress or release_task`, c.task_id);
+      }
+      for (const d of fresh.dependency_issues) await tx.log("task", d.task_id, "dependency_issue", actor, d);
+      const total = fresh.stale_open.length + fresh.stale_claims.length + fresh.dependency_issues.length;
+      const artifact = total
+        ? (await tx.postArtifact({ agent_id: actor, kind: "note", title: "Backlog grooming", content: groomMarkdown(findings, now) }) as any).id
+        : undefined;
+      await tx.log("sdlc", "grooming", "groomed", actor, {
+        stale_open: findings.stale_open.length, stale_claims: findings.stale_claims.length,
+        dependency_issues: findings.dependency_issues.length, estimates_reset: reset.length,
+        new_findings: total, keys: findingKeys(findings),
+      });
+      return { ...findings, new_findings: total, estimates_reset: reset, ...(artifact ? { artifact_id: artifact } : {}) };
+    });
+  }
+
+  async sweepSdlc() {
+    const policy = getSdlcPolicy(loadPolicy());
+    const now = Date.now();
+    const last = async (action: string) =>
+      (await this.sql<any[]>`SELECT MAX(created_at) AS at FROM events WHERE entity_type='sdlc' AND action=${action}`)[0]?.at;
+    const out: { retro?: string; groomed?: boolean } = {};
+    if (policy.grooming.enabled && isDue(await last("groomed"), policy.grooming.every_minutes * 60_000, now)) {
+      await this.groomBacklog("sdlc-sweeper");
+      out.groomed = true;
+    }
+    if (policy.retro.enabled && isDue(await last("retro_created"), policy.retro.every_days * 86_400_000, now)) {
+      const r = await this.runRetro({ actor: "sdlc-sweeper" }) as any;
+      if (r.task_id) out.retro = r.task_id;
+    }
+    return out;
   }
 
   async digest(sinceOrArgs?: string | DigestArgs): Promise<DigestResult> {
@@ -1303,6 +1505,14 @@ export class PgStore implements IStore {
     return rows;
   }
 
+  async conversation(a: string, b: string, limit = 200) {
+    const n = Math.max(1, Math.min(1000, Math.floor(limit)));
+    const rows = await this.sql`SELECT * FROM messages
+      WHERE (to_agent=${a} AND from_agent=${b}) OR (to_agent=${b} AND from_agent=${a})
+      ORDER BY id DESC LIMIT ${n}`;
+    return [...rows].reverse();
+  }
+
   async watchTask(agentId: string, taskId: string) {
     await this.sql`INSERT INTO watches (agent_id, task_id) VALUES (${agentId},${taskId}) ON CONFLICT DO NOTHING`;
     await this.log("watch", taskId, "watching", agentId);
@@ -1323,8 +1533,103 @@ export class PgStore implements IStore {
     return { ...await this.board(), locks, jobs, events: await this.auditLog(eventsLimit) };
   }
 
-  async auditLog(limit = 50) {
-    return this.sql`SELECT * FROM events ORDER BY id DESC LIMIT ${limit}`;
+  async auditLog(limit = 50, page: AuditPage = {}) {
+    const after = page.after_id ?? 0, before = page.before_id ?? Number.MAX_SAFE_INTEGER;
+    return page.after_id !== undefined
+      ? this.sql`SELECT * FROM events WHERE id > ${after} AND id < ${before} ORDER BY id ASC LIMIT ${limit}`
+      : this.sql`SELECT * FROM events WHERE id > ${after} AND id < ${before} ORDER BY id DESC LIMIT ${limit}`;
+  }
+
+  async agentEvents(agentId: string, limit = 200) {
+    const rows = await this.sql`SELECT * FROM events
+      WHERE actor=${agentId} OR (entity_type='message' AND entity_id=${agentId}) OR data->>'principal'=${agentId}
+      ORDER BY id DESC LIMIT ${limit}`;
+    return [...rows].reverse();
+  }
+
+  async taskEvents(taskId: string, sinceIso?: string) {
+    return sinceIso
+      ? this.sql`SELECT * FROM events WHERE entity_id=${taskId} AND created_at > ${sinceIso}::timestamptz ORDER BY id`
+      : this.sql`SELECT * FROM events WHERE entity_id=${taskId} ORDER BY id`;
+  }
+
+  // ── Agent identity & attestation (gh-20). Decisions live in agent-identity.ts. ──
+
+  async registerAgentKey(a: RegisterKeyInput) {
+    const existing = (await this.sql`SELECT * FROM agent_keys WHERE agent_id=${a.agent_id}`) as unknown as AgentKeyRow[];
+    const plan = planRegistration(existing, a);
+    if ("error" in plan) {
+      await this.log("agent", a.agent_id, "key_rejected", a.agent_id, { error: plan.error, binding: a.binding });
+      return plan;
+    }
+    if (plan.kind === "noop") return { agent_id: a.agent_id, key_id: plan.key_id, status: "unchanged" };
+    const now = new Date().toISOString();
+    const r = plan.row;
+    try {
+      await this.sql.begin(async (sql) => {
+        if (plan.kind === "rotate") {
+          const retired = await sql`UPDATE agent_keys SET status='retired', retired_at=${now} WHERE key_id=${plan.retire} AND status='active'`;
+          if (retired.count !== 1) throw new Error("active key changed during rotation");
+        }
+        await sql`INSERT INTO agent_keys (key_id, agent_id, public_key, status, binding, last_ts, created_at)
+          VALUES (${r.key_id}, ${r.agent_id}, ${r.public_key}, ${r.status}, ${r.binding}, 0, ${now})`;
+      });
+    } catch (e: any) {
+      return { error: `registration conflict for ${a.agent_id}: ${e?.message ?? e}` };
+    }
+    await this.log("agent", a.agent_id, plan.kind === "rotate" ? "key_rotated" : "key_registered", a.agent_id, plan.kind === "rotate"
+      ? { key_id: r.key_id, retired: plan.retire, binding: r.binding, attestation: plan.proof }
+      : { key_id: r.key_id, binding: r.binding });
+    return { agent_id: a.agent_id, key_id: r.key_id, status: plan.kind === "rotate" ? "rotated" : "registered", ...(plan.kind === "rotate" ? { retired: plan.retire } : {}) };
+  }
+
+  async listAgentKeys(agentId?: string) {
+    return agentId
+      ? this.sql`SELECT key_id, agent_id, public_key, status, binding, created_at, retired_at FROM agent_keys WHERE agent_id=${agentId} ORDER BY created_at`
+      : this.sql`SELECT key_id, agent_id, public_key, status, binding, created_at, retired_at FROM agent_keys ORDER BY agent_id, created_at`;
+  }
+
+  async revokeAgentKeys(agentId: string, actor: string) {
+    const r = await this.sql`UPDATE agent_keys SET status='retired', retired_at=${new Date().toISOString()} WHERE agent_id=${agentId} AND status='active'`;
+    await this.log("agent", agentId, "keys_revoked", actor, { retired: r.count });
+    return { agent_id: agentId, retired: r.count };
+  }
+
+  async verifyAgentAction(a: VerifyAgentActionArgs): Promise<VerifyAgentActionResult> {
+    const [active] = (await this.sql`SELECT * FROM agent_keys WHERE agent_id=${a.agent_id} AND status='active'`) as unknown as AgentKeyRow[];
+    const plan = planVerification(active, getIdentityPolicy(loadPolicy()).require_signatures, a.action, a.agent_id, a.task_id, a.args, a.attestation);
+    const reject = async (error: string) => {
+      await this.log("agent", a.agent_id, "attestation_rejected", a.agent_id, { action: a.action, task_id: a.task_id, error });
+      return { error };
+    };
+    if ("error" in plan) return reject(plan.error);
+    if (plan.kind === "unsigned") return { ok: true };
+    const ts = plan.attestation.ts;
+    const won = await this.sql`UPDATE agent_keys SET last_ts=${ts} WHERE key_id=${plan.attestation.key_id} AND status='active' AND last_ts < ${ts}`;
+    if (won.count !== 1) return reject("attestation replayed: ts must increase per key");
+    return { ok: true, attestation: plan.attestation };
+  }
+
+  async listGithubStatus(): Promise<GithubStatusRow[]> {
+    return (await this.sql`SELECT * FROM github_status ORDER BY task_id`) as unknown as GithubStatusRow[];
+  }
+
+  async putGithubStatus(taskId: string, patch: GithubStatusPatch, actor: string): Promise<GithubStatusRow> {
+    const [prev] = await this.sql`SELECT * FROM github_status WHERE task_id=${taskId}`;
+    const row: GithubStatusRow = {
+      task_id: taskId,
+      last_comment_at: null, last_digest_at: null, attempts: 0, last_attempt_at: null, last_error: null,
+      ...(prev as any),
+      ...patch,
+      updated_at: new Date().toISOString(),
+    };
+    await this.sql`INSERT INTO github_status (task_id, issue_ref, last_status, last_comment_at, last_digest_at, attempts, last_attempt_at, last_error, updated_at)
+      VALUES (${row.task_id}, ${row.issue_ref}, ${row.last_status}, ${row.last_comment_at}, ${row.last_digest_at}, ${row.attempts}, ${row.last_attempt_at}, ${row.last_error}, ${row.updated_at})
+      ON CONFLICT (task_id) DO UPDATE SET issue_ref=excluded.issue_ref, last_status=excluded.last_status,
+        last_comment_at=excluded.last_comment_at, last_digest_at=excluded.last_digest_at, attempts=excluded.attempts,
+        last_attempt_at=excluded.last_attempt_at, last_error=excluded.last_error, updated_at=excluded.updated_at`;
+    await this.log("github_status", taskId, "updated", actor, patch);
+    return row;
   }
 
   async close() {

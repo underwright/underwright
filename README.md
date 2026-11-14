@@ -9,9 +9,9 @@ evidence instead of "looks done to me."
 
 ## The problem it solves
 
-Run two agents on the same repo and they duplicate work, write competing
-utilities, and grade their own homework. Underwright gives them a shared
-control plane:
+Point multiple coding agents at the same repo and they duplicate work, write
+competing utilities, and grade their own homework. Underwright gives them a
+shared control plane:
 
 - **Work registry** — tasks with ownership (file globs/symbols), acceptance
   criteria, and a spec reference
@@ -27,6 +27,11 @@ control plane:
   and do other work instead of burning inference on polling
 - **Audit log** — every mutation is an event. The compliance trail is free.
 
+**GitHub is the work-item source of truth.** New work starts as an issue;
+`github sync` or the webhook turns it into a `gh-*` board task that agents
+claim, verify, and close out. The board is coordination state, not a second
+backlog — see [docs/process-flow.md](docs/process-flow.md).
+
 ## Quick start
 
 Install globally or run directly with `npx`:
@@ -34,6 +39,13 @@ Install globally or run directly with `npx`:
 ```bash
 npm i -g underwright
 ```
+
+Published on npm as the unscoped `underwright` package under the maintainer's
+personal account — npm orgs can only own scoped (`@underwright/*`) packages, so
+the CLI name stays unscoped by design. The `underwright` org is reserved for
+future scoped packages (pro tier, plugins). Releases are tag-triggered CI
+publish (gh#65); `publishConfig.provenance` is on for CI and should be
+overridden with `--provenance=false` for any manual publish.
 
 Point any MCP-capable agent at the server:
 
@@ -195,6 +207,10 @@ checklist for the triager to complete before the task is claimable.
 - **Local-first.** One SQLite file per workspace; no service required.
   A hosted, multi-repo control plane is the roadmap, not the prerequisite.
 
+How the running system hangs together — the work loop end to end, which
+behaviors are policy-driven today, and which are designed-but-unbuilt — is in
+[docs/process-flow.md](docs/process-flow.md).
+
 ## Status
 
 Early development. Roadmap: git-platform adapters (GitHub/GitLab/ADO),
@@ -235,6 +251,39 @@ raw CLI when `omni` or the harness is unavailable. Preferences are pinned in
 `underwright.policy.json` under `harness_matrix`. See
 [docs/multi-harness.md](docs/multi-harness.md#omnigent-backend-uw-runner) for
 the coverage table and the session-link captured into job results.
+
+> **Omnigent is not "another agent"** — it's the agent runtime/fleet manager:
+> a swarm of harnesses (Claude, Codex, CommandCode, Kimi, Antigravity, Cursor,
+> Copilot, …) each running under one supervisor with session tracking, token/cost
+> accounting, inboxes, and push wake. Underwright is the board/dispatch/control
+> plane that feeds work to that swarm; Omnigent is how the swarm executes it.
+> One orchestrates *work*, the other orchestrates *agents* — they're two halves
+> of the same stack, not two agents.
+
+```mermaid
+graph LR
+  subgraph "Underwright — the work layer"
+    B[Board / tasks / claims]
+    D[Dispatcher + watch]
+    M[Mailbox — system of record]
+    J[Job queue]
+  end
+  subgraph "Omnigent — the agent layer"
+    O[omni run / supervisor]
+    H1[claude]
+    H2[codex]
+    H3[cmdc / kimi / agy …]
+    U[session usage: tokens + cost]
+  end
+  GH[GitHub issues] -->|sync| B
+  B --> D --> J
+  J -->|backend: omnigent| O
+  O --> H1 & H2 & H3
+  H1 & H2 & H3 -->|session marker| U
+  M -.->|push mirror| O
+  B -->|MCP| AG[agents on any host]
+  O -.->|optional wake| AG
+```
 
 `submit_job` accepts optional `host` and `target_agent_id` affinity; both must
 match when supplied. `agent_id` remains the submitter identity. Unpinned jobs

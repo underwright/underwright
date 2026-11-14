@@ -69,6 +69,16 @@ describe("helper index", () => {
     expect(hits.length).toBeGreaterThan(0);
     expect(hits[0].entity_type).toBe("helper");
   });
+
+  it("treats FTS5 operator characters in queries as literal text", () => {
+    store.registerHelper({ agent_id: "a", path: "test/node-safety.test.ts", symbol: "until", kind: "util", summary: "node-safety TERM-resistant child fixture for claude@minipc" });
+    for (const q of ["node-safety", "TERM-resistant child", "claude@minipc", 'say "hi', "a:b", "(x", "NOT", "foo*", "   "]) {
+      expect(() => store.searchContext(q)).not.toThrow();
+    }
+    expect(store.searchContext("TERM-resistant child").some((h: any) => h.entity_type === "helper")).toBe(true);
+    expect(store.searchContext("node-safety").some((h: any) => h.entity_type === "helper")).toBe(true);
+    expect(store.searchContext("resist*").some((h: any) => h.entity_type === "helper")).toBe(true);
+  });
 });
 
 describe("jobs", () => {
@@ -98,9 +108,11 @@ describe.skipIf(!process.env.DATABASE_URL)("pg backend", () => {
 describe("definition of done", () => {
   it("warns (not blocks) when policy missing requirements at warn level", async () => {
     process.env.UNDERWRIGHT_POLICY = new URL("../underwright.policy.json", import.meta.url).pathname;
-    const t = store.createTask({ title: "feat", type: "feature" });
-    store.claimTask(t.id, "agent-A");
-    store.reportEvidence({ task_id: t.id, agent_id: "agent-A", kind: "test_run", exit_code: 0 });
+    // Triaged so the DoR gate passes: the repo policy enables the lifecycle
+    // FSM, which refuses to complete a task that never left 'open'.
+    const t = store.createTask({ title: "feat", type: "feature", ac_ids: ["ac1"], estimate: "S" });
+    expect(store.claimTask(t.id, "agent-A")).not.toHaveProperty("error");
+    store.reportEvidence({ task_id: t.id, agent_id: "agent-A", kind: "test_run", exit_code: 0, ac_ids: ["ac1"] });
     const r = store.completeTask(t.id, "agent-A") as any;
     expect(r).toHaveProperty("completed", t.id);
     expect(r.warnings?.join(" ")).toContain("coverage");

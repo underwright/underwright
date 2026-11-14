@@ -1,25 +1,61 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
-import { NODES_SCHEMA } from "./schema.js";
+import { NODES_SCHEMA, GITHUB_STATUS_SCHEMA, AGENT_KEYS_SCHEMA } from "./schema.js";
+import type { GithubStatusRow, GithubStatusPatch, VerifyAgentActionArgs, VerifyAgentActionResult } from "./istore.js";
+import { planRegistration, planVerification, type AgentKeyRow, type RegisterKeyInput } from "./agent-identity.js";
+import { getIdentityPolicy } from "./policy.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
+import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, SPRINTS_SCHEMA, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { buildRetro, findingKeys, getSdlcPolicy, groomFindings, groomMarkdown, isDue, newFindings, retroMarkdown, retroTaskId, sprintReport, validateSprint } from "./sdlc.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy, type Policy } from "./policy.js";
+import { modelTierReport, routeAgentSpec } from "./model-routing.js";
+import { checkTransition, getLifecyclePolicy } from "./lifecycle.js";
 import { parseCoverage } from "./coverage.js";
-import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
+import { renewalWorthLogging } from "./lease.js";
+import { chooseReassignAgent, chooseReviewer, contributorsFromRecords, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
-import type { IStore, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
+import type { IStore, CreateSprintArgs, RetroArgs, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult, AuditPage } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
 export type { TaskStatus } from "./istore.js";
 import type { TaskStatus } from "./istore.js";
 import { PgStore } from "./pstore.js";
+import { withPrincipal } from "./principal.js";
+
+/**
+ * Turn free text into a safe FTS5 MATCH expression: each whitespace token becomes a
+ * quoted string (so `-`, `:`, `@`, `(`, `"`, AND/OR/NOT are literal), ANDed implicitly.
+ * A trailing `*` on a token is kept as a prefix query. Returns "" when nothing searchable remains.
+ */
+export function ftsQuery(text: string): string {
+  return text.trim().split(/\s+/).map((tok) => {
+    const prefix = tok.length > 1 && tok.endsWith("*");
+    const body = (prefix ? tok.slice(0, -1) : tok).replace(/"/g, '""');
+    if (!/[\p{L}\p{N}]/u.test(body)) return "";
+    return `"${body}"${prefix ? "*" : ""}`;
+  }).filter(Boolean).join(" ");
+}
 
 export class SqliteStore implements IStore {
   private db: Database.Database;
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
-    return this.db.transaction(() => work(this))();
+    // IMMEDIATE: take the write lock up front. A DEFERRED transaction that reads
+    // then writes fails with SQLITE_BUSY_SNAPSHOT (no busy-handler retry) when
+    // another process commits in between — task-d35372ce. Even IMMEDIATE can
+    // lose the lock race at open under contention; retry briefly so callers
+    // (e.g. enroll exchange) see retryable state, not HTTP 500.
+    const tx = this.db.transaction(() => work(this));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return tx.immediate();
+      } catch (e: any) {
+        if (!String(e?.code ?? "").startsWith("SQLITE_BUSY") || attempt >= 4) throw e;
+        const ms = 25 * (attempt + 1);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      }
+    }
   }
   private nodeQuery(query: string, params: any[] = []): any[] {
     const statement = this.db.prepare(query);
@@ -206,7 +242,10 @@ export class SqliteStore implements IStore {
            VALUES (?,?,?,'node','',?,?,?,?)`,
           [id, args.task_id ?? null, args.agent_id ?? "admin", targetId, JSON.stringify(spec), dedupe, args.retry_of ?? null],
         );
-      } catch {
+      } catch (e: any) {
+        // Only a dedupe-key constraint race is recoverable here; surface
+        // anything else (e.g. SQLITE_BUSY) with its real cause.
+        if (!String(e?.code ?? "").startsWith("SQLITE_CONSTRAINT")) throw e;
         const existing = (s.nodeQuery(
           "SELECT * FROM jobs WHERE target_node_id=? AND dedupe_key=? AND status IN ('queued','running')",
           [targetId, dedupe],
@@ -424,7 +463,10 @@ export class SqliteStore implements IStore {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
-    this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // Sliding session: a live heartbeat keeps the session (and its job leases)
+    // valid. Without this the session hard-expired at 1h and the daemon died
+    // mid-run (task-570d289b). The node token remains the real credential.
+    this.nodeQuery("UPDATE nodes SET last_seen_at=?, session_expires_at=? WHERE id=? AND session_epoch=?", [now, nodeExpiry(3600), principal.node_id, sessionId]);
     this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
@@ -450,10 +492,16 @@ export class SqliteStore implements IStore {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
+    // Explicit rather than relying on the driver default: wait out short lock
+    // contention from the HTTP server / node daemon instead of failing.
+    this.db.pragma("busy_timeout = 5000");
     this.db.exec(SCHEMA);
+    this.db.exec(SPRINTS_SCHEMA);
     this.migrate();
     this.db.exec(JOBS_INDEXES);
     this.db.exec(NODES_SCHEMA);
+    this.db.exec(GITHUB_STATUS_SCHEMA);
+    this.db.exec(AGENT_KEYS_SCHEMA);
   }
 
   /** Schema versioning via PRAGMA user_version. */
@@ -571,6 +619,13 @@ export class SqliteStore implements IStore {
       this.db.exec("CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of);");
       this.db.exec("PRAGMA user_version = 9;");
     }
+    if (v < 10) {
+      // v10: sprint scope (gh-56) — a task belongs to at most one sprint.
+      const has = this.db.prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='sprint'").get();
+      if (!has) this.db.exec("ALTER TABLE tasks ADD COLUMN sprint TEXT;");
+      this.db.exec("CREATE INDEX IF NOT EXISTS tasks_sprint ON tasks(sprint);");
+      this.db.exec("PRAGMA user_version = 10;");
+    }
   }
 
   notifyWatchers(taskId: string, body: string) {
@@ -582,7 +637,7 @@ export class SqliteStore implements IStore {
   log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
     this.db
       .prepare("INSERT INTO events (entity_type, entity_id, action, actor, data, created_at) VALUES (?,?,?,?,?,?)")
-      .run(entityType, entityId, action, actor, JSON.stringify(data), new Date().toISOString());
+      .run(entityType, entityId, action, actor, JSON.stringify(withPrincipal(data)), new Date().toISOString());
   }
 
   private index(entityType: string, entityId: string, title: string, content: string) {
@@ -696,8 +751,15 @@ export class SqliteStore implements IStore {
     if (!t) return { error: `task ${id} not found` };
     const raw = this.db.prepare("SELECT status FROM tasks WHERE id=?").get(id) as any;
     if (raw.status === status) return { id, status };
+    const illegal = checkTransition(
+      { task: { ...t, status: raw.status }, artifacts: this.listArtifacts(id) as any[] },
+      status, "status", getLifecyclePolicy(loadPolicy()));
+    if (illegal) return { error: illegal };
     this.db.prepare("UPDATE tasks SET status=?, updated_at=datetime('now') WHERE id=?").run(status, id);
-    this.log("task", id, `status:${status}`, actor);
+    // An open or done task holds no claim; a leftover row would block re-claim
+    // and count against the dispatcher cap until its lease expired.
+    if (status === "open" || status === "done") this.db.prepare("DELETE FROM claims WHERE task_id=?").run(id);
+    this.log("task", id, `status:${status}`, actor, { from: raw.status });
     this.notifyWatchers(id, `task ${id} → ${status}`);
     if (status === "done" && t.status !== "done") this.unblockDependents(id, actor);
     return { id, status };
@@ -762,10 +824,13 @@ export class SqliteStore implements IStore {
       return { error: `task ${taskId} is blocked by unfinished tasks: ${task.unfinished_blockers.join(", ")}` };
     }
 
-    const dor = evaluateDoR(task, loadPolicy());
+    const policy = loadPolicy();
+    const dor = evaluateDoR(task, policy);
     if (!dor.ready) {
       return { error: `task ${taskId} is not ready to claim: ${dor.missing.join("; ")}. Triage it first (update_task).` };
     }
+    const illegal = checkTransition({ task }, "claimed", "claim", getLifecyclePolicy(policy));
+    if (illegal) return { error: illegal };
 
     if (task.type === "review" && task.review_of && existing?.agent_id !== agentId) {
       const independence = reviewIndependenceError(agentId, this.implementerOf(task.review_of), task.review_of);
@@ -838,6 +903,14 @@ export class SqliteStore implements IStore {
     return rows;
   }
 
+  conversation(a: string, b: string, limit = 200) {
+    const rows = this.db.prepare(
+      `SELECT * FROM messages WHERE (to_agent=? AND from_agent=?) OR (to_agent=? AND from_agent=?)
+       ORDER BY id DESC LIMIT ?`,
+    ).all(a, b, b, a, Math.max(1, Math.min(1000, Math.floor(limit)))) as any[];
+    return rows.reverse();
+  }
+
   watchTask(agentId: string, taskId: string) {
     this.db.prepare("INSERT OR IGNORE INTO watches (agent_id, task_id) VALUES (?,?)").run(agentId, taskId);
     this.log("watch", taskId, "watching", agentId);
@@ -862,7 +935,21 @@ export class SqliteStore implements IStore {
     if (!claim || claim.agent_id !== agentId) return { error: `task ${taskId} not claimed by ${agentId}` };
     const expires = new Date(Date.now() + ttlSeconds * 1000).toISOString();
     this.db.prepare("UPDATE claims SET lease_expires=? WHERE task_id=?").run(expires, taskId);
+    this.log("task", taskId, "lease_renewed", agentId, { ttlSeconds });
     return { task_id: taskId, lease_expires: expires };
+  }
+
+  /** Single-instance lease for clock-driven loops: only one serve sweeps. */
+  sweeperLeadership(instanceId: string, ttlSeconds = 90) {
+    const now = new Date();
+    const exp = new Date(now.getTime() + ttlSeconds * 1000).toISOString();
+    return this.db.transaction(() => {
+      const row = this.db.prepare("SELECT instance_id, expires_at FROM cp_leader WHERE role='sweeper'").get() as any;
+      if (row && row.instance_id !== instanceId && row.expires_at > now.toISOString()) return false;
+      this.db.prepare("INSERT INTO cp_leader(role,instance_id,expires_at) VALUES('sweeper',?,?) ON CONFLICT(role) DO UPDATE SET instance_id=excluded.instance_id, expires_at=excluded.expires_at")
+        .run(instanceId, exp);
+      return true;
+    }).immediate();
   }
 
   /** Reclaim leases and publish their effects atomically, even across servers. */
@@ -961,6 +1048,10 @@ export class SqliteStore implements IStore {
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
 
     const rows = this.getEvidence(taskId) as any[];
+    const policy = loadPolicy();
+    const artifacts = this.listArtifacts(taskId) as any[];
+    const illegal = checkTransition({ task, evidence: rows, artifacts }, "done", "complete", getLifecyclePolicy(policy));
+    if (illegal) return { error: illegal };
     const proven = new Set(rows.flatMap((r) => JSON.parse(r.ac_ids)));
     const missing = (task.ac_ids as string[]).filter((ac) => !proven.has(ac));
     if (missing.length > 0) {
@@ -970,9 +1061,8 @@ export class SqliteStore implements IStore {
       return { error: "no evidence attached. Done requires proof." };
     }
 
-    const policy = loadPolicy();
     const dod = evaluateDoD({
-      task, evidence: rows, artifacts: this.listArtifacts(taskId),
+      task, evidence: rows, artifacts,
       claimAgent: claim?.agent_id ?? agentId, policy,
     });
     if (dod.blocked) {
@@ -1006,6 +1096,15 @@ export class SqliteStore implements IStore {
   }
 
   private implementerOf(subjectId: string): string | null {
+    return implementerFromRecords(this.subjectRecords(subjectId));
+  }
+
+  /** Agents whose harness a review of subjectId must avoid (gh-68). */
+  private contributorsOf(subjectId: string): string[] {
+    return contributorsFromRecords(this.subjectRecords(subjectId));
+  }
+
+  private subjectRecords(subjectId: string) {
     const completed = this.db.prepare(
       "SELECT actor FROM events WHERE entity_type='task' AND entity_id=? AND action='completed' ORDER BY id DESC LIMIT 1"
     ).get(subjectId) as { actor?: string } | undefined;
@@ -1017,13 +1116,13 @@ export class SqliteStore implements IStore {
       "SELECT agent_id FROM artifacts WHERE task_id=? AND kind IN ('design','spec') ORDER BY created_at DESC LIMIT 1"
     ).get(subjectId) as { agent_id?: string } | undefined;
     const created = this.db.prepare("SELECT created_by FROM tasks WHERE id=?").get(subjectId) as { created_by?: string } | undefined;
-    return implementerFromRecords({
+    return {
       completedBy: completed?.actor,
       claimAgent: claim?.agent_id,
       lastClaimedBy: claimed?.actor,
       artifactAuthor: artifact?.agent_id,
       createdBy: created?.created_by,
-    });
+    };
   }
 
   /** Assign the next open task. Review tasks go to a different harness than the implementer. */
@@ -1048,7 +1147,8 @@ export class SqliteStore implements IStore {
       }
       const reviewer = chooseReviewer({
         implementer: meta.review_of ? this.implementerOf(meta.review_of) : null,
-        agents: this.knownAgentWorkloads().filter((a) => !(capped && a.id === agentId)),
+        contributors: meta.review_of ? this.contributorsOf(meta.review_of) : [],
+        agents: this.knownAgentWorkloads(Math.max(policy.idle_minutes * 2, 30)).filter((a) => !(capped && a.id === agentId)),
         max: policy.max_tasks_per_agent,
         requireDifferentHarness: policy.review.require_different_harness,
         preferStronger: policy.review.prefer_stronger,
@@ -1134,11 +1234,20 @@ export class SqliteStore implements IStore {
     };
   }
 
-  private knownAgentWorkloads() {
+  private knownAgentWorkloads(liveWithinMinutes = 0) {
+    const activity = liveWithinMinutes > 0
+      ? "AND created_at >= datetime('now', ?)"
+      : "";
+    // Liveness must come from agent-driven actions — dispatcher-made 'claimed'
+    // events (claimTaskAtomic on an idle assignee) would otherwise manufacture it.
+    const actions = activity
+      ? "'completed', 'lease_renewed', 'released'"
+      : "'claimed', 'completed', 'released'";
     const rows = this.db.prepare(`
       SELECT DISTINCT actor AS id FROM events
-      WHERE entity_type = 'task' AND action IN ('claimed', 'completed', 'released')
-    `).all() as { id: string }[];
+      WHERE entity_type = 'task' AND action IN (${actions})
+      ${activity}
+    `).all(...(activity ? [`-${liveWithinMinutes} minutes`] : [])) as { id: string }[];
     return rows
       .filter((row) => row.id && !isSystemActor(row.id))
       .map((row) => ({ id: row.id, workload: this.agentWorkload(row.id) }));
@@ -1169,10 +1278,12 @@ export class SqliteStore implements IStore {
         continue;
       }
       const meta = this.taskRouteMeta(row.taskId);
+      const live = this.knownAgentWorkloads(Math.max(policy.idle_minutes * 2, 30));
       const next = meta?.type === "review"
         ? chooseReviewer({
           implementer: meta.review_of ? this.implementerOf(meta.review_of) : null,
-          agents: this.knownAgentWorkloads().filter((a) => a.id !== row.assignee),
+          contributors: meta.review_of ? this.contributorsOf(meta.review_of) : [],
+          agents: live.filter((a) => a.id !== row.assignee),
           max: policy.max_tasks_per_agent,
           requireDifferentHarness: policy.review.require_different_harness,
           preferStronger: policy.review.prefer_stronger,
@@ -1180,7 +1291,7 @@ export class SqliteStore implements IStore {
         })
         : chooseReassignAgent({
           assignee: row.assignee,
-          agents: this.knownAgentWorkloads(),
+          agents: live,
           max: policy.max_tasks_per_agent,
         });
       if (!next) { mark("no_alternate_agent"); continue; }
@@ -1196,6 +1307,155 @@ export class SqliteStore implements IStore {
       reassigned.push(row.taskId);
     }
     return { reassigned, logged };
+  }
+
+  // ------------------------------------------------ SDLC ceremonies (gh-56)
+
+  createSprint(args: CreateSprintArgs) {
+    const invalid = validateSprint(args);
+    if (invalid) return { error: invalid };
+    const id = args.id?.trim() || `sprint-${randomUUID().slice(0, 8)}`;
+    return this.db.transaction(() => {
+      if (this.db.prepare("SELECT 1 FROM sprints WHERE id=?").get(id)) return { error: `sprint ${id} already exists` };
+      this.db.prepare("INSERT INTO sprints (id, name, starts_at, ends_at, goal, created_by) VALUES (?,?,?,?,?,?)")
+        .run(id, args.name.trim(), args.starts_at, args.ends_at, args.goal ?? "", args.actor);
+      this.log("sprint", id, "created", args.actor, { name: args.name, starts_at: args.starts_at, ends_at: args.ends_at });
+      return this.db.prepare("SELECT * FROM sprints WHERE id=?").get(id);
+    }).immediate();
+  }
+
+  listSprints() {
+    const now = Date.now();
+    return (this.db.prepare("SELECT * FROM sprints ORDER BY starts_at DESC, id").all() as any[])
+      .map((s) => ({ ...s, state: sprintReport(s, [], now).state }));
+  }
+
+  assignSprint(taskIds: string[], sprintId: string | null, actor: string) {
+    return this.db.transaction(() => {
+      const sprint = sprintId ? this.db.prepare("SELECT * FROM sprints WHERE id=?").get(sprintId) as any : null;
+      if (sprintId && !sprint) return { error: `sprint ${sprintId} not found` };
+      if (sprint && sprintReport(sprint, [], Date.now()).state === "closed") {
+        return { error: `sprint ${sprintId} is closed — assign to an active or planned sprint` };
+      }
+      const rows = taskIds.map((id) => this.db.prepare("SELECT id, status, sprint FROM tasks WHERE id=?").get(id) as any);
+      const missing = taskIds.filter((_, i) => !rows[i]);
+      if (missing.length) return { error: `tasks not found: ${missing.join(", ")}` };
+      const update = this.db.prepare("UPDATE tasks SET sprint=?, updated_at=datetime('now') WHERE id=?");
+      const assigned: string[] = [];
+      const carried: string[] = [];
+      for (const t of rows) {
+        if ((t.sprint ?? null) === sprintId) continue;
+        update.run(sprintId, t.id);
+        const carry = !!t.sprint && !!sprintId && t.status !== "done";
+        if (carry) carried.push(t.id);
+        assigned.push(t.id);
+        this.log("task", t.id, "sprint_assigned", actor, { from: t.sprint ?? null, to: sprintId, carry_over: carry });
+      }
+      return { sprint: sprintId, assigned, carried_over: carried };
+    }).immediate();
+  }
+
+  sprintReport(sprintId?: string) {
+    const now = Date.now();
+    const sprint = (sprintId
+      ? this.db.prepare("SELECT * FROM sprints WHERE id=?").get(sprintId)
+      : (this.db.prepare("SELECT * FROM sprints ORDER BY starts_at DESC, id").all() as any[])
+        .find((s) => sprintReport(s, [], now).state === "active")) as any;
+    if (!sprint) return sprintId ? { error: `sprint ${sprintId} not found` } : null;
+    const tasks = this.db.prepare(`SELECT t.id, t.status,
+        (SELECT MAX(e.created_at) FROM events e WHERE e.entity_type='task' AND e.entity_id=t.id
+           AND e.action IN ('completed','status:done')) AS completed_at
+      FROM tasks t WHERE t.sprint=? ORDER BY t.id`).all(sprint.id) as any[];
+    const carriedIn = (this.db.prepare(`SELECT entity_id FROM events WHERE entity_type='task' AND action='sprint_assigned'
+      AND json_extract(data,'$.to')=? AND json_extract(data,'$.carry_over')=1`).all(sprint.id) as any[]).map((r) => r.entity_id);
+    return sprintReport(sprint, tasks, now, carriedIn);
+  }
+
+  runRetro(args: RetroArgs) {
+    const sdlc = getSdlcPolicy(loadPolicy());
+    const until = args.until ? Date.parse(args.until) : Date.now();
+    const since = args.since ? Date.parse(args.since) : until - sdlc.retro.every_days * 86_400_000;
+    if (!Number.isFinite(until) || !Number.isFinite(since) || since >= until) return { error: "invalid retro window" };
+    const floor = new Date(since).toISOString().slice(0, 10);
+    const events = this.db.prepare("SELECT * FROM events WHERE entity_type='task' AND created_at >= ?").all(floor) as any[];
+    const evidence = this.db.prepare("SELECT task_id, kind, exit_code, agent_id, created_at FROM evidence WHERE created_at >= ?").all(floor) as any[];
+    const stats = buildRetro({ since, until, events, evidence });
+    const id = retroTaskId(until);
+    if (this.db.prepare("SELECT 1 FROM tasks WHERE id=?").get(id)) return { task_id: id, existing: true, stats };
+    const body = retroMarkdown(stats);
+    const created = this.createTask({
+      id, title: `Retro ${stats.since.slice(0, 10)} → ${stats.until.slice(0, 10)}`, description: body,
+      type: "retro", estimate: "S", ac_ids: ["actions"], created_by: args.actor, priority: 2,
+    }) as any;
+    if (created?.error) return created;
+    this.postArtifact({ task_id: id, agent_id: args.actor, kind: "note", title: "Retro stats",
+      content: `${body}\n\n\`\`\`json\n${JSON.stringify(stats, null, 2)}\n\`\`\`` });
+    this.log("sdlc", "retro", "retro_created", args.actor, { task_id: id, since: stats.since, until: stats.until });
+    return { task_id: id, stats };
+  }
+
+  groomBacklog(actor: string) {
+    const now = Date.now();
+    const policy = getSdlcPolicy(loadPolicy()).grooming;
+    return this.db.transaction(() => {
+      const tasks = this.db.prepare(`SELECT t.id, t.status, t.estimate, t.updated_at,
+          (SELECT MAX(e.created_at) FROM events e WHERE e.entity_type='task' AND e.entity_id=t.id
+             AND e.action NOT IN ('groom_stale','stale_claim','dependency_issue')) AS last_activity
+        FROM tasks t WHERE t.status='open'`).all() as any[];
+      const claims = this.db.prepare(`SELECT c.task_id, c.agent_id, c.lease_expires, c.created_at AS claimed_at,
+          (SELECT MAX(e.created_at) FROM events e WHERE e.actor=c.agent_id
+             AND (e.entity_id=c.task_id OR json_extract(e.data,'$.task_id')=c.task_id)) AS last_holder_activity
+        FROM claims c`).all() as any[];
+      const edges = this.db.prepare(`SELECT d.task_id, t.status AS task_status, d.blocker_id, b.status AS blocker_status
+        FROM task_dependencies d JOIN tasks t ON t.id=d.task_id JOIN tasks b ON b.id=d.blocker_id`).all() as any[];
+      const findings = groomFindings({ now, tasks, claims, edges, policy });
+      const prevRow = this.db.prepare(
+        "SELECT data FROM events WHERE entity_type='sdlc' AND action='groomed' ORDER BY id DESC LIMIT 1").get() as any;
+      const prevData = typeof prevRow?.data === "string" ? JSON.parse(prevRow.data) : prevRow?.data;
+      // Only act on findings the previous pass did not already report.
+      const fresh = newFindings(findings, Array.isArray(prevData?.keys) ? prevData.keys : []);
+      const reset: string[] = [];
+      for (const t of fresh.stale_open) {
+        if (policy.reset_estimates && t.estimate) {
+          this.db.prepare("UPDATE tasks SET estimate='', updated_at=datetime('now') WHERE id=?").run(t.task_id);
+          reset.push(t.task_id);
+        }
+        this.log("task", t.task_id, "groom_stale", actor, { ...t, estimate_reset: reset.includes(t.task_id) });
+      }
+      for (const c of fresh.stale_claims) {
+        this.log("task", c.task_id, "stale_claim", actor, c);
+        this.sendMessage(c.agent_id, actor,
+          `stale claim on ${c.task_id}: no activity for ${c.idle_minutes}m — renew_lease with progress or release_task`, c.task_id);
+      }
+      for (const d of fresh.dependency_issues) this.log("task", d.task_id, "dependency_issue", actor, d);
+      const total = fresh.stale_open.length + fresh.stale_claims.length + fresh.dependency_issues.length;
+      const artifact = total
+        ? (this.postArtifact({ agent_id: actor, kind: "note", title: "Backlog grooming", content: groomMarkdown(findings, now) }) as any).id
+        : undefined;
+      this.log("sdlc", "grooming", "groomed", actor, {
+        stale_open: findings.stale_open.length, stale_claims: findings.stale_claims.length,
+        dependency_issues: findings.dependency_issues.length, estimates_reset: reset.length,
+        new_findings: total, keys: findingKeys(findings),
+      });
+      return { ...findings, new_findings: total, estimates_reset: reset, ...(artifact ? { artifact_id: artifact } : {}) };
+    }).immediate();
+  }
+
+  sweepSdlc() {
+    const policy = getSdlcPolicy(loadPolicy());
+    const now = Date.now();
+    const last = (action: string) => (this.db.prepare(
+      "SELECT MAX(created_at) AS at FROM events WHERE entity_type='sdlc' AND action=?").get(action) as any)?.at;
+    const out: { retro?: string; groomed?: boolean } = {};
+    if (policy.grooming.enabled && isDue(last("groomed"), policy.grooming.every_minutes * 60_000, now)) {
+      this.groomBacklog("sdlc-sweeper");
+      out.groomed = true;
+    }
+    if (policy.retro.enabled && isDue(last("retro_created"), policy.retro.every_days * 86_400_000, now)) {
+      const r = this.runRetro({ actor: "sdlc-sweeper" }) as any;
+      if (r.task_id) out.retro = r.task_id;
+    }
+    return out;
   }
 
   listArtifacts(taskId: string) {
@@ -1227,13 +1487,14 @@ export class SqliteStore implements IStore {
     const wantsSymbols = !kinds?.length || kinds.includes("symbol");
     const ftsKinds = kinds?.filter((k) => k !== "symbol");
     let rows: any[] = [];
-    if (!kinds?.length || ftsKinds!.length) {
+    const match = ftsQuery(query);
+    if (match && (!kinds?.length || ftsKinds!.length)) {
       rows = this.db
         .prepare(
           `SELECT entity_type, entity_id, title, snippet(search_idx, 3, '>>>', '<<<', '…', 20) AS snippet
            FROM search_idx WHERE search_idx MATCH ? ORDER BY rank LIMIT 20`
         )
-        .all(query) as any[];
+        .all(match) as any[];
       if (ftsKinds?.length) rows = rows.filter((r) => ftsKinds.includes(r.entity_type));
     }
     if (wantsSymbols) {
@@ -1328,10 +1589,14 @@ export class SqliteStore implements IStore {
     return { symbol: name, definitions: defs, impacted: levels, files: [...files].sort() };
   }
 
-  submitJob(args: SubmitJobArgs) {
+  submitJob(args: SubmitJobArgs, policy?: Policy) {
     if (args.type === "node") return { error: "use submit_node_task for node jobs" };
     if (args.type === "agent" ? !args.agent?.executable || !args.agent.prompt : !args.command)
       return { error: "command required, or executable and prompt for agent jobs" };
+    if (args.type === "agent" && args.agent && args.task_id) {
+      // gh-54: stamp the model tier routed from the task's difficulty signals.
+      args = { ...args, agent: routeAgentSpec(args.agent, this.getTask(args.task_id) as any, policy ?? loadPolicy()) };
+    }
     const id = `job-${randomUUID().slice(0, 8)}`;
     this.db.prepare(`INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec)
       VALUES (?,?,?,?,?,?,?,?)`).run(id, args.task_id ?? null, args.agent_id, args.type,
@@ -1358,12 +1623,14 @@ export class SqliteStore implements IStore {
   }
 
   renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
-    const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
+    const ttlMs = Math.max(1, ttlSeconds) * 1000;
+    const expires = new Date(Date.now() + ttlMs).toISOString();
+    const prior = this.db.prepare("SELECT lease_expires FROM jobs WHERE id=?").get(jobId) as { lease_expires: string | null } | undefined;
     const updated = this.db.prepare(`UPDATE jobs SET lease_expires=?, result=COALESCE(?,result)
       WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
       .run(expires, result?.slice(-64000) ?? null, jobId, agentId, token, new Date().toISOString());
     if (!updated.changes) return { error: "job lease not owned or expired" };
-    this.log("job", jobId, "renewed", agentId);
+    if (renewalWorthLogging(prior?.lease_expires, ttlMs)) this.log("job", jobId, "renewed", agentId);
     return { id: jobId, lease_expires: expires };
   }
 
@@ -1380,6 +1647,78 @@ export class SqliteStore implements IStore {
     })();
   }
 
+  /** Finished jobs the failure watch has not yet classified (see src/watch.ts). */
+  watchCandidates(lookbackMinutes: number, limit: number) {
+    return this.db.prepare(`SELECT j.id, j.task_id, j.type, j.status, j.result, j.outcome_reason
+        FROM jobs j JOIN tasks t ON t.id = j.task_id
+        WHERE j.finished_at IS NOT NULL AND j.finished_at >= datetime('now', ?)
+          AND (j.status = 'failed' OR (j.status = 'done' AND t.status != 'done'))
+          AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type='job' AND e.entity_id=j.id AND e.action='watch_classified')
+        ORDER BY j.finished_at, j.id LIMIT ?`)
+      .all(`-${lookbackMinutes} minutes`, limit) as any[];
+  }
+
+  /**
+   * True while the task's latest `blocked` event is newer than its latest `updated` event.
+   * `actor` narrows to blocked events by that actor; null counts any actor's `blocked` artifact.
+   */
+  isWatchSkipListed(taskId: string, actor: string | null): boolean {
+    const row = this.db.prepare(`SELECT
+        (SELECT MAX(id) FROM events WHERE entity_type='task' AND entity_id=? AND action='blocked' AND (? IS NULL OR actor=?)) AS blocked_id,
+        (SELECT MAX(id) FROM events WHERE entity_type='task' AND entity_id=? AND action='updated') AS updated_id`)
+      .get(taskId, actor, actor, taskId) as { blocked_id: number | null; updated_id: number | null };
+    return row.blocked_id != null && (row.updated_id == null || row.blocked_id > row.updated_id);
+  }
+
+  /** Snapshot of every blocked task for the unblock pass: newest blocked artifact
+   *  content, whether all dependency blockers are done, and when it was last
+   *  auto-reopened (oscillation guard). */
+  blockedTaskSnapshots(): { id: string; title: string; updated_at: string; content: string; deps_done: number; last_reopen: string | null }[] {
+    return this.db.prepare(`SELECT t.id, t.title, t.updated_at,
+        COALESCE((SELECT content FROM artifacts a WHERE a.task_id=t.id AND a.kind='blocked' ORDER BY a.created_at DESC LIMIT 1),'') AS content,
+        CASE WHEN NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id
+                             WHERE d.task_id=t.id AND b.status NOT IN ('done','cancelled')) THEN 1 ELSE 0 END AS deps_done,
+        (SELECT MAX(created_at) FROM events e WHERE e.entity_type='task' AND e.entity_id=t.id AND e.action='unblock_reopen') AS last_reopen
+      FROM tasks t WHERE t.status='blocked'`).all() as any[];
+  }
+
+  /** Blocked artifacts the model router (src/model-routing.ts) has not handled.
+   *  Pre-filtered on the marker words; the router does the exact match. */
+  modelEscalationCandidates(): { id: string; task_id: string; content: string }[] {
+    return this.db.prepare(`SELECT a.id, a.task_id, a.content FROM artifacts a
+        WHERE a.kind='blocked' AND a.task_id IS NOT NULL AND lower(a.content) LIKE '%stronger%model%'
+          AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type='artifact' AND e.entity_id=a.id AND e.action='model_escalated')
+        ORDER BY a.created_at, a.rowid`).all() as any[];
+  }
+
+  /** agent_spec JSON of the task's most recent agent job, or null. */
+  latestAgentSpec(taskId: string): string | null {
+    const row = this.db.prepare(`SELECT agent_spec FROM jobs WHERE task_id=? AND type='agent' AND agent_spec IS NOT NULL
+        ORDER BY created_at DESC, rowid DESC LIMIT 1`).get(taskId) as { agent_spec: string } | undefined;
+    return row?.agent_spec ?? null;
+  }
+
+  /** gh-54 metrics: tokens per task by model tier and tier × estimate. */
+  modelReport() {
+    const jobs = this.db.prepare(`SELECT j.id AS job_id, j.task_id, t.estimate, j.agent_spec FROM jobs j JOIN tasks t ON t.id=j.task_id
+        WHERE j.type='agent' ORDER BY j.created_at, j.rowid`).all() as any[];
+    const tokens = this.db.prepare(`SELECT task_id, output FROM evidence WHERE output LIKE '%tokens%'`).all() as any[];
+    return modelTierReport(jobs, tokens);
+  }
+
+  /** Agent-job counts for the watch budget gate (src/watch.ts): queued+running now,
+   *  created on `day` (UTC YYYY-MM-DD), and the halt reasons already notified that day. */
+  watchBudgetStats(day: string): { inflight: number; jobs_today: number; halts_notified: string[] } {
+    const row = this.db.prepare(`SELECT
+        (SELECT COUNT(*) FROM jobs WHERE type='agent' AND status IN ('queued','running')) AS inflight,
+        (SELECT COUNT(*) FROM jobs WHERE type='agent' AND substr(created_at,1,10)=?) AS jobs_today`)
+      .get(day) as { inflight: number; jobs_today: number };
+    const halts = this.db.prepare(
+      "SELECT DISTINCT json_extract(data,'$.halted') AS h FROM events WHERE entity_type='watch' AND action='watch_budget_halt' AND entity_id LIKE ?")
+      .all(`${day}:%`) as { h: string }[];
+    return { ...row, halts_notified: halts.map((r) => r.h).filter(Boolean) };
+  }
+
   getJob(id: string) {
     return this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id) ?? null;
   }
@@ -1387,7 +1726,7 @@ export class SqliteStore implements IStore {
   board() {
     const tasks = this.db
       .prepare(
-        `SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
+        `SELECT t.id, t.title, t.status, t.priority, t.sprint, t.updated_at, c.agent_id AS claimed_by, c.lease_expires,
                 (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
          FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`
       )
@@ -1403,6 +1742,7 @@ export class SqliteStore implements IStore {
       nodes: this.listNodes(),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
       agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
+      sprint: this.sprintReport(),
     };
   }
 
@@ -1433,8 +1773,105 @@ export class SqliteStore implements IStore {
     return { ...this.board(), locks, jobs, events: this.auditLog(eventsLimit) };
   }
 
-  auditLog(limit = 50) {
-    return this.db.prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit);
+  auditLog(limit = 50, page: AuditPage = {}) {
+    const asc = page.after_id !== undefined;
+    return this.db.prepare(`SELECT * FROM events WHERE id > ? AND id < ? ORDER BY id ${asc ? "ASC" : "DESC"} LIMIT ?`)
+      .all(page.after_id ?? 0, page.before_id ?? Number.MAX_SAFE_INTEGER, limit);
+  }
+
+  agentEvents(agentId: string, limit = 200) {
+    return (this.db.prepare(`SELECT * FROM events
+      WHERE actor=? OR (entity_type='message' AND entity_id=?) OR json_extract(data, '$.principal')=?
+      ORDER BY id DESC LIMIT ?`).all(agentId, agentId, agentId, limit) as any[]).reverse();
+  }
+
+  taskEvents(taskId: string, sinceIso?: string) {
+    // events.created_at mixes SQLite datetime() text and ISO strings; julianday()
+    // parses both (and the Z suffix) with millisecond precision.
+    return sinceIso
+      ? this.db.prepare("SELECT * FROM events WHERE entity_id=? AND julianday(created_at) > julianday(?) ORDER BY id").all(taskId, sinceIso)
+      : this.db.prepare("SELECT * FROM events WHERE entity_id=? ORDER BY id").all(taskId);
+  }
+
+  // ── Agent identity & attestation (gh-20). Decisions live in agent-identity.ts. ──
+
+  registerAgentKey(a: RegisterKeyInput) {
+    const existing = this.db.prepare("SELECT * FROM agent_keys WHERE agent_id=?").all(a.agent_id) as AgentKeyRow[];
+    const plan = planRegistration(existing, a);
+    if ("error" in plan) {
+      this.log("agent", a.agent_id, "key_rejected", a.agent_id, { error: plan.error, binding: a.binding });
+      return plan;
+    }
+    if (plan.kind === "noop") return { agent_id: a.agent_id, key_id: plan.key_id, status: "unchanged" };
+    const now = new Date().toISOString();
+    const r = plan.row;
+    try {
+      this.db.transaction(() => {
+        if (plan.kind === "rotate") {
+          const retired = this.db.prepare("UPDATE agent_keys SET status='retired', retired_at=? WHERE key_id=? AND status='active'").run(now, plan.retire);
+          if (retired.changes !== 1) throw new Error("active key changed during rotation");
+        }
+        this.db.prepare("INSERT INTO agent_keys (key_id, agent_id, public_key, status, binding, last_ts, created_at) VALUES (?,?,?,?,?,?,?)")
+          .run(r.key_id, r.agent_id, r.public_key, r.status, r.binding, 0, now);
+        this.log("agent", a.agent_id, plan.kind === "rotate" ? "key_rotated" : "key_registered", a.agent_id, plan.kind === "rotate"
+          ? { key_id: r.key_id, retired: plan.retire, binding: r.binding, attestation: plan.proof }
+          : { key_id: r.key_id, binding: r.binding });
+      })();
+    } catch (e: any) {
+      // Unique index on (agent_id) WHERE active: a concurrent first registration won.
+      return { error: `registration conflict for ${a.agent_id}: ${e?.message ?? e}` };
+    }
+    return { agent_id: a.agent_id, key_id: r.key_id, status: plan.kind === "rotate" ? "rotated" : "registered", ...(plan.kind === "rotate" ? { retired: plan.retire } : {}) };
+  }
+
+  listAgentKeys(agentId?: string) {
+    return agentId
+      ? this.db.prepare("SELECT key_id, agent_id, public_key, status, binding, created_at, retired_at FROM agent_keys WHERE agent_id=? ORDER BY created_at").all(agentId)
+      : this.db.prepare("SELECT key_id, agent_id, public_key, status, binding, created_at, retired_at FROM agent_keys ORDER BY agent_id, created_at").all();
+  }
+
+  revokeAgentKeys(agentId: string, actor: string) {
+    const r = this.db.prepare("UPDATE agent_keys SET status='retired', retired_at=? WHERE agent_id=? AND status='active'").run(new Date().toISOString(), agentId);
+    this.log("agent", agentId, "keys_revoked", actor, { retired: r.changes });
+    return { agent_id: agentId, retired: r.changes };
+  }
+
+  verifyAgentAction(a: VerifyAgentActionArgs): VerifyAgentActionResult {
+    const active = this.db.prepare("SELECT * FROM agent_keys WHERE agent_id=? AND status='active'").get(a.agent_id) as AgentKeyRow | undefined;
+    const plan = planVerification(active, getIdentityPolicy(loadPolicy()).require_signatures, a.action, a.agent_id, a.task_id, a.args, a.attestation);
+    const reject = (error: string) => {
+      this.log("agent", a.agent_id, "attestation_rejected", a.agent_id, { action: a.action, task_id: a.task_id, error });
+      return { error };
+    };
+    if ("error" in plan) return reject(plan.error);
+    if (plan.kind === "unsigned") return { ok: true };
+    // Conditional update: two requests carrying one signature cannot both pass.
+    const won = this.db.prepare("UPDATE agent_keys SET last_ts=? WHERE key_id=? AND status='active' AND last_ts < ?")
+      .run(plan.attestation.ts, plan.attestation.key_id, plan.attestation.ts).changes === 1;
+    if (!won) return reject("attestation replayed: ts must increase per key");
+    return { ok: true, attestation: plan.attestation };
+  }
+
+  listGithubStatus(): GithubStatusRow[] {
+    return this.db.prepare("SELECT * FROM github_status ORDER BY task_id").all() as GithubStatusRow[];
+  }
+
+  putGithubStatus(taskId: string, patch: GithubStatusPatch, actor: string): GithubStatusRow {
+    const prev = this.db.prepare("SELECT * FROM github_status WHERE task_id=?").get(taskId) as GithubStatusRow | undefined;
+    const row: GithubStatusRow = {
+      task_id: taskId,
+      last_comment_at: null, last_digest_at: null, attempts: 0, last_attempt_at: null, last_error: null,
+      ...prev,
+      ...patch,
+      updated_at: new Date().toISOString(),
+    };
+    this.db.prepare(`INSERT INTO github_status (task_id, issue_ref, last_status, last_comment_at, last_digest_at, attempts, last_attempt_at, last_error, updated_at)
+      VALUES (@task_id, @issue_ref, @last_status, @last_comment_at, @last_digest_at, @attempts, @last_attempt_at, @last_error, @updated_at)
+      ON CONFLICT(task_id) DO UPDATE SET issue_ref=excluded.issue_ref, last_status=excluded.last_status,
+        last_comment_at=excluded.last_comment_at, last_digest_at=excluded.last_digest_at, attempts=excluded.attempts,
+        last_attempt_at=excluded.last_attempt_at, last_error=excluded.last_error, updated_at=excluded.updated_at`).run(row);
+    this.log("github_status", taskId, "updated", actor, patch);
+    return row;
   }
 
   close() {

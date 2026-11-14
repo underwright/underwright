@@ -24,6 +24,17 @@ It never runs an authentication action. `bash .../scripts/install-agents.sh list
 lists supported harness IDs without installing anything. Network installers are
 only run when the administrator submits an explicitly approved install operation.
 
+`install-agents.sh` is the new-machine provisioning playbook. It covers the
+roster in [harness-registry.md](harness-registry.md), including `copilot`. Gate
+provisioning on its exit code: `0` means ok, `1` means a step failed, `2` means
+a usage error. `install` fails when the installer exits non-zero or leaves no
+binary on PATH. `verify --agents ID` fails when the harness is missing or its
+non-interactive auth check fails. For harnesses that have no such check
+(antigravity, kimi, cline, copilot), `verify` proves the install only.
+Authenticate once on the machine (`install-agents.sh auth --agents ID`, which
+needs a TTY), then run `verify` before you attest `auth_status: ready` in the
+node inventory.
+
 Launch payloads use `{workspace_id, harness, prompt, cwd?}`; script payloads use
 `{workspace_id, script, args?, cwd?}`; provision uses
 `{workspace_id, repository_id, dest}`; install uses `{harness}`.

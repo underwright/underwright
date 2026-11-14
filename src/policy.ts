@@ -105,6 +105,18 @@ export interface HumanNotifyPolicy {
   events: HumanNotifyEventKind[];
 }
 
+/** Policy `model_routing` block (gh-54). Parsed by getModelRouting in model-routing.ts. */
+export interface ModelRoutingRule {
+  enabled?: boolean;
+  default_tier?: string;
+  /** First match wins: { tier, estimate?, type?, review_kind?, min_ac?, paths? }. */
+  rules?: unknown[];
+  /** harness (or family) → tier → model name passed to the CLI. */
+  models?: Record<string, Partial<Record<"light" | "standard" | "heavy", string>>>;
+  /** harness → CLI flag for the model, overriding the built-in table. */
+  flags?: Record<string, string>;
+}
+
 /** Per-agent launch preferences plus the omnigent coverage table. Agent entries
  *  map agent_id (or "*") to a preferred harness+backend; the "coverage" table
  *  records which harnesses omnigent can drive today. */
@@ -122,6 +134,61 @@ export interface Policy {
   /** Per-agent preferred harness+backend for agent jobs, plus the omnigent
    *  coverage table. Exact agent_id wins over "*". */
   harness_matrix?: HarnessMatrixRule;
+  /** Model-complexity routing (gh-54): task signals → light/standard/heavy, tier → model per harness. */
+  model_routing?: ModelRoutingRule;
+  /** Board→GitHub status mirror (task-cfc5f333). */
+  github?: GithubStatusRule;
+  /** Human-facing auth for /mcp and the dashboard (gh-51). */
+  auth?: AuthRule;
+  /** Agent identity & attestation (gh-20). */
+  identity?: IdentityRule;
+}
+
+export interface IdentityRule {
+  /** Refuse claim/lease/evidence/complete actions from agents without a
+   *  registered key. Default false: only agents that registered a key must sign. */
+  require_signatures?: boolean;
+}
+
+export function getIdentityPolicy(policy: Policy = loadPolicy()): Required<IdentityRule> {
+  return { require_signatures: policy.identity?.require_signatures === true };
+}
+
+/** `token` (default): UNDERWRIGHT_TOKEN bearer/cookie. `databricks`: trust the
+ *  Databricks Apps proxy's X-Forwarded-* user headers. Only enable databricks
+ *  when the server is reachable solely through that proxy. */
+export type AuthMode = "token" | "databricks";
+export interface AuthRule {
+  mode?: AuthMode;
+  /** Emails or `@domain` suffixes allowed in. Empty = any authenticated workspace user. */
+  allowed_users?: string[];
+}
+
+export function getAuthPolicy(policy: Policy = loadPolicy(), env: NodeJS.ProcessEnv = process.env): Required<AuthRule> {
+  const raw = policy.auth ?? {};
+  const mode = (env.UNDERWRIGHT_AUTH_MODE ?? raw.mode ?? "token").trim().toLowerCase();
+  if (mode !== "token" && mode !== "databricks") throw new Error(`unknown auth mode: ${mode}`);
+  const allowed = Array.isArray(raw.allowed_users) ? raw.allowed_users : [];
+  return { mode, allowed_users: allowed.map(u => String(u).trim().toLowerCase()).filter(Boolean) };
+}
+
+export interface GithubStatusRule {
+  /** Post a comment on the linked issue when a task changes status. Default false. */
+  status_comments?: boolean;
+  /** Repo used for `gh-N` / `[#N]` tasks that have no issue URL in spec_ref. */
+  repo?: string;
+  /** Hours between per-issue digests; 0 or unset disables the scheduled digest. */
+  digest_hours?: number;
+}
+
+export function getGithubStatusPolicy(policy: Policy = loadPolicy()): Required<Pick<GithubStatusRule, "status_comments" | "digest_hours">> & { repo?: string } {
+  const g = policy.github ?? {};
+  const hours = Number(g.digest_hours ?? 0);
+  return {
+    status_comments: g.status_comments === true,
+    repo: typeof g.repo === "string" && /^[\w.-]+\/[\w.-]+$/.test(g.repo) ? g.repo : undefined,
+    digest_hours: Number.isFinite(hours) && hours > 0 ? hours : 0,
+  };
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };

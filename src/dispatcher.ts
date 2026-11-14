@@ -76,11 +76,14 @@ const NOT_IMPLEMENTERS = new Set(["human", "github-sync", "sync", "underwright"]
 
 export type ReviewKind = "code" | "design";
 
-/** `grok@alandesktop` → `grok`. Ids without `@` are their own harness. */
+/** Harness family: `grok@alandesktop` → `grok`. Session variants collapse to the
+ *  family so the review gate can't be sidestepped by renaming: `claude-sdk@x`,
+ *  `claude-2@x`, `codex2@x` → `claude`/`codex`. Ids without `@` are their own harness. */
 export function harnessOf(agentId: string): string {
   const at = agentId.indexOf("@");
-  const name = at === -1 ? agentId : agentId.slice(0, at);
-  return name.trim().toLowerCase();
+  const name = (at === -1 ? agentId : agentId.slice(0, at)).trim().toLowerCase();
+  const family = name.split(/[-_.\s]/)[0].replace(/\d+$/, "");
+  return family || name;
 }
 
 export function tierOf(agentId: string): number {
@@ -109,6 +112,26 @@ export function implementerFromRecords(args: {
     pick(args.artifactAuthor) ??
     pick(args.createdBy)
   );
+}
+
+/** Everyone who built the subject: finisher, claim holders, design/spec author.
+ *  A review routed under require_different_harness avoids all their harnesses,
+ *  not just the one implementerFromRecords picks (gh-68). Falls back to the creator. */
+export function contributorsFromRecords(args: {
+  completedBy?: string | null;
+  claimAgent?: string | null;
+  lastClaimedBy?: string | null;
+  artifactAuthor?: string | null;
+  createdBy?: string | null;
+}): string[] {
+  const ids = [args.completedBy, args.claimAgent, args.lastClaimedBy, args.artifactAuthor]
+    .map((id) => id?.trim() ?? "")
+    .filter((id) => id && !isSystemActor(id) && !NOT_IMPLEMENTERS.has(id));
+  if (!ids.length) {
+    const fallback = implementerFromRecords({ createdBy: args.createdBy });
+    if (fallback) ids.push(fallback);
+  }
+  return [...new Set(ids)];
 }
 
 /** Claim gate: the reviewer must be a different agent than the implementer. */
@@ -160,14 +183,18 @@ export function chooseReviewer(args: {
   requireDifferentHarness: boolean;
   preferStronger: boolean;
   designReview: boolean;
+  /** Other agents who worked the subject (contributorsFromRecords). Their
+   *  harnesses are excluded too when requireDifferentHarness is set. */
+  contributors?: string[];
 }): string | null {
   const impl = args.implementer;
-  const implHarness = impl ? harnessOf(impl) : null;
+  const builders = new Set([impl, ...(args.contributors ?? [])].filter((id): id is string => Boolean(id)));
+  const builtBy = new Set([...builders].map(harnessOf));
   const implTier = impl ? tierOf(impl) : 0;
   const eligible = args.agents.filter((a) =>
-    a.id && !isSystemActor(a.id) && a.id !== impl && !overCap(a.workload, args.max));
-  const differentHarness = eligible.filter((a) => !implHarness || harnessOf(a.id) !== implHarness);
-  if (args.requireDifferentHarness && implHarness && differentHarness.length === 0) return null;
+    a.id && !isSystemActor(a.id) && !builders.has(a.id) && !overCap(a.workload, args.max));
+  const differentHarness = eligible.filter((a) => !builtBy.has(harnessOf(a.id)));
+  if (args.requireDifferentHarness && builtBy.size && differentHarness.length === 0) return null;
   let pool = args.requireDifferentHarness && differentHarness.length ? differentHarness : eligible;
   if (args.designReview) {
     const heavy = pool.filter((a) => tierOf(a.id) >= HIGH_TIER);

@@ -132,3 +132,11 @@ it("dedupes active node tasks, bounds results, and waits/cancels long-poll witho
   const timed = await store.pollNodeJob(node.token, node.session.session_id, 1);
   expect(timed.empty).toBe(true);
 });
+
+it("is hermetic: the repo's underwright.policy.json (e.g. dispatcher.node_retry) does not leak into tests", async () => {
+  const { getDispatcherPolicy } = await import("../src/policy.js");
+  const { resolve } = await import("node:path");
+  expect(process.env.UNDERWRIGHT_POLICY).toBeTruthy();
+  expect(resolve(process.env.UNDERWRIGHT_POLICY!)).not.toBe(resolve(process.cwd(), "underwright.policy.json"));
+  expect(getDispatcherPolicy().node_retry).toEqual({ kinds: [], max_attempts: 0 });
+});

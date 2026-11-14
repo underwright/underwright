@@ -52,6 +52,27 @@ describe("remote queue leases", () => {
     expect(store.auditLog().some(e => e.action === "renewed" && e.actor === "runner-A")).toBe(true);
   });
 
+  it("throttles renewal audit events to one per third of the lease while still extending it", () => {
+    const { store } = fixture();
+    vi.useFakeTimers();
+    const j = store.submitJob({ agent_id: "a", type: "test", command: "echo hi" });
+    const job = store.nextJob("runner", "A", 60);
+    const renewedCount = () => store.auditLog(500).filter(e => e.action === "renewed" && e.entity_id === j.id).length;
+    // A per-second heartbeat for 60s: the lease and live output advance every tick…
+    let last = "";
+    for (let s = 1; s <= 60; s++) {
+      vi.setSystemTime(Date.now() + 1000);
+      const r = store.renewJob(j.id, "runner", job.lease_token, 60, `tick ${s}`);
+      expect(r.error).toBeUndefined();
+      expect(r.lease_expires > last).toBe(true);
+      last = r.lease_expires;
+    }
+    expect(store.getJob(j.id).result).toBe("tick 60");
+    // …but the audit log gets one event per ~20s (ttl/3), not one per second.
+    expect(renewedCount()).toBeGreaterThanOrEqual(2);
+    expect(renewedCount()).toBeLessThanOrEqual(3);
+  });
+
   it("rejects expired leases, reclaims with a new token, and fences the same runner's old attempt", () => {
     const { store } = fixture();
     vi.useFakeTimers();
@@ -232,15 +253,17 @@ describe("omnigent backend", () => {
     expect(unavailable.executable).toBe("codex");
     expect(unavailable.args).toEqual(["exec", "do the thing"]);
     expect(unavailable.backend).toBe("raw");
-    const unsupported = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "cmdc" }), "cmdc@A", "A", { omniAvailable: true });
+    const unsupported = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "grok" }), "grok@A", "A", { omniAvailable: true });
     expect(unsupported.executable).toBe("codex");
     expect(unsupported.backend).toBe("raw");
   });
 
-  it("covers codex and claude-sdk through omnigent while cmdc stays raw-only", () => {
+  it("covers the omni-drivable harnesses while grok stays raw-only", () => {
     expect(OMNIGENT_HARNESS_SUPPORT.codex).toBe(true);
     expect(OMNIGENT_HARNESS_SUPPORT["claude-sdk"]).toBe(true);
-    expect(OMNIGENT_HARNESS_SUPPORT.cmdc).toBe(false);
+    expect(OMNIGENT_HARNESS_SUPPORT.cmdc).toBe(true);
+    expect(OMNIGENT_HARNESS_SUPPORT.kimi).toBe(true);
+    expect(OMNIGENT_HARNESS_SUPPORT.grok).toBeUndefined();
   });
 
   it("resolves the policy matrix with the spec and the exact agent id winning", () => {
@@ -258,14 +281,14 @@ describe("omnigent backend", () => {
   it("infers omnigent from the coverage table when the matrix pins only the harness", () => {
     const nested: Policy = {
       harness_matrix: {
-        agents: { "codex@A": { harness: "codex" }, "kimi@A": { harness: "kimi" } },
+        agents: { "codex@A": { harness: "codex" }, "grok@A": { harness: "grok" } },
         coverage: { codex: true, "claude-sdk": true, cmdc: false },
       },
     } as Policy;
     const covered = agentInvocation(jobWith(spec), "codex@A", "A", { omniAvailable: true, policy: nested });
     expect(covered.executable).toBe("omni");
     expect(covered.args).toEqual(["run", "--harness", "codex", "-p", "do the thing"]);
-    const uncovered = agentInvocation(jobWith(spec), "kimi@A", "A", { omniAvailable: true, policy: nested });
+    const uncovered = agentInvocation(jobWith(spec), "grok@A", "A", { omniAvailable: true, policy: nested });
     expect(uncovered.executable).toBe("codex");
     expect(uncovered.backend).toBe("raw");
   });
@@ -274,24 +297,27 @@ describe("omnigent backend", () => {
     const flipped: Policy = { harness_matrix: { coverage: { cmdc: true, codex: false } } } as Policy;
     const cmdc = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "cmdc" }), "cmdc@A", "A", { omniAvailable: true, policy: flipped });
     expect(cmdc.executable).toBe("omni");
-    expect(cmdc.args).toEqual(["run", "--harness", "cmdc", "-p", "do the thing"]);
+    expect(cmdc.args).toEqual(["run", "--harness", "commandcode", "-p", "do the thing"]);
     const codex = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: true, policy: flipped });
     expect(codex.executable).toBe("codex");
     expect(codex.backend).toBe("raw");
   });
 
-  it("ships a policy matrix covering codex/claude-sdk on omni and cmdc pending", () => {
+  it("ships a policy matrix covering codex/claude-sdk/cmdc/kimi/agy on omni, grok raw", () => {
     const shipped = JSON.parse(readFileSync(new URL("../underwright.policy.json", import.meta.url), "utf8"));
     const parsed = getHarnessMatrix(shipped);
-    expect(parsed.coverage).toMatchObject({ codex: true, "claude-sdk": true, cmdc: false });
+    expect(parsed.coverage).toMatchObject({ codex: true, "claude-sdk": true, cmdc: true });
     expect(parsed.agents["codex@laptop-2"]).toMatchObject({ harness: "codex", backend: "omnigent" });
     expect(parsed.agents["cmdc@winbox"]).toMatchObject({ harness: "cmdc" });
     expect(getHarnessBackend("grok@alandesktop", shipped).harness).toBe("grok");
     const routed = agentInvocation(jobWith(spec), "codex@laptop-2", "laptop-2", { omniAvailable: true, policy: shipped });
     expect(routed.executable).toBe("omni");
-    const pending = agentInvocation(jobWith({ executable: "cmdc", args: ["-p", "--yolo"], prompt: "x" }), "cmdc@winbox", "winbox", { omniAvailable: true, policy: shipped });
-    expect(pending.executable).toBe("cmdc");
-    expect(pending.backend).toBe("raw");
+    const viaOmni = agentInvocation(jobWith({ executable: "cmdc", args: ["-p", "--yolo"], prompt: "x" }), "cmdc@winbox", "winbox", { omniAvailable: true, policy: shipped });
+    expect(viaOmni.executable).toBe("omni");
+    expect(viaOmni.args).toEqual(["run", "--harness", "commandcode", "-p", "x"]);
+    const rawGrok = agentInvocation(jobWith({ executable: "grok", args: [], prompt: "x" }), "grok@alandesktop", "alandesktop", { omniAvailable: true, policy: shipped });
+    expect(rawGrok.executable).toBe("grok");
+    expect(rawGrok.backend).toBe("raw");
   });
 
   it("extracts the last omnigent session marker, or a matching transcript URL", () => {

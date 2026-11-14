@@ -30,3 +30,13 @@ jobs:
           UNDERWRIGHT_TASK_ID: ${{ secrets.UNDERWRIGHT_TASK_ID }}
       - run: npm run test:contract
       - run: npm audit --audit-level=high
+      - name: Report CI evidence
+        if: always()
+        uses: ./action/evidence-check
+        with:
+          url: ${{ secrets.UNDERWRIGHT_URL }}
+          token: ${{ secrets.UNDERWRIGHT_TOKEN }}
+          task-id: ${{ secrets.UNDERWRIGHT_TASK_ID }}
+          kind: ci_check
+          status: ${{ job.status }}
+          command: npm run build && npm test && npm run test:contract
