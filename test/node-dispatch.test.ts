@@ -192,6 +192,21 @@ it("starves cleanly when every harness is exhausted", async () => {
   expect(res.match.skipped.no_harness).toBe(1);
 });
 
+it("cools down re-dispatch after a formed job fails", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const t = await store.createTask(task());
+
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  await store.finishNodeJob(node.token, node.session.session_id, leased.id, leased.lease_token, "failed", "boom");
+
+  // task is parked for the cooldown window — no infinite fail/re-dispatch loop
+  const res = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(res.empty).toBe(true);
+  expect(res.match.skipped.recent_failure).toBe(1);
+});
+
 it("omits model args for daemons that do not attest launch-model-flag", async () => {
   const { store } = fixture();
   const node = await enrolled(store);
