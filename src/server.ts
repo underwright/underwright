@@ -12,6 +12,7 @@ import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
+import { initTelemetry } from "./telemetry.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -312,6 +313,9 @@ export async function serve(dbPath: string) {
  *  POST /github/webhook stays open and authenticates with the HMAC secret. */
 export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
   const store = await openStore(dbPath);
+  // gh-136: control-plane telemetry — UNDERWRIGHT_TELEMETRY=file|stdout|off,
+  // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
+  initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
   const stopSweeper = startLeaseSweeper(store);
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {

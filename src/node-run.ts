@@ -7,6 +7,7 @@ import { arch, platform } from "node:os";
 import { join } from "node:path";
 import { nodeStateDirectory, readNodeCredential, secureDirectory } from "./node-client.js";
 import { sleepSignal, type NodeCredential } from "./node-protocol.js";
+import { initTelemetry } from "./telemetry.js";
 
 export type NodeExecutor = (job: any, signal?: AbortSignal) => Promise<{ status: "done" | "failed"; result: string }>;
 export type NodeProbe = () => Promise<unknown> | unknown;
@@ -90,6 +91,9 @@ export async function runNode(opts: {
   let journal: AttemptJournal;
   try { journal = new AttemptJournal(join(dir, 'attempts')); journal.reconcile(); }
   catch (error) { release(); throw error; }
+  // gh-136: daemon-local telemetry — the file that answers "why did the loop die"
+  // when the control plane only sees heartbeat stop.
+  const tel = initTelemetry({ backend: process.env.UNDERWRIGHT_TELEMETRY ?? "file", file: join(dir, "telemetry.jsonl"), resource: { node: cred.node_id } });
   // config.inventory attests harness readiness; the operational arrays are
   // derived from what the executor registry can actually run.
   const probe = opts.probe ?? (() => ({ ...defaultInventoryProbe(), ...(opts.config?.inventory as object | undefined) }));
@@ -185,8 +189,12 @@ export async function runNode(opts: {
             let held = false;
             try {
               job = await nodeCall(cred, "/nodes/v1/poll", { session_id, wait_seconds: 25, held_job_ids: [...activeJobs] }, "POST", sessionAbort.signal);
-              if ([401, 409].includes(job.status)) { sessionAbort.abort(); return; }
-              if (job.empty || job.status === 204 || !job.id) continue;
+              if ([401, 409].includes(job.status)) { tel.event("session.reauth", { slot, status: job.status }); sessionAbort.abort(); return; }
+              if (job.empty || job.status === 204 || !job.id) {
+                tel.event("node.poll", { slot, outcome: "empty", ...(job.match ?? {}) });
+                continue;
+              }
+              tel.event("node.poll", { slot, outcome: "job", job_id: job.id, task_id: job.task_id });
               if (activeJobs.has(job.id)) continue; // duplicate delivery; another slot holds it
               activeJobs.add(job.id);
               held = true;
@@ -210,10 +218,12 @@ export async function runNode(opts: {
                     .catch(() => childAbort.abort()).finally(() => { renewing = false; });
                 }, opts.renewMs ?? 10000);
                 const expiryTimer = setInterval(() => { if (Date.now() >= expires) childAbort.abort(); }, 100);
+                const execSpan = tel.span("job.execute", { job_id: job.id, task_id: job.task_id, attempt_id: job.attempt_id, slot });
                 try {
                   finished = await execute(job, childAbort.signal);
                   finished = { status: childAbort.signal.aborted ? 'failed' : finished.status, result: redact(finished.result).slice(-64000) };
-                } catch { finished = { status: 'failed', result: 'executor failed/outcome_unknown' }; }
+                  execSpan.end(finished.status === 'done' ? 'ok' : 'error', undefined, { outcome: finished.status });
+                } catch (error) { execSpan.end("error", error); finished = { status: 'failed', result: 'executor failed/outcome_unknown' }; }
                 finally { clearInterval(timer); clearInterval(expiryTimer); sessionAbort.signal.removeEventListener('abort', stopChild); }
                 journal.write({ ...record, phase: 'finished', outcome: finished });
               }
@@ -231,7 +241,7 @@ export async function runNode(opts: {
           }
         };
         const loops = [beat, caps, ...Array.from({ length: maxConcurrency }, (_v, i) => () => work(i))]
-          .map(async loop => { try { await loop(); } catch (error) { sessionAbort.abort(); throw error; } });
+          .map(async (loop, li) => { try { await loop(); } catch (error) { tel.event("loop.exit", { loop: li, error: error instanceof Error ? error.message : String(error) }); sessionAbort.abort(); throw error; } });
         const settled = await Promise.allSettled(loops);
         const failure = settled.find(r => r.status === 'rejected');
         // A rejection with neither abort fired is a real fault — propagate it.

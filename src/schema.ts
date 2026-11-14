@@ -265,6 +265,7 @@ export const NODES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS nodes (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('approved','revoked','draining')),
   policy_json TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT,
+  last_poll_at TEXT,
   session_epoch TEXT, session_expires_at TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
   capabilities_version INTEGER NOT NULL DEFAULT 0, capabilities_observed_at TEXT
 );
