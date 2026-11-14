@@ -683,14 +683,16 @@ export class SqliteStore implements IStore {
       this.db.exec("CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of);");
       this.db.exec("PRAGMA user_version = 9;");
     }
-    if (v < 10) {
-      // v10: gh-136 — poll liveness distinct from generic last_seen_at so
-      // "heartbeating but not polling" is a queryable condition.
+    if (v < 11) {
+      // v11: poll liveness distinct from generic last_seen_at so
+      // "heartbeating but not polling" is a queryable condition. Numbered 11,
+      // not 10: a salvaged build already stamped 10 for an unrelated tasks
+      // migration on live DBs, so a v10 block would never run there.
       const cols = new Set(
         this.db.prepare("SELECT name FROM pragma_table_info('nodes')").all().map((r: any) => r.name)
       );
       if (!cols.has("last_poll_at")) this.db.exec("ALTER TABLE nodes ADD COLUMN last_poll_at TEXT;");
-      this.db.exec("PRAGMA user_version = 10;");
+      this.db.exec("PRAGMA user_version = 11;");
     }
   }
 
