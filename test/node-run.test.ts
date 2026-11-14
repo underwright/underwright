@@ -154,3 +154,32 @@ it("escapes node names on the dashboard and refuses credential-bearing inventory
   expect(html).not.toContain("<script>xss</script>");
   expect(html).not.toContain(node.token);
 });
+
+it("attests operation kinds and workspaces derived from config, not a partial inventory snapshot", async () => {
+  const { store, path, dir } = fixture();
+  const http = await serveHttp(path, "127.0.0.1", 0, "admin-secret");
+  cleanup.push(() => new Promise<void>(resolve => { http.close(() => resolve()); http.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${(http.address() as any).port}`;
+  const node = await enrolled(store);
+  saveNodeCredential({ version: 1, url, node_id: node.node_id, token: node.token, expires_at: node.expires_at, insecure_transport: true }, dir);
+  const shutdown = new AbortController();
+  const running = runNode({
+    dir, signal: shutdown.signal, heartbeatMs: 40, capabilitiesMs: 60,
+    executor: async () => ({ status: "done" as const, result: "x" }),
+    config: {
+      workspaces: { home: "/tmp", underwright: "/tmp" },
+      scripts: { smoke: { executable: "echo" } },
+      harnesses: { codex: { executable: "true" } },
+      // Partial snapshot with no operational arrays — must not blank the attestation.
+      inventory: { harnesses: [{ id: "codex", installed: true, auth_status: "ready", quota: { state: "unknown" } }] },
+    },
+  });
+  await vi.waitFor(() => {
+    const caps = JSON.parse((store as any).nodeQuery("SELECT capabilities_json FROM nodes WHERE id=?", [node.node_id])[0]?.capabilities_json ?? "{}");
+    expect(caps.supported_operation_kinds).toEqual(["run-script", "launch-agent"]);
+    expect(caps.approved_workspace_ids.sort()).toEqual(["home", "underwright"]);
+    expect(caps.harnesses[0].auth_status).toBe("ready");
+  }, { timeout: 10_000 });
+  shutdown.abort();
+  await running.catch(() => undefined);
+});
