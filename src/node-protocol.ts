@@ -82,6 +82,9 @@ export const nodeHarnessSchema = z.object({
   quota: z.object({
     state: z.enum(['available', 'unknown', 'stale', 'exhausted']).default('unknown'),
     observed_at: z.string().optional(),
+    /** When the operator says the quota window resets; exhausted entries with
+     *  a past resets_at are eligible again (the next attest clears the state). */
+    resets_at: z.string().optional(),
   }).strict().default({ state: 'unknown' }),
 }).strict();
 export const nodeInventorySchema = z.object({
@@ -132,6 +135,18 @@ export function projectNode(node: any, now = Date.now()) {
     harnesses,
   };
 }
+/** Quota gate shared by routing and job submission: available/unknown always
+ *  pass; exhausted blocks until its resets_at window has passed. */
+export function quotaAllows(quota: { state?: string; resets_at?: string } | undefined, now = Date.now()): boolean {
+  const state = quota?.state ?? 'unknown';
+  if (state === 'available' || state === 'unknown') return true;
+  if (state === 'exhausted' && quota?.resets_at) {
+    const resets = Date.parse(quota.resets_at);
+    return Number.isFinite(resets) && resets <= now;
+  }
+  return false;
+}
+
 export const nodeError = (error = 'unauthorized', status_code = 401): NodeError => ({ error, status_code });
 export const boundNodeResult = (value: string) => value
   .replace(/uw_(?:node|worker)_[a-f0-9]+/g, '[redacted]')
@@ -196,7 +211,7 @@ export function nodeSpecAllowed(
     if (spec.kind === 'launch-agent') {
       const harness = capabilities.harnesses?.find((h: any) => h.id === spec.payload?.harness);
       const observed = observedAt ? Date.parse(isoTimestamp(observedAt) ?? '') : NaN;
-      if (!Number.isFinite(observed) || now - observed > NODE_STALE_MS || !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return false;
+      if (!Number.isFinite(observed) || now - observed > NODE_STALE_MS || !harness?.installed || harness.auth_status !== 'ready' || !quotaAllows(harness.quota, now)) return false;
     }
     const kinds = capabilities.supported_operation_kinds;
     if (Array.isArray(kinds) && kinds.length && !kinds.includes(spec.kind)) return false;

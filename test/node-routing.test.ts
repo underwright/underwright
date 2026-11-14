@@ -179,3 +179,24 @@ describe('node job retry policy', () => {
     } finally { old === undefined ? delete process.env.UNDERWRIGHT_POLICY : process.env.UNDERWRIGHT_POLICY = old; }
   });
 });
+
+describe('quota gating', () => {
+  const launchSpec = {
+    kind: 'launch-agent', workspace_id: 'w1',
+    payload: { workspace_id: 'w1', harness: 'codex', prompt: 'x' },
+  } as any;
+  const launchPolicy = { allowed_task_types: ['launch-agent'], workspace_ids: ['w1'], repository_ids: [] } as any;
+  const capsWithQuota = (quota: object) => JSON.stringify({
+    harnesses: [{ id: 'codex', installed: true, auth_status: 'ready', quota }],
+  });
+  const fresh = new Date().toISOString();
+
+  it('blocks exhausted quota, allows past resets_at to recover, and passes available/unknown', () => {
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'exhausted' }), fresh)).toBe(false);
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'exhausted', resets_at: new Date(Date.now() + 3600_000).toISOString() }), fresh)).toBe(false);
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'exhausted', resets_at: new Date(Date.now() - 60_000).toISOString() }), fresh)).toBe(true);
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'available' }), fresh)).toBe(true);
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'unknown' }), fresh)).toBe(true);
+    expect(nodeSpecAllowed(launchPolicy, launchSpec, capsWithQuota({ state: 'stale' }), fresh)).toBe(false);
+  });
+});

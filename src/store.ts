@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -30,6 +30,23 @@ export class SqliteStore implements IStore {
 
   private nodeAudit(id: string, action: string, actor = 'node-protocol') {
     this.log('node', id, action, actor);
+  }
+
+  /** Record quota state transitions per harness so exhaustion/recovery is
+   *  queryable over time instead of only being the latest attestation. */
+  private auditQuotaTransitions(nodeId: string, priorJson: string | null | undefined, harnesses: { id?: string; quota?: { state?: string; resets_at?: string } }[]) {
+    const prior: Record<string, { state?: string; resets_at?: string }> = {};
+    try {
+      for (const h of JSON.parse(priorJson || "{}").harnesses ?? []) if (h?.id) prior[h.id] = h.quota ?? {};
+    } catch { /* first attestation */ }
+    for (const h of harnesses ?? []) {
+      if (!h?.id) continue;
+      const before = prior[h.id]?.state ?? "unattested";
+      const after = h.quota?.state ?? "unknown";
+      if (before === after) continue;
+      const action = after === "exhausted" ? "quota_exhausted" : before === "exhausted" ? "quota_recovered" : "quota_changed";
+      this.log("node", nodeId, action, "capabilities", { harness: h.id, from: before, to: after, resets_at: h.quota?.resets_at ?? null });
+    }
   }
 
   private nodeRate(bucket: string, limit: number): boolean {
@@ -183,7 +200,7 @@ export class SqliteStore implements IStore {
         const harness = inventory.harnesses?.find((h: any) => h.id === spec.payload.harness);
         if (!args.task_id || !args.agent_id || !spec.workspace_id || spec.payload.workspace_id !== spec.workspace_id ||
             !node.capabilities_observed_at || Date.now() - Date.parse(String(node.capabilities_observed_at)) > 120000 ||
-            !harness?.installed || harness.auth_status !== 'ready' || !['available', 'unknown'].includes(harness.quota?.state)) return nodeError('launch requires task, agent and fresh ready harness capability', 403);
+            !harness?.installed || harness.auth_status !== 'ready' || !quotaAllows(harness.quota)) return nodeError('launch requires task, agent and fresh ready harness capability', 403);
         const reserved = (s.nodeQuery("SELECT * FROM jobs WHERE type='node' AND task_id=? AND agent_id=? AND status IN ('queued','running') AND dedupe_key LIKE 'launch:%'", [args.task_id, args.agent_id]))[0];
         if (reserved) return { ...publicNodeJob(reserved), deduped: true };
       }
@@ -443,6 +460,8 @@ export class SqliteStore implements IStore {
     const now = new Date().toISOString();
     const inventoryJson = JSON.stringify(parsed.data);
     if (inventoryJson.includes("uw_node_")) return nodeError("invalid inventory", 400);
+    const prior = (this.nodeQuery("SELECT capabilities_json FROM nodes WHERE id=?", [principal.node_id]))[0];
+    this.auditQuotaTransitions(principal.node_id, prior?.capabilities_json, parsed.data.harnesses);
     this.nodeQuery(
       "UPDATE nodes SET last_seen_at=?, capabilities_json=?, capabilities_version=?, capabilities_observed_at=? WHERE id=?",
       [now, inventoryJson, version, now, principal.node_id],

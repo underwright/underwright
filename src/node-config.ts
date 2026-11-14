@@ -29,8 +29,13 @@ const NATIVE_ARGS: Record<string, string[]> = {
   devin: ["-p"],
 };
 
-/** Harnesses with a known-good omnigent invocation when no native CLI is found. */
-const OMNI_HARNESSES = ["codex", "kimi", "agy", "command-code", "opencode", "grok", "cursor"];
+/** Harness id → omnigent's harness name (verified against omnigent 0.22.0's
+ *  supported list; command-code and plain 'opencode' are NOT omnigent-covered). */
+const OMNI_HARNESSES: Record<string, string> = {
+  codex: "codex", kimi: "kimi", grok: "grok", cursor: "cursor",
+  agy: "antigravity", opencode: "opencode-native", copilot: "copilot",
+  devin: "devin-native", pi: "pi",
+};
 
 const KNOWN_SECTIONS = new Set([
   "workspaces", "repositories", "harnesses", "installers", "scripts",
@@ -145,8 +150,8 @@ export function probeHarnesses(pathEnv = process.env.PATH ?? ""): Record<string,
       const exe = which(bin, pathEnv);
       if (!exe) continue;
       // Prefer omnigent for harnesses without a known single-prompt native form.
-      if (omni && OMNI_HARNESSES.includes(id) && !NATIVE_ARGS[id]) {
-        found[id] = { executable: omni, args: ["run", "--harness", id === "command-code" ? "commandcode" : id, "-p"] };
+      if (omni && OMNI_HARNESSES[id] && !NATIVE_ARGS[id]) {
+        found[id] = { executable: omni, args: ["run", "--harness", OMNI_HARNESSES[id], "-p"] };
       } else {
         found[id] = { executable: exe, args: NATIVE_ARGS[id] ?? [] };
       }
@@ -155,8 +160,8 @@ export function probeHarnesses(pathEnv = process.env.PATH ?? ""): Record<string,
   }
   // Omni can still carry harnesses whose native CLI is absent.
   if (omni) {
-    for (const id of OMNI_HARNESSES) {
-      if (!found[id]) found[id] = { executable: omni, args: ["run", "--harness", id === "command-code" ? "commandcode" : id, "-p"] };
+    for (const [id, omniName] of Object.entries(OMNI_HARNESSES)) {
+      if (!found[id]) found[id] = { executable: omni, args: ["run", "--harness", omniName, "-p"] };
     }
   }
   return found;
