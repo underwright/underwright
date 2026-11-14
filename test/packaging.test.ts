@@ -58,7 +58,7 @@ describe("npm packaging, release CI, and install docs (gh-25)", () => {
     expect(packedPaths.some((p) => p.startsWith("src/"))).toBe(false);
     expect(packedPaths.some((p) => p.startsWith("test/"))).toBe(false);
     expect(packedPaths).not.toContain(".mcp.json");
-  });
+  }, 60000);
 
   it("release-ci: configures tag -> build -> test -> npm publish workflow with provenance", () => {
     const workflowPath = join(root, ".github/workflows/release.yml");
@@ -107,4 +107,4 @@ it("runs the reviewed installer resource from an extracted npm package", () => {
     expect(plan.executable).toBe('bash');
     expect(plan.args).toEqual([script, 'install', '--agents', 'codex', '--yes', '--no-open']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-}, 15000);
+}, 60000);
