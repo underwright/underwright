@@ -423,9 +423,11 @@ export class SqliteStore implements IStore {
       if ((s.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
       if ((s.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
-      // Cooldown: a dispatch-formed job that failed in the last 5 min parks
-      // the task — node-local executor/config errors must not hot-loop.
-      if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status='failed' AND finished_at > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      // Cooldown: any dispatch-formed job that finished in the last 5 min
+      // parks the task. Failure is the obvious case; a 'done' job on a task
+      // still open means the agent couldn't complete it via the board —
+      // re-dispatching instantly just reruns the same dead-end session.
+      if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
