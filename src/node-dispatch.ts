@@ -122,6 +122,12 @@ export function matchTaskToNode(
     return { skip: "no_workspace" };
   }
   const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now);
+  // Model args only ship to daemons that attest launch-model-flag — older
+  // strict payload schemas reject unknown keys ("invalid task parameters").
+  const modelFlagOk = (() => {
+    try { return (JSON.parse(node.capabilitiesJson || "{}").features ?? []).includes("launch-model-flag"); }
+    catch { return false; }
+  })();
   const acCount = (() => {
     try { return (JSON.parse(task.ac_ids || "[]") as unknown[]).length; } catch { return 0; }
   })();
@@ -130,7 +136,8 @@ export function matchTaskToNode(
     routing,
   );
   for (const harness of ready) {
-    const { model, model_flag } = modelForHarness(routing, harness, tier);
+    const resolved = modelForHarness(routing, harness, tier);
+    const { model, model_flag } = modelFlagOk ? resolved : { model: undefined, model_flag: undefined };
     const agent_id = `${harness}@${node.name}`;
     // probe spec: harness+workspace decide admissibility; prompt/model don't
     // affect nodeSpecAllowed

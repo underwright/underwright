@@ -65,6 +65,7 @@ const READY_CAPS = (harnesses: { id: string; quota?: object }[], extra: object =
   protocol_version: 1 as const,
   max_concurrency: 4,
   supported_operation_kinds: ["launch-agent"],
+  features: ["launch-model-flag"],
   harnesses: harnesses.map(h => ({ id: h.id, installed: true, auth_status: "ready" as const, quota: h.quota ?? { state: "available" } })),
   ...extra,
 });
@@ -189,6 +190,21 @@ it("starves cleanly when every harness is exhausted", async () => {
   const res = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(res.empty).toBe(true);
   expect(res.match.skipped.no_harness).toBe(1);
+});
+
+it("omits model args for daemons that do not attest launch-model-flag", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  const legacy = READY_CAPS([{ id: "claude" }]);
+  delete (legacy as any).features;                       // pre-gh-126 daemon
+  await attest(store, node, legacy);
+  await store.createTask(task({ estimate: "L" }));
+
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  const spec = leased.node_spec;
+  expect(spec.payload.harness).toBe("claude");
+  expect(spec.payload.model).toBeUndefined();            // strict-schema-safe
+  expect(spec.payload.model_flag).toBeUndefined();
 });
 
 it("dispatch forms jobs across free concurrency slots, not just one", async () => {
