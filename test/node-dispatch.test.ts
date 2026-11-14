@@ -207,6 +207,30 @@ it("cools down re-dispatch after a formed job fails", async () => {
   expect(res.match.skipped.recent_failure).toBe(1);
 });
 
+it("backs off a failing harness and rotates to the next ready one", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const t1 = await store.createTask(task({ title: "first", priority: 0 }));
+  const t2 = await store.createTask(task({ title: "second", priority: 1 }));
+
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.node_spec.payload.harness).toBe("claude");
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "out of credits");
+
+  // t1 is parked on task-cooldown; t2 dispatches on codex — claude is backed off
+  const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j2.task_id).toBe(t2.id);
+  expect(j2.node_spec.payload.harness).toBe("codex");
+
+  // codex also fails → every ready harness backed off → clean no_harness
+  await store.finishNodeJob(node.token, node.session.session_id, j2.id, j2.lease_token, "failed", "boom");
+  const t3 = await store.createTask(task({ title: "third", priority: 2 }));
+  const res = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(res.empty).toBe(true);
+  expect(res.match.skipped.no_harness).toBeGreaterThanOrEqual(1);
+});
+
 it("omits model args for daemons that do not attest launch-model-flag", async () => {
   const { store } = fixture();
   const node = await enrolled(store);
