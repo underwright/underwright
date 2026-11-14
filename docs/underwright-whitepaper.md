@@ -295,6 +295,14 @@ The sequencing is honest: Lakebase-backed `PgStore` parity and the app
 bundle are active work, not shipped features — which is exactly why they
 are named here as the roadmap rather than implied by adjectives.
 
+Whichever shape the hosted plane takes, the deployment boundary is fixed
+([ADR-0011](adr/0011-deployment-boundary.md)): the plane handles
+coordination metadata and the customer's machines handle execution. Job
+specs name capabilities, never executables or repo contents; harness
+credentials never leave the node; connectivity is outbound-only. A
+customer installs one daemon and one enroll token per machine — the
+security review reduces to "a daemon that polls."
+
 The meta-result, already visible in the day-to-day, is that the system is
 increasingly built by itself: agents claim tasks, hit blockers, escalate
 with structured options, unblock each other, and post evidence — while this
