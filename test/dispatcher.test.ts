@@ -34,7 +34,7 @@ describe("dispatcher policy", () => {
 
   it("ships an enabled dispatcher with a cap and an idle window", () => {
     const policy = JSON.parse(readFileSync(new URL("../underwright.policy.json", import.meta.url), "utf8"));
-    expect(policy.dispatcher).toMatchObject({ enabled: true, max_tasks_per_agent: 0, idle_minutes: 15 });
+    expect(policy.dispatcher).toMatchObject({ enabled: true, max_tasks_per_agent: 3, idle_minutes: 15 });
     expect(policy.dispatcher.review).toEqual(review);
     expect(policy.dod.review).toEqual({ artifacts: ["review"] });
   });

@@ -161,11 +161,13 @@
     "coverage": {
       "codex": true,
       "claude-sdk": true,
-      "cmdc": true,
+      "cmdc": false,
       "kimi": true,
       "agy": true,
       "opencode": true,
-      "pi": true
+      "pi": true,
+      "grok": true,
+      "cursor": true
     }
   },
   "github_status": {
