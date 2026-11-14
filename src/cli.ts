@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { enrollNode, nodeStatus } from "./node-client.js";
+import { attestHarnesses, DEFAULT_NODE_CONFIG_PATH, initConfig, validateConfig, which } from "./node-config.js";
+import type { ExecutorConfig } from "./node-executors.js";
 import {
   installService,
   renderUnit,
@@ -87,8 +89,79 @@ switch (cmd) {
         const configPath = flag('config');
         if (!configPath) throw new Error('node run requires --config FILE with locally approved resources');
         const config = JSON.parse(readFileSync(configPath, 'utf8'));
+        const report = validateConfig(config);
+        for (const issue of report.issues) {
+          console.error(`[node config ${issue.level}] ${issue.section}${issue.id ? ':' + issue.id : ''} ${issue.message}`);
+        }
+        if (!report.ok) throw new Error(`node config invalid: ${report.issues.filter(i => i.level === 'error').length} error(s) — fix ${configPath} or run 'underwright node config validate --config ${configPath}'`);
         await runNode({ signal: shutdown.signal, config });
-      } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run");
+      } else if (args[0] === "config") {
+        const sub = args[1];
+        const configPath = resolve(flag("config") ?? DEFAULT_NODE_CONFIG_PATH);
+        const load = () => JSON.parse(readFileSync(configPath, 'utf8')) as ExecutorConfig;
+        const save = (c: ExecutorConfig) => { mkdirSync(dirname(configPath), { recursive: true }); writeFileSync(configPath, JSON.stringify(c, null, 2) + "\n"); };
+        if (sub === "validate") {
+          const report = validateConfig(load());
+          for (const issue of report.issues) {
+            console.log(`${issue.level.padEnd(7)} ${issue.section}${issue.id ? ':' + issue.id : ''} ${issue.message}`);
+          }
+          console.log(report.ok ? "ok: no errors" : `failed: ${report.issues.filter(i => i.level === "error").length} error(s)`);
+          if (!report.ok) process.exitCode = 1;
+        } else if (sub === "init") {
+          if (existsSync(configPath) && !args.includes("--force")) throw new Error(`config already exists: ${configPath} (use --force to overwrite)`);
+          const workspaces: Record<string, string> = {};
+          for (const w of args.slice(2)) {
+            const m = w.match(/^--workspace=(.+)=(.+)$/);
+            if (m) workspaces[m[1]] = m[2];
+          }
+          const config = initConfig({ workspaces: Object.keys(workspaces).length ? workspaces : undefined });
+          save(config);
+          console.log(`wrote ${configPath}`);
+          const report = validateConfig(config);
+          for (const issue of report.issues) console.log(`${issue.level.padEnd(7)} ${issue.section}${issue.id ? ':' + issue.id : ''} ${issue.message}`);
+        } else if (sub === "set") {
+          const [key, value] = args.slice(2);
+          if (!["concurrency", "timeoutMs", "maxOutput"].includes(key)) throw new Error("settable keys: concurrency, timeoutMs, maxOutput");
+          const config = load();
+          (config as unknown as Record<string, unknown>)[key] = Number(value);
+          save(config);
+          console.log(`${key} = ${value}`);
+        } else if (sub === "add" || sub === "remove") {
+          const [section, id, ...rest] = args.slice(2);
+          const config = load() as Record<string, any>;
+          if (sub === "remove") {
+            if (!["workspaces", "repositories", "harnesses", "installers", "scripts"].includes(section)) throw new Error("removable sections: workspaces, repositories, harnesses, installers, scripts");
+            if (config[section]?.[id] === undefined) throw new Error(`${section}.${id} not present`);
+            delete config[section][id];
+            save(config as ExecutorConfig);
+            console.log(`removed ${section}.${id}`);
+          } else {
+            if (section === "workspace" || section === "workspaces") {
+              const path = rest[0];
+              if (!path || !isAbsolute(path)) throw new Error("add workspace ID ABSOLUTE_PATH");
+              (config.workspaces ??= {})[id] = path;
+            } else if (section === "repository" || section === "repositories") {
+              if (!rest[0]) throw new Error("add repository ID CLONE_URL");
+              (config.repositories ??= {})[id] = rest[0];
+            } else if (section === "harness" || section === "harnesses") {
+              const exe = flag("exec") ?? rest[0];
+              if (!exe || !which(exe)) throw new Error(`executable not found: ${exe ?? "(none given)"} — pass --exec PATH`);
+              (config.harnesses ??= {})[id] = { executable: which(exe)!, args: rest.slice(exe === rest[0] ? 1 : 0) };
+            } else if (section === "script" || section === "scripts") {
+              const exe = rest[0];
+              if (!exe || !which(exe)) throw new Error(`executable not found: ${exe ?? "(none given)"}`);
+              (config.scripts ??= {})[id] = { executable: which(exe)!, args: rest.slice(1) };
+            } else if (section === "installer" || section === "installers") {
+              (config.installers ??= {})[id] = { executable: rest[0] ?? "packaged-install-agents" };
+            } else throw new Error("addable sections: workspace, repository, harness, script, installer");
+            save(config as ExecutorConfig);
+            console.log(`added ${section}.${id}`);
+          }
+        } else if (sub === "attest") {
+          save(attestHarnesses(load()));
+          console.log(`attested harnesses in ${configPath} (auth_status stays operator-set)`);
+        } else throw new Error("usage: underwright node config validate|init|set|add|remove|attest [--config FILE]");
+      } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run | node config <cmd>");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;
   }
@@ -292,6 +365,8 @@ Usage:
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
   underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
+  underwright node config        Manage node-executors.json: validate|init|set|add|remove|attest
+                                 [--config FILE] (default ~/.config/underwright/node-executors.json).
   underwright service install    Install a systemd unit for autostart on reboot:
                                  [serve|node|run|runner] [--http H:P] [--config FILE]
                                  [--url URL] [--system] [--no-start].
