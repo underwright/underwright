@@ -25,7 +25,7 @@ export interface DispatchTask {
 }
 
 /** Why a task didn't match — kept coarse so callers can log/metric it. */
-export type SkipReason = "no_workspace" | "claimed" | "blocked_deps" | "live_job" | "no_harness";
+export type SkipReason = "no_workspace" | "claimed" | "blocked_deps" | "live_job" | "no_harness" | "recent_failure";
 
 export interface DispatchMeta {
   eligible: number;
