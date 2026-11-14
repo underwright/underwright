@@ -3,7 +3,8 @@ import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
+import { matchTaskToNode, buildLaunchSpec, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
@@ -338,7 +339,7 @@ export class SqliteStore implements IStore {
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
       s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
-      const node = (s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
+      const node = (s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1. Running
       // jobs from any session on this node count against it.
@@ -355,10 +356,15 @@ export class SqliteStore implements IStore {
       const held = running.find((j: any) => j.session_id === sessionId && !exclude.includes(j.id));
       // Prefer leasing new queued work while capacity remains; fall back to the
       // session's already-running job (idempotent re-delivery after restart).
-      const queued = running.length < maxConcurrency ? (s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1",
-        [principal.node_id],
-      ))[0] : undefined;
+      const queuedSql = "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1";
+      let queued = running.length < maxConcurrency ? (s.nodeQuery(queuedSql, [principal.node_id]))[0] : undefined;
+      if (!queued && running.length < maxConcurrency) {
+        // gh-126 pull-through dispatch: no pre-queued job — match eligible
+        // board tasks to this node's live capabilities and form one.
+        const meta = this.dispatchToNode(s, principal.node_id, node, now);
+        if (meta.formed) queued = (s.nodeQuery(queuedSql, [principal.node_id]))[0];
+        if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+      }
       if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
       let spec: any = {};
       try { spec = JSON.parse(queued.node_spec || "{}"); } catch { spec = {}; }
@@ -383,6 +389,59 @@ export class SqliteStore implements IStore {
       s.log("job", queued.id, "started", principal.node_id, { attempt_id, lease_expires });
       return publicNodeJob(updated[0]);
     });
+  }
+
+  /** gh-126 pull-through dispatch: find the best eligible board task for this
+   *  node and enqueue a launch-agent job for it. Runs inside the poll's
+   *  transaction so the insert + lease are atomic for this store; concurrent
+   *  pollers lose the live_job check and skip. Returns match metadata so empty
+   *  polls can explain starvation. */
+  private dispatchToNode(s: SqliteStore, nodeId: string, node: any, now: string): DispatchMeta & { formed: boolean } {
+    const meta: DispatchMeta & { formed: boolean } = { formed: false, eligible: 0, considered: 0, skipped: {} };
+    const dispatch = getDispatchPolicy();
+    if (!dispatch.enabled) return meta;
+    const routing = getModelRouting();
+    const candidates = s.nodeQuery(
+      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
+       WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
+       ORDER BY priority ASC, updated_at ASC LIMIT 25`,
+    ) as DispatchTask[];
+    meta.eligible = candidates.length;
+    const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
+    const policy = JSON.parse(node.policy_json || "{}");
+    for (const task of candidates) {
+      meta.considered++;
+      if ((s.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
+      if ((s.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
+      if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
+      const result = matchTaskToNode(task, {
+        name: node.name ?? nodeId,
+        policy,
+        capabilitiesJson: node.capabilities_json,
+        capabilitiesObservedAt: node.capabilities_observed_at,
+      }, dispatch, routing, Date.parse(now));
+      if ("skip" in result) { skip(result.skip); continue; }
+      const m = result.match;
+      const id = `job-${randomUUID().slice(0, 8)}`;
+      const spec = buildLaunchSpec({
+        taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
+        workspace: m.workspace, harness: m.harness, model: m.model, model_flag: m.model_flag,
+      });
+      try {
+        s.nodeQuery(
+          `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key)
+           VALUES (?,?,?,'node','',?,?,'dispatch:'||?)`,
+          [id, task.id, m.agent_id, nodeId, JSON.stringify(spec), task.id],
+        );
+      } catch { skip("live_job"); continue; }
+      s.log("job", id, "submitted", "dispatch", {
+        type: "node", via: "pull-through", target_node_id: nodeId, task_id: task.id,
+        harness: m.harness, tier: m.tier, model: m.model ?? null, workspace: m.workspace,
+      });
+      meta.formed = true;
+      return meta;
+    }
+    return meta;
   }
 
   async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal, exclude: string[] = []) {

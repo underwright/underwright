@@ -70,7 +70,7 @@ quota signatures (`codex_seats`).
 seat fields, `harness_matrix` (which agent runs which backend; omnigent
 coverage table decides `omni run` vs raw CLI).
 
-#### Node execution — pull-through dispatch 📐 (gh-126)
+#### Node execution — pull-through dispatch ✅ (gh-126)
 
 Nodes are pullers, not push targets. The daemon's lifecycle on every host:
 
@@ -104,7 +104,7 @@ sequenceDiagram
     D->>S: POST /nodes/v1/poll { held_job_ids, wait: 25s }
     alt pre-queued job for this node
       S-->>D: job { id, lease_token, spec }
-    else eligible tasks × node capability — pull-through match 📐 gh-126
+    else eligible tasks × node capability — pull-through match
       S->>B: open + DoR + blockers done vs vendors / slots / quota / policy
       S-->>D: formed job (task + vendor + model + prompt)
     else nothing eligible
@@ -135,17 +135,23 @@ The poll handler runs the match — there is no separate producer daemon:
                  3. else long-poll wait, re-evaluate on wake
 ```
 
-Eligibility is maintained by synchronous hooks (task→open, last blocker
-done, quota transitions); the **match** runs at pull time against the
-polling node's live state — attested vendors, free slot, per-harness quota,
-node policy allowlist. The job spec emitted carries **task + vendor +
-concrete model + prompt**, which is both the dispatch decision and the
-usage-attribution key (gh-61). Match metadata explains starvation
-("3 eligible, 2 need cline, 1 quota-exhausted") instead of returning empty.
+The **match** runs at pull time inside `leaseNodeJob` against the polling
+node's live state — attested vendors, free slot, per-harness quota, node
+policy allowlist. Eligible tasks are `open` + DoR fields (estimate, ACs) +
+no unfinished blockers + no active claim + no live node job. The job spec
+emitted carries **task + vendor + concrete model + prompt** — tier resolved
+from `model_routing` rules (type/estimate/min-ac/review-kind → tier, then
+`models[harness][tier]`), flag from `model_routing.flags` and applied
+node-side — which is both the dispatch decision and the usage-attribution
+key (gh-61). Empty polls return `match` metadata explaining starvation
+(eligible count + skip reasons: `no_workspace`, `blocked_deps`, `live_job`,
+`no_harness`) instead of bare empty.
 
-Today only stages 1 and 3 exist — `submit_node_task`/`submit_job` are the
-sole producers, so an empty queue stays empty (observed: reconnected node
-with 8 slots pulling nothing while the board held 89 open tasks).
+Placement is policy-driven, not hard-coded: `dispatch` in
+`underwright.policy.json` carries `workspaces` (repo slug → workspace_id,
+task repo parsed from `spec_ref`), `default_workspace`, and `harness_order`
+preference. `submit_node_task`/`submit_job` remain valid producers —
+pre-queued jobs are always leased first.
 
 ### 5. Work — claim, context, build ✅
 

@@ -108,12 +108,43 @@ export interface HumanNotifyPolicy {
 /** Per-agent launch preferences plus the omnigent coverage table. Agent entries
  *  map agent_id (or "*") to a preferred harness+backend; the "coverage" table
  *  records which harnesses omnigent can drive today. */
+/** gh-126: pull-through dispatch. When a node polls and has no queued job,
+ *  the control plane matches eligible board tasks to that node's live
+ *  capabilities and forms a launch-agent job. `workspaces` maps a repo slug
+ *  ("owner/name", from the task's spec_ref URL) to the workspace_id the node
+ *  policy knows; `default_workspace` covers tasks with no resolvable repo.
+ *  `harness_order` is a preference list — attested harnesses not listed are
+ *  tried afterwards in attestation order. */
+export interface DispatchRule {
+  enabled?: boolean;
+  default_workspace?: string;
+  workspaces?: Record<string, string>;
+  harness_order?: string[];
+}
+
+export interface ModelRoutingRule {
+  enabled?: boolean;
+  default_tier?: string;
+  rules?: Array<{
+    type?: string[];
+    estimate?: string[];
+    min_ac?: number;
+    review_kind?: string[];
+    paths?: string[];
+    tier: string;
+  }>;
+  models?: Record<string, Record<string, string>>;
+  flags?: Record<string, string>;
+}
+
 export interface Policy {
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
   templates?: TaskTemplate[];
   automerge?: boolean | string[] | Record<string, boolean | AutoMergeRule>;
   dispatcher?: DispatcherRule;
+  dispatch?: DispatchRule;
+  model_routing?: ModelRoutingRule;
   human_notify?: string | HumanNotifyRule;
   "human-notify"?: string | HumanNotifyRule;
   notifications?: string | HumanNotifyRule;
@@ -447,4 +478,61 @@ export function expandTemplate<T extends TemplateSeedArgs>(args: T, policy: Poli
     },
     error: undefined,
   };
+}
+
+/** gh-126 pull-through dispatch policy. Disabled when the block is absent. */
+export function getDispatchPolicy(policy: Policy = loadPolicy()): Required<DispatchRule> & { workspaces: Record<string, string> } {
+  const d = policy.dispatch;
+  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [] };
+  return {
+    enabled: d.enabled !== false,
+    default_workspace: typeof d.default_workspace === "string" ? d.default_workspace : "",
+    workspaces: d.workspaces && typeof d.workspaces === "object" ? d.workspaces : {},
+    harness_order: Array.isArray(d.harness_order) ? d.harness_order.filter(h => typeof h === "string") : [],
+  };
+}
+
+export function getModelRouting(policy: Policy = loadPolicy()): Required<Omit<ModelRoutingRule, "rules" | "models" | "flags">> & Pick<ModelRoutingRule, "rules" | "models" | "flags"> {
+  const m = policy.model_routing;
+  if (!m || typeof m !== "object") return { enabled: false, default_tier: "standard", rules: [], models: {}, flags: {} };
+  return {
+    enabled: m.enabled !== false,
+    default_tier: typeof m.default_tier === "string" && m.default_tier ? m.default_tier : "standard",
+    rules: Array.isArray(m.rules) ? m.rules : [],
+    models: m.models && typeof m.models === "object" ? m.models : {},
+    flags: m.flags && typeof m.flags === "object" ? m.flags : {},
+  };
+}
+
+/** Resolve the model tier for a task from model_routing rules. First matching
+ *  rule wins; fields present on a rule must all match (paths rules are skipped —
+ *  tasks carry no path set at dispatch time). */
+export function tierForTask(
+  task: { type?: string; estimate?: string; ac_count?: number; review_kind?: string },
+  routing = getModelRouting(),
+): string {
+  for (const r of routing.rules ?? []) {
+    if (!r?.tier) continue;
+    if (r.paths?.length) continue;
+    if (r.type?.length && !r.type.includes(task.type ?? "")) continue;
+    if (r.estimate?.length && !r.estimate.includes(task.estimate ?? "")) continue;
+    if (r.review_kind?.length && !r.review_kind.includes(task.review_kind ?? "")) continue;
+    if (r.min_ac != null && (task.ac_count ?? 0) < r.min_ac) continue;
+    return r.tier;
+  }
+  return routing.default_tier;
+}
+
+/** Concrete model + CLI flag for a harness at a tier. `*` entries apply to any
+ *  harness without an explicit row; flag is omitted when the harness takes no
+ *  model flag (flag shipped in the job spec, applied node-side). */
+export function modelForHarness(
+  routing: ReturnType<typeof getModelRouting>,
+  harness: string,
+  tier: string,
+): { tier: string; model?: string; model_flag?: string } {
+  const table = routing.models?.[harness] ?? routing.models?.["*"];
+  const model = table?.[tier] ?? table?.[routing.default_tier];
+  const flag = routing.flags?.[harness] ?? routing.flags?.["*"];
+  return model ? { tier, model, ...(flag ? { model_flag: flag } : {}) } : { tier };
 }
