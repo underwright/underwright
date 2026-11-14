@@ -348,7 +348,7 @@ The same line belongs on a fleet agent job. The runner does not claim the
 task; the launched harness does, then keeps going:
 
 ```json
-"prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md strictly and work the board until idle. Before escalating, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact kind=blocked with what was tried, send_message to the human, then release_task and read inbox for your next task — do not idle. Claim {{task_id}}, implement it, report evidence, then read inbox and continue. Job: {{job_id}}."
+"prompt": "You are {{agent_id}} on {{host}}. Read AGENTS.md strictly and work the board until idle. Before escalating, search_context for helpers, check artifacts and handoffs on the task, and try the alternate harness CLI. If still blocked, post_artifact kind=blocked with what was tried, send_message to the human, then release_task and read inbox for your next task — do not idle. Claim {{task_id}}, implement it, record progress on the task ledger with record_progress at transitions (started, blocked, done — one line each: decisions, blockers, next step), report evidence, then read inbox and continue. Job: {{job_id}}."
 ```
 
 ```bash
