@@ -97,7 +97,7 @@ export interface IStore {
   authenticateNode(token: string, sessionId?: string): Awaitable<NodePrincipal | NodeError>;
   startNodeSession(token: string): Awaitable<any>;
   submitNodeTask(a: SubmitNodeTaskArgs): Awaitable<any>;
-  pollNodeJob(token: string, sessionId: string, waitSeconds?: number, signal?: AbortSignal): Awaitable<any>;
+  pollNodeJob(token: string, sessionId: string, waitSeconds?: number, signal?: AbortSignal, exclude?: string[]): Awaitable<any>;
   renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
   finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
   sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;

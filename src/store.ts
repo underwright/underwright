@@ -306,32 +306,37 @@ export class SqliteStore implements IStore {
     });
   }
 
-  private leaseNodeJob(token: string, sessionId: string) {
+  private leaseNodeJob(token: string, sessionId: string, exclude: string[] = []) {
     this.sweepExpiredNodeJobs();
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
       s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
-      const held = (s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>? AND session_id=?",
-        [principal.node_id, now, sessionId],
-      ))[0];
-      if (held) return publicNodeJob(held);
-      const busy = (s.nodeQuery(
-        "SELECT id FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>?",
-        [principal.node_id, now],
-      ))[0];
-      if (busy) return { empty: true, status_code: 204 };
-      const queued = (s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1",
-        [principal.node_id],
-      ))[0];
-      if (!queued) return { empty: true, status_code: 204 };
-      let spec: any = {};
-      try { spec = JSON.parse(queued.node_spec || "{}"); } catch { spec = {}; }
       const node = (s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
+      // gh-91: capacity is the node's attested max_concurrency, not 1. Running
+      // jobs from any session on this node count against it.
+      const running = s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>?",
+        [principal.node_id, now],
+      ) as any[];
+      let maxConcurrency = 1;
+      try {
+        const caps = JSON.parse(node.capabilities_json || "{}");
+        const advertised = Number(caps.max_concurrency);
+        if (Number.isFinite(advertised)) maxConcurrency = Math.max(1, Math.min(8, Math.floor(advertised)));
+      } catch { /* default 1 */ }
+      const held = running.find((j: any) => j.session_id === sessionId && !exclude.includes(j.id));
+      // Prefer leasing new queued work while capacity remains; fall back to the
+      // session's already-running job (idempotent re-delivery after restart).
+      const queued = running.length < maxConcurrency ? (s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1",
+        [principal.node_id],
+      ))[0] : undefined;
+      if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
+      let spec: any = {};
+      try { spec = JSON.parse(queued.node_spec || "{}"); } catch { spec = {}; }
       if (!s.nodePolicyAllows(JSON.parse(node.policy_json), spec, node.capabilities_json, node.capabilities_observed_at)) {
         s.nodeQuery(
           "UPDATE jobs SET status='failed', finished_at=?, outcome_reason='policy_denied', lease_expires=NULL WHERE id=? AND status='queued'",
@@ -355,13 +360,13 @@ export class SqliteStore implements IStore {
     });
   }
 
-  async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal) {
+  async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal, exclude: string[] = []) {
     const waitMs = Math.max(0, Math.min(NODE_POLL_MAX_WAIT, waitSeconds)) * 1000;
     const deadline = Date.now() + waitMs;
     try {
       while (true) {
         if (signal?.aborted) return nodeError("canceled", 499);
-        const leased = this.leaseNodeJob(token, sessionId);
+        const leased = this.leaseNodeJob(token, sessionId, exclude);
         if (!leased || !("empty" in leased)) return leased;
         if (Date.now() >= deadline) return leased;
         await sleepSignal(Math.min(50, Math.max(1, deadline - Date.now())), signal);

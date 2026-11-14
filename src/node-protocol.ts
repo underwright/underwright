@@ -37,9 +37,15 @@ export const nodeSpecSchema = z.object({
   }
 });
 export type NodeSpec = z.output<typeof nodeSpecSchema>;
+/** Protocol cap on a node's advertised worker slots (gh-91). */
+export const NODE_MAX_CONCURRENCY = 8;
 export const nodePollSchema = z.object({
   session_id: z.string().min(1).max(64),
   wait_seconds: z.number().int().min(0).max(NODE_POLL_MAX_WAIT).default(0),
+  /** Job ids this daemon already holds (gh-91). The lease path skips
+   *  re-delivering held jobs the caller is already running, so idle slots
+   *  wait for real work instead of livelock-looping on a held job. */
+  held_job_ids: z.array(z.string().max(64)).max(NODE_MAX_CONCURRENCY).default([]),
 }).strict();
 export const nodeRenewSchema = z.object({
   session_id: z.string().min(1).max(64),
@@ -86,8 +92,8 @@ export const nodeInventorySchema = z.object({
   labels: z.array(z.string().max(64)).max(16).default([]),
   supported_operation_kinds: z.array(z.enum(NODE_JOB_KINDS)).max(4).default([]),
   approved_workspace_ids: z.array(z.string().max(128)).max(32).default([]),
-  max_concurrency: z.number().int().min(1).max(8).default(1),
-  current_slots: z.number().int().min(0).max(8).default(0),
+  max_concurrency: z.number().int().min(1).max(NODE_MAX_CONCURRENCY).default(1),
+  current_slots: z.number().int().min(0).max(NODE_MAX_CONCURRENCY).default(0),
   harnesses: z.array(nodeHarnessSchema).max(16).default([]),
 }).strict();
 export const nodeCapabilitiesSchema = z.object({

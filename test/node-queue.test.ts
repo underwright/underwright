@@ -80,8 +80,10 @@ it("rejects stale session/attempt owners and acknowledges matching finish only",
 it("fails expired node leases as outcome_unknown without reclaim, while legacy jobs remain reclaimable", async () => {
   const { store } = fixture();
   vi.useFakeTimers();
-  const node = await enrolled(store);
-  const nodeJob = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: spec() });
+  const node = await enrolled(store, "node", { allowed_task_types: ["run-script", "provision"], workspace_ids: ["ws-1"] });
+  // 'provision' is not in dispatcher.node_retry.kinds — the outcome_unknown
+  // default is what's under test here (run-script intentionally requeues).
+  const nodeJob = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: spec({ kind: "provision" }) });
   const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
   const legacy = store.submitJob({ agent_id: "a", type: "test", command: "echo hi" });
   const oldLegacy = store.nextJob("runner", "A", 5);

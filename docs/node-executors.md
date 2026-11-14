@@ -14,9 +14,19 @@ user-owned local configuration. It names the only commands the node may execute:
   "harnesses": {"codex": {"executable": "codex", "args": ["exec"]}},
   "installers": {"codex": {"executable": "packaged-install-agents"}},
   "scripts": {"check": {"executable": "npm", "args": ["test"]}},
+  "concurrency": 4,
   "timeoutMs": 600000
 }
 ```
+
+`concurrency` (gh-91) sets this node's worker slots: how many node jobs run in
+parallel. It is clamped to the protocol maximum of 8 (a warning is logged when
+clamped). The daemon attests it as `max_concurrency` and reports live
+`current_slots` each capabilities tick; the server leases up to that many
+running jobs per node and prefers nodes with free slots when routing. Each
+slot polls with its own lease and journal — a running job is a child process,
+so a crashed job kills only its own slot. Omit it (or use an operator
+`inventory` object) and the node stays single-slot.
 
 The packaged installer resolves relative to the installed module and runs the
 reviewed `scripts/install-agents.sh install --agents ID --yes --no-open` resource.

@@ -33,6 +33,9 @@ export interface ExecutorConfig {
   installers?: Record<string, { executable: string; args?: string[] }>;  // install-harness targets
   scripts?: Record<string, { executable: string; args?: string[] }>;     // run-script targets
   envAllow?: string[];                                      // extra env names to pass through
+  /** Pinned worker slots for this node (gh-91). Clamped to the protocol max
+   *  (8). Overrides the inventory probe's max_concurrency recommendation. */
+  concurrency?: number;
   timeoutMs?: number;
   onSpawn?: (pid: number) => void;
   maxOutput?: number;

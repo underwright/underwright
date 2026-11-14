@@ -79,6 +79,66 @@ it("heartbeats independently while a job is running and redacts inventory secret
   await running.catch(() => undefined);
 });
 
+it("runs two jobs in parallel when config.concurrency is 2 (gh-91)", async () => {
+  const { store, path, dir } = fixture();
+  const http = await serveHttp(path, "127.0.0.1", 0, "admin-secret");
+  cleanup.push(() => new Promise<void>(resolve => { http.close(() => resolve()); http.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${(http.address() as any).port}`;
+  const node = await enrolled(store);
+  saveNodeCredential({ version: 1, url, node_id: node.node_id, token: node.token, expires_at: node.expires_at, insecure_transport: true }, dir);
+  const j1 = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: { version: 1, kind: "run-script", payload: {} } });
+  const j2 = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: { version: 1, kind: "run-script", payload: {} } });
+  let inFlight = 0, maxInFlight = 0;
+  const seen = new Set<string>();
+  const executor = async (job: any) => {
+    inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight); seen.add(job.id);
+    // Hold each job open until both slots are occupied (or give up) — proves
+    // overlap rather than relying on executor-vs-stagger timing.
+    for (let i = 0; i < 400 && seen.size < 2; i += 1) await new Promise(resolve => setTimeout(resolve, 25));
+    inFlight -= 1;
+    return { status: "done" as const, result: `done:${job.id}` };
+  };
+  const shutdown = new AbortController();
+  const running = runNode({
+    dir, signal: shutdown.signal, heartbeatMs: 40, capabilitiesMs: 60,
+    executor, config: { workspaces: {}, concurrency: 2 },
+    probe: () => ({ protocol_version: 1, harnesses: [] }),
+  });
+  await vi.waitFor(() => expect(seen.size).toBe(2), { timeout: 10_000 });
+  expect(maxInFlight).toBe(2);
+  await vi.waitFor(() => {
+    const jobs = store.nodeQuery("SELECT status FROM jobs WHERE type='node' AND target_node_id=?", [node.node_id]).map((j: any) => j.status);
+    expect(jobs.length).toBe(2);
+    expect(jobs.every((s: string) => s === "done")).toBe(true);
+  }, { timeout: 10_000 });
+  const caps = JSON.parse(store.listNodes()[0] ? (store as any).nodeQuery("SELECT capabilities_json FROM nodes WHERE id=?", [node.node_id])[0]?.capabilities_json ?? "{}" : "{}");
+  expect(caps.max_concurrency).toBe(2);
+  shutdown.abort();
+  await running.catch(() => undefined);
+});
+
+it("clamps config.concurrency to the protocol cap of 8 (gh-91)", async () => {
+  const { store, path, dir } = fixture();
+  const http = await serveHttp(path, "127.0.0.1", 0, "admin-secret");
+  cleanup.push(() => new Promise<void>(resolve => { http.close(() => resolve()); http.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${(http.address() as any).port}`;
+  const node = await enrolled(store);
+  saveNodeCredential({ version: 1, url, node_id: node.node_id, token: node.token, expires_at: node.expires_at, insecure_transport: true }, dir);
+  const shutdown = new AbortController();
+  const running = runNode({
+    dir, signal: shutdown.signal, heartbeatMs: 40, capabilitiesMs: 60,
+    executor: async () => ({ status: "done" as const, result: "x" }),
+    config: { workspaces: {}, concurrency: 99 },
+    probe: () => ({ protocol_version: 1, harnesses: [] }),
+  });
+  await vi.waitFor(() => {
+    const caps = JSON.parse((store as any).nodeQuery("SELECT capabilities_json FROM nodes WHERE id=?", [node.node_id])[0]?.capabilities_json ?? "{}");
+    expect(caps.max_concurrency).toBe(8);
+  }, { timeout: 10_000 });
+  shutdown.abort();
+  await running.catch(() => undefined);
+});
+
 it("escapes node names on the dashboard and refuses credential-bearing inventory", async () => {
   const { store } = fixture();
   const node = await enrolled(store);
