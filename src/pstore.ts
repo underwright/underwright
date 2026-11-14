@@ -515,7 +515,7 @@ export class PgStore implements IStore {
       if ((await this.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
-      if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status='failed' AND finished_at > now() - interval '5 minutes' LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > now() - interval '5 minutes' LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
