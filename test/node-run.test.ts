@@ -139,6 +139,55 @@ it("clamps config.concurrency to the protocol cap of 8 (gh-91)", async () => {
   await running.catch(() => undefined);
 });
 
+it("re-authenticates when the server session expires instead of exiting (gh-110)", async () => {
+  const { store, path, dir } = fixture();
+  const http = await serveHttp(path, "127.0.0.1", 0, "admin-secret");
+  cleanup.push(() => new Promise<void>(resolve => { http.close(() => resolve()); http.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${(http.address() as any).port}`;
+  const node = await enrolled(store);
+  saveNodeCredential({ version: 1, url, node_id: node.node_id, token: node.token, expires_at: node.expires_at, insecure_transport: true }, dir);
+  const shutdown = new AbortController();
+  let settled = false;
+  const running = runNode({
+    dir, signal: shutdown.signal, heartbeatMs: 30, capabilitiesMs: 60,
+    executor: async () => ({ status: "done" as const, result: "x" }),
+    probe: () => ({ protocol_version: 1, harnesses: [] }),
+  }).finally(() => { settled = true; });
+  await vi.waitFor(() => expect(store.listNodes()[0].liveness).toBe("online"), { timeout: 10_000 });
+  // Expire the server-side session: the next heartbeat/poll gets a 401.
+  store.nodeQuery("UPDATE nodes SET session_expires_at=? WHERE id=?", [new Date(Date.now() - 1000).toISOString(), node.node_id]);
+  await new Promise(resolve => setTimeout(resolve, 400));
+  expect(settled).toBe(false);
+  // Work must still flow on the re-established session.
+  await store.submitNodeTask({ target_node_id: node.node_id, node_spec: { version: 1, kind: "run-script", payload: {} } });
+  await vi.waitFor(() => {
+    const statuses = store.nodeQuery("SELECT status FROM jobs WHERE type='node' AND target_node_id=?", [node.node_id]).map((j: any) => j.status);
+    expect(statuses.length).toBe(1);
+    expect(statuses[0]).toBe("done");
+  }, { timeout: 15_000 });
+  shutdown.abort();
+  await running.catch(() => undefined);
+});
+
+it("retries session establishment instead of exiting on session-denied (gh-110)", async () => {
+  const { path, dir } = fixture();
+  const http = await serveHttp(path, "127.0.0.1", 0, "admin-secret");
+  cleanup.push(() => new Promise<void>(resolve => { http.close(() => resolve()); http.closeAllConnections(); }));
+  const url = `http://127.0.0.1:${(http.address() as any).port}`;
+  saveNodeCredential({ version: 1, url, node_id: "node-x", token: `uw_node_${"0".repeat(64)}`, expires_at: new Date(Date.now() + 86400000).toISOString(), insecure_transport: true }, dir);
+  const shutdown = new AbortController();
+  let settled = false;
+  const running = runNode({
+    dir, signal: shutdown.signal, heartbeatMs: 30, capabilitiesMs: 60,
+    executor: async () => ({ status: "done" as const, result: "x" }),
+    probe: () => ({ protocol_version: 1, harnesses: [] }),
+  }).finally(() => { settled = true; });
+  await new Promise(resolve => setTimeout(resolve, 500));
+  expect(settled).toBe(false);
+  shutdown.abort();
+  await running.catch(() => undefined);
+});
+
 it("escapes node names on the dashboard and refuses credential-bearing inventory", async () => {
   const { store } = fixture();
   const node = await enrolled(store);

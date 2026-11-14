@@ -110,118 +110,141 @@ export async function runNode(opts: {
     console.error(`[underwright-node] config.concurrency=${opts.config.concurrency} clamped to ${maxConcurrency}`);
   }
   const activeJobs = new Set<string>();
-  const backoff = async (error: any) => {
+  const backoff = async (error: any, sig: AbortSignal) => {
     const wait = Math.max(1, Math.min(30, Number(error?.retry_after) || 1 + Math.floor(Math.random() * 3)));
-    await sleep(wait * 1000, abort.signal);
+    await sleep(wait * 1000, sig);
   };
   try {
-    const session = await nodeCall(cred, "/nodes/v1/session", { version: 1 }, "POST", abort.signal);
-    if (session.error || !session.session_id) throw Object.assign(new Error("session denied"), session);
-    session_id = session.session_id;
-    const execute = opts.executor ?? (async (job: any, childSignal?: AbortSignal) => {
-      if (!opts.config) return { status: 'failed' as const, result: 'executor config required; use node run --config FILE' };
-      const registry = createExecutorRegistry(session.policy, {
-        ...opts.config,
-        timeoutMs: Math.min(opts.config.timeoutMs ?? 600000, (job.node_spec.timeout_seconds ?? 600) * 1000),
-        onSpawn: pid => journal.write({ job_id: job.id, attempt_id: job.attempt_id, phase: 'started', pid, process_start: processStart(pid) }),
-      });
-      let worker: Record<string, string> | undefined;
-      if (job.node_spec.kind === 'launch-agent') {
-        const issued = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/worker`, { session_id, lease_token: job.lease_token });
-        if (issued.error || !issued.token) return { status: 'failed' as const, result: 'worker credential denied' };
-        worker = { UNDERWRIGHT_TOKEN: issued.token, UNDERWRIGHT_MCP_URL: cred.url + '/worker/mcp', UNDERWRIGHT_TASK_ID: issued.task_id, UNDERWRIGHT_AGENT_ID: issued.agent_id, UNDERWRIGHT_JOB_ID: issued.job_id, UNDERWRIGHT_ATTEMPT_ID: issued.attempt_id };
-      }
-      return registry.execute({ id: job.id, type: job.node_spec.kind, params: job.node_spec.payload, worker }, childSignal);
-    });
-    const beat = async () => {
-      while (!abort.signal.aborted) {
-        try {
-          const active_job_id = [...activeJobs][0];
-          const phase = activeJobs.size ? "running" : "idle";
-          const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase }, "POST", abort.signal);
-          if ([401, 409].includes(result.status)) { abort.abort(); return; }
-        } catch (error) { if (abort.signal.aborted) return; await backoff(error); }
-        await sleep(heartbeatMs, abort.signal).catch(() => undefined);
-      }
-    };
-    const caps = async () => {
-      while (!abort.signal.aborted) {
-        try {
-          const probed: any = await Promise.race([
-            Promise.resolve(probe()),
-            sleep(5_000, abort.signal).then(() => { throw Object.assign(new Error("probe timeout"), { timeout: true }); }),
-          ]);
-          // Live numbers always win over whatever the probe advertises (gh-91).
-          if (opts.config) {
-            probed.supported_operation_kinds = configSupportedKinds(opts.config);
-            probed.approved_workspace_ids = Object.keys(opts.config.workspaces ?? {});
-          }
-          const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size };
-          capabilities_version += 1;
-          const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", abort.signal);
-          if ([401, 409].includes(result.status)) { abort.abort(); return; }
-        } catch (error) { if (abort.signal.aborted) return; await backoff(error); }
-        await sleep(capabilitiesMs, abort.signal).catch(() => undefined);
-      }
-    };
-    const work = async (slot: number) => {
-      // Stagger slot starts so a fleet restart doesn't stampede the poll endpoint.
-      if (slot) await sleep((slot * 250) + Math.floor(Math.random() * 250), abort.signal).catch(() => undefined);
-      while (!abort.signal.aborted) {
-        let job: any;
-        let held = false;
-        try {
-          job = await nodeCall(cred, "/nodes/v1/poll", { session_id, wait_seconds: 25, held_job_ids: [...activeJobs] }, "POST", abort.signal);
-          if ([401, 409].includes(job.status)) { abort.abort(); return; }
-          if (job.empty || job.status === 204 || !job.id) continue;
-          if (activeJobs.has(job.id)) continue; // duplicate delivery; another slot holds it
-          activeJobs.add(job.id);
-          held = true;
-          let record = journal.read(job.id, job.attempt_id);
-          let finished = record?.outcome;
-          if (!record) {
-            record = { job_id: job.id, attempt_id: job.attempt_id, phase: 'started' };
-            journal.write(record);
-            const childAbort = new AbortController();
-            const stopChild = () => childAbort.abort();
-            abort.signal.addEventListener('abort', stopChild, { once: true });
-            if (abort.signal.aborted) childAbort.abort();
-            let expires = Date.parse(job.lease_expires);
-            let renewing = false;
-            const timer = setInterval(() => {
-              if (Date.now() >= expires) childAbort.abort();
-              if (renewing || childAbort.signal.aborted) return;
-              renewing = true;
-              void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token }, 'POST', AbortSignal.timeout(Math.max(1, Math.min(10000, expires - Date.now()))))
-                .then(r => { if (r.error || !r.lease_expires) childAbort.abort(); else expires = Date.parse(r.lease_expires); })
-                .catch(() => childAbort.abort()).finally(() => { renewing = false; });
-            }, opts.renewMs ?? 10000);
-            const expiryTimer = setInterval(() => { if (Date.now() >= expires) childAbort.abort(); }, 100);
-            try {
-              finished = await execute(job, childAbort.signal);
-              finished = { status: childAbort.signal.aborted ? 'failed' : finished.status, result: redact(finished.result).slice(-64000) };
-            } catch { finished = { status: 'failed', result: 'executor failed/outcome_unknown' }; }
-            finally { clearInterval(timer); clearInterval(expiryTimer); abort.signal.removeEventListener('abort', stopChild); }
-            journal.write({ ...record, phase: 'finished', outcome: finished });
-          }
-          finished ??= { status: 'failed', result: 'restart/outcome_unknown; automatic replay refused' };
-          const receipt = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/finish`, {
-            session_id, lease_token: job.lease_token, status: finished.status, result: finished.result,
-          });
-          if (receipt.error) { if ([401, 409].includes(receipt.status)) abort.abort(); else throw new Error('finish failed'); }
-        } catch (error) {
-          if (abort.signal.aborted) return;
-          await backoff(error);
-        } finally {
-          if (held) activeJobs.delete(job?.id);
+    // gh-110: re-session loop. A 401/409 means the server-side session died —
+    // abort the current loop set, re-authenticate, and start fresh loops
+    // rather than exiting. Previously loops settled fulfilled on abort, so the
+    // process exited 0 and Restart=on-failure never fired: nodes stayed dead.
+    while (!signal.aborted) {
+      const sessionAbort = new AbortController();
+      const linkAbort = () => sessionAbort.abort();
+      signal.addEventListener("abort", linkAbort);
+      try {
+        const session = await nodeCall(cred, "/nodes/v1/session", { version: 1 }, "POST", sessionAbort.signal);
+        if (session.error || !session.session_id) {
+          console.error(`[underwright-node] session denied (${session.status ?? "unknown"}); retrying`);
+          await backoff(session, sessionAbort.signal).catch(() => undefined);
+          continue;
         }
+        session_id = session.session_id;
+        const execute = opts.executor ?? (async (job: any, childSignal?: AbortSignal) => {
+          if (!opts.config) return { status: 'failed' as const, result: 'executor config required; use node run --config FILE' };
+          const registry = createExecutorRegistry(session.policy, {
+            ...opts.config,
+            timeoutMs: Math.min(opts.config.timeoutMs ?? 600000, (job.node_spec.timeout_seconds ?? 600) * 1000),
+            onSpawn: pid => journal.write({ job_id: job.id, attempt_id: job.attempt_id, phase: 'started', pid, process_start: processStart(pid) }),
+          });
+          let worker: Record<string, string> | undefined;
+          if (job.node_spec.kind === 'launch-agent') {
+            const issued = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/worker`, { session_id, lease_token: job.lease_token });
+            if (issued.error || !issued.token) return { status: 'failed' as const, result: 'worker credential denied' };
+            worker = { UNDERWRIGHT_TOKEN: issued.token, UNDERWRIGHT_MCP_URL: cred.url + '/worker/mcp', UNDERWRIGHT_TASK_ID: issued.task_id, UNDERWRIGHT_AGENT_ID: issued.agent_id, UNDERWRIGHT_JOB_ID: issued.job_id, UNDERWRIGHT_ATTEMPT_ID: issued.attempt_id };
+          }
+          return registry.execute({ id: job.id, type: job.node_spec.kind, params: job.node_spec.payload, worker }, childSignal);
+        });
+        const beat = async () => {
+          while (!sessionAbort.signal.aborted) {
+            try {
+              const active_job_id = [...activeJobs][0];
+              const phase = activeJobs.size ? "running" : "idle";
+              const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase }, "POST", sessionAbort.signal);
+              if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
+            } catch (error) { if (sessionAbort.signal.aborted) return; await backoff(error, sessionAbort.signal); }
+            await sleep(heartbeatMs, sessionAbort.signal).catch(() => undefined);
+          }
+        };
+        const caps = async () => {
+          while (!sessionAbort.signal.aborted) {
+            try {
+              const probed: any = await Promise.race([
+                Promise.resolve(probe()),
+                sleep(5_000, sessionAbort.signal).then(() => { throw Object.assign(new Error("probe timeout"), { timeout: true }); }),
+              ]);
+              // Live numbers always win over whatever the probe advertises (gh-91).
+              if (opts.config) {
+                probed.supported_operation_kinds = configSupportedKinds(opts.config);
+                probed.approved_workspace_ids = Object.keys(opts.config.workspaces ?? {});
+              }
+              const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size };
+              capabilities_version += 1;
+              const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", sessionAbort.signal);
+              if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
+            } catch (error) { if (sessionAbort.signal.aborted) return; await backoff(error, sessionAbort.signal); }
+            await sleep(capabilitiesMs, sessionAbort.signal).catch(() => undefined);
+          }
+        };
+        const work = async (slot: number) => {
+          // Stagger slot starts so a fleet restart doesn't stampede the poll endpoint.
+          if (slot) await sleep((slot * 250) + Math.floor(Math.random() * 250), sessionAbort.signal).catch(() => undefined);
+          while (!sessionAbort.signal.aborted) {
+            let job: any;
+            let held = false;
+            try {
+              job = await nodeCall(cred, "/nodes/v1/poll", { session_id, wait_seconds: 25, held_job_ids: [...activeJobs] }, "POST", sessionAbort.signal);
+              if ([401, 409].includes(job.status)) { sessionAbort.abort(); return; }
+              if (job.empty || job.status === 204 || !job.id) continue;
+              if (activeJobs.has(job.id)) continue; // duplicate delivery; another slot holds it
+              activeJobs.add(job.id);
+              held = true;
+              let record = journal.read(job.id, job.attempt_id);
+              let finished = record?.outcome;
+              if (!record) {
+                record = { job_id: job.id, attempt_id: job.attempt_id, phase: 'started' };
+                journal.write(record);
+                const childAbort = new AbortController();
+                const stopChild = () => childAbort.abort();
+                sessionAbort.signal.addEventListener('abort', stopChild, { once: true });
+                if (sessionAbort.signal.aborted) childAbort.abort();
+                let expires = Date.parse(job.lease_expires);
+                let renewing = false;
+                const timer = setInterval(() => {
+                  if (Date.now() >= expires) childAbort.abort();
+                  if (renewing || childAbort.signal.aborted) return;
+                  renewing = true;
+                  void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token }, 'POST', AbortSignal.timeout(Math.max(1, Math.min(10000, expires - Date.now()))))
+                    .then(r => { if (r.error || !r.lease_expires) childAbort.abort(); else expires = Date.parse(r.lease_expires); })
+                    .catch(() => childAbort.abort()).finally(() => { renewing = false; });
+                }, opts.renewMs ?? 10000);
+                const expiryTimer = setInterval(() => { if (Date.now() >= expires) childAbort.abort(); }, 100);
+                try {
+                  finished = await execute(job, childAbort.signal);
+                  finished = { status: childAbort.signal.aborted ? 'failed' : finished.status, result: redact(finished.result).slice(-64000) };
+                } catch { finished = { status: 'failed', result: 'executor failed/outcome_unknown' }; }
+                finally { clearInterval(timer); clearInterval(expiryTimer); sessionAbort.signal.removeEventListener('abort', stopChild); }
+                journal.write({ ...record, phase: 'finished', outcome: finished });
+              }
+              finished ??= { status: 'failed', result: 'restart/outcome_unknown; automatic replay refused' };
+              const receipt = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/finish`, {
+                session_id, lease_token: job.lease_token, status: finished.status, result: finished.result,
+              });
+              if (receipt.error) { if ([401, 409].includes(receipt.status)) sessionAbort.abort(); else throw new Error('finish failed'); }
+            } catch (error) {
+              if (sessionAbort.signal.aborted) return;
+              await backoff(error, sessionAbort.signal);
+            } finally {
+              if (held) activeJobs.delete(job?.id);
+            }
+          }
+        };
+        const loops = [beat, caps, ...Array.from({ length: maxConcurrency }, (_v, i) => () => work(i))]
+          .map(async loop => { try { await loop(); } catch (error) { sessionAbort.abort(); throw error; } });
+        const settled = await Promise.allSettled(loops);
+        const failure = settled.find(r => r.status === 'rejected');
+        // A rejection with neither abort fired is a real fault — propagate it.
+        if (failure?.status === 'rejected' && !signal.aborted && !sessionAbort.signal.aborted) throw failure.reason;
+        if (!signal.aborted) {
+          console.error("[underwright-node] session ended; re-authenticating");
+          await sleep(1000, signal).catch(() => undefined);
+        }
+      } finally {
+        signal.removeEventListener("abort", linkAbort);
+        sessionAbort.abort();
       }
-    };
-    const loops = [beat, caps, ...Array.from({ length: maxConcurrency }, (_v, i) => () => work(i))]
-      .map(async loop => { try { await loop(); } catch (error) { abort.abort(); throw error; } });
-    const settled = await Promise.allSettled(loops);
-    const failure = settled.find(r => r.status === 'rejected');
-    if (failure?.status === 'rejected' && !signal.aborted) throw failure.reason;
+    }
   } finally {
     signal.removeEventListener("abort", onAbort);
     abort.abort();
