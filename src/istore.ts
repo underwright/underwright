@@ -128,6 +128,8 @@ export interface IStore {
   notifyWatchers(taskId: string, body: string): Awaitable<void>;
   log(entityType: string, entityId: string, action: string, actor: string, data?: unknown): Awaitable<void>;
   postArtifact(a: { task_id?: string; agent_id: string; kind: string; title?: string; content: string }): Awaitable<any>;
+  recordProgress(a: { task_id: string; agent_id: string; status: string; summary: string; details?: string; operation_id?: string; job_id?: string; attempt_id?: string }): Awaitable<any>;
+  listLedger(taskId: string, limit?: number): Awaitable<any[]>;
   importSpecKit(a: {
     path?: string;
     task_id?: string;

@@ -165,6 +165,15 @@ Rules of engagement:
     content: z.string(),
   }, async (a) => text(await store.postArtifact(a)));
 
+  server.tool("record_progress", "Append an event to the task's progress ledger — the thin coordination record the control plane reads for status, watch signals, and resume context. Write at each transition; keep summary one line, put evidence/next actions in details. Retrying with the same operation_id is safe.", {
+    task_id: z.string(),
+    agent_id: z.string(),
+    status: z.enum(["started", "progress", "blocked", "done", "cancelled"]),
+    summary: z.string().min(1).max(500),
+    details: z.string().max(20000).optional(),
+    operation_id: z.string().max(64).optional().describe("idempotency key — reuse to retry a write safely"),
+  }, async (a) => text(await store.recordProgress(a)));
+
   server.tool("import_speckit", "Import Spec Kit markdown (constitution/spec/plan/tasks) as spec artifacts and link extracted ac_ids to task.ac_ids.", {
     path: z.string().optional().describe("path to a Spec Kit directory (.specify/specs) or markdown file"),
     task_id: z.string().optional().describe("existing task id to attach artifacts and link extracted ac_ids to"),

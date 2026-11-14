@@ -1,7 +1,7 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
@@ -372,6 +372,7 @@ export class PgStore implements IStore {
         case 'complete_task': { const { _notify, ...result } = await s.completeTaskAtomic(w.task_id, w.agent_id, true) as any; return result; }
         case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        case 'record_progress': return s.recordProgress({ ...args, task_id: w.task_id, agent_id: w.agent_id, job_id: w.job_id, attempt_id: w.attempt_id } as any);
         default: return nodeError('worker tool denied', 403);
       }
     });
@@ -587,6 +588,7 @@ export class PgStore implements IStore {
     await sql.unsafe(NODES_SCHEMA);
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
+    await sql.unsafe(LEDGER_SCHEMA);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
@@ -689,7 +691,7 @@ export class PgStore implements IStore {
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
     return {
       ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
-      artifacts: await this.listArtifacts(id), reviews: await this.reviewIds(id),
+      artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
     };
   }
 
@@ -896,6 +898,40 @@ export class PgStore implements IStore {
       await this.notifyWatchers(a.task_id, `task ${a.task_id} escalation: blocked artifact ${id}`);
     }
     return { id };
+  }
+
+  /** Append a progress event to the task ledger (gh-112). Idempotent by
+   *  operation_id: a retried write with the same payload returns the prior
+   *  row, a reused operation_id with a different payload is an error. */
+  async recordProgress(a: { task_id: string; agent_id: string; status: string; summary: string; details?: string; operation_id?: string; job_id?: string; attempt_id?: string }) {
+    if (!a.summary?.trim()) return { error: "summary is required" };
+    if (a.summary.length > 500) return { error: "summary exceeds 500 characters" };
+    if (a.details && a.details.length > 20000) return { error: "details exceeds 20000 characters" };
+    if (!(LEDGER_STATUSES as readonly string[]).includes(a.status)) return { error: `unknown ledger status: ${a.status}` };
+    const op = a.operation_id ?? `op-${randomUUID().slice(0, 8)}`;
+    return this.sql.begin(async sql => {
+      const [prior] = await sql<any[]>`SELECT * FROM task_ledger WHERE operation_id = ${op}`;
+      if (prior) {
+        const same = prior.task_id === a.task_id && prior.agent_id === a.agent_id && prior.status === a.status
+          && prior.summary === a.summary && prior.details === (a.details ?? "")
+          && prior.job_id === (a.job_id ?? null) && prior.attempt_id === (a.attempt_id ?? null);
+        if (!same) throw new Error("operation_id already used with different input");
+        return prior;
+      }
+      const [task] = await sql<any[]>`SELECT status FROM tasks WHERE id = ${a.task_id}`;
+      if (!task) throw new Error(`task ${a.task_id} not found`);
+      if (task.status === "done") throw new Error(`task ${a.task_id} is completed; ledger is closed`);
+      const [claim] = await sql<any[]>`SELECT agent_id FROM claims WHERE task_id = ${a.task_id}`;
+      if (claim && claim.agent_id !== a.agent_id) throw new Error(`task ${a.task_id} is claimed by ${claim.agent_id}`);
+      const [row] = await sql<any[]>`INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details)
+        VALUES (${op},${a.task_id},${a.agent_id},${a.job_id ?? null},${a.attempt_id ?? null},${a.status},${a.summary},${a.details ?? ""}) RETURNING *`;
+      await sql`INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES ('task',${a.task_id},'ledger',${a.agent_id},${sql.json({ operation_id: op, status: a.status, job_id: a.job_id ?? null })})`;
+      return row;
+    }).catch((e: Error) => ({ error: e.message }));
+  }
+
+  async listLedger(taskId: string, limit = 20) {
+    return this.sql<any[]>`SELECT operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details, created_at FROM task_ledger WHERE task_id = ${taskId} ORDER BY created_at DESC, operation_id DESC LIMIT ${Math.max(1, Math.min(limit, 500))}`;
   }
 
   async importSpecKit(a: ImportSpecKitArgs) {
