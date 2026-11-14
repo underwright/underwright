@@ -52,7 +52,7 @@ export const harmlessExecutor: NodeExecutor = async (job) => ({
   result: `harmless:${job?.node_spec?.kind ?? "node"}`,
 });
 
-export function defaultInventoryProbe(): unknown {
+export function defaultInventoryProbe(): Record<string, unknown> {
   return {
     protocol_version: 1, daemon_version: "0.1.0", os: platform(), arch: arch(),
     labels: [], supported_operation_kinds: ["run-script", "launch-agent", "provision", "install-harness"],
@@ -61,6 +61,15 @@ export function defaultInventoryProbe(): unknown {
       id, version: "unknown", installed: false, auth_status: "unknown", quota: { state: "unknown" },
     })),
   };
+}
+
+function configSupportedKinds(config: ExecutorConfig): string[] {
+  const kinds: string[] = [];
+  if (Object.keys(config.scripts ?? {}).length) kinds.push('run-script');
+  if (Object.keys(config.harnesses ?? {}).length) kinds.push('launch-agent');
+  if (Object.keys(config.repositories ?? {}).length) kinds.push('provision');
+  if (Object.keys(config.installers ?? {}).length) kinds.push('install-harness');
+  return kinds;
 }
 
 export async function runNode(opts: {
@@ -81,7 +90,9 @@ export async function runNode(opts: {
   let journal: AttemptJournal;
   try { journal = new AttemptJournal(join(dir, 'attempts')); journal.reconcile(); }
   catch (error) { release(); throw error; }
-  const probe = opts.probe ?? (() => opts.config?.inventory ?? defaultInventoryProbe());
+  // config.inventory attests harness readiness; the operational arrays are
+  // derived from what the executor registry can actually run.
+  const probe = opts.probe ?? (() => ({ ...defaultInventoryProbe(), ...(opts.config?.inventory as object | undefined) }));
   const heartbeatMs = opts.heartbeatMs ?? 15_000;
   const capabilitiesMs = opts.capabilitiesMs ?? 60_000;
   const abort = new AbortController();
@@ -141,6 +152,10 @@ export async function runNode(opts: {
             sleep(5_000, abort.signal).then(() => { throw Object.assign(new Error("probe timeout"), { timeout: true }); }),
           ]);
           // Live numbers always win over whatever the probe advertises (gh-91).
+          if (opts.config) {
+            probed.supported_operation_kinds = configSupportedKinds(opts.config);
+            probed.approved_workspace_ids = Object.keys(opts.config.workspaces ?? {});
+          }
           const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size };
           capabilities_version += 1;
           const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", abort.signal);
