@@ -3,7 +3,8 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
+import { matchTaskToNode, buildLaunchSpec, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
@@ -435,7 +436,7 @@ export class PgStore implements IStore {
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
       await s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [new Date().toISOString(), principal.node_id]);
-      const node = (await s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
+      const node = (await s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1.
       const running = (await s.nodeQuery(
@@ -449,10 +450,15 @@ export class PgStore implements IStore {
         if (Number.isFinite(advertised)) maxConcurrency = Math.max(1, Math.min(8, Math.floor(advertised)));
       } catch { /* default 1 */ }
       const held = running.find((j: any) => j.session_id === sessionId && !exclude.includes(j.id));
-      const queued = running.length < maxConcurrency ? (await s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED",
-        [principal.node_id],
-      ))[0] : undefined;
+      const queuedSql =
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED";
+      let queued = running.length < maxConcurrency ? (await s.nodeQuery(queuedSql, [principal.node_id]))[0] : undefined;
+      if (!queued && running.length < maxConcurrency) {
+        // gh-126 pull-through dispatch: match eligible tasks to this node.
+        const meta = await s.dispatchToNode(principal.node_id, node);
+        if (meta.formed) queued = (await s.nodeQuery(queuedSql, [principal.node_id]))[0];
+        if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204, match: meta };
+      }
       if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
       let spec: any = queued.node_spec;
       if (typeof spec === "string") { try { spec = JSON.parse(spec); } catch { spec = {}; } }
@@ -479,6 +485,58 @@ export class PgStore implements IStore {
       await s.log("job", queued.id, "started", principal.node_id, { attempt_id, lease_expires });
       return publicNodeJob(updated[0]);
     });
+  }
+
+  /** gh-126 pull-through dispatch — pg twin of SqliteStore.dispatchToNode.
+   *  Postgres `?` placeholders translate to $n in nodeQuery. */
+  private async dispatchToNode(nodeId: string, node: any): Promise<DispatchMeta & { formed: boolean }> {
+    const meta: DispatchMeta & { formed: boolean } = { formed: false, eligible: 0, considered: 0, skipped: {} };
+    const dispatch = getDispatchPolicy();
+    if (!dispatch.enabled) return meta;
+    const routing = getModelRouting();
+    const candidates = (await this.nodeQuery(
+      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
+       WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
+       ORDER BY priority ASC, updated_at ASC LIMIT 25`,
+    )) as DispatchTask[];
+    meta.eligible = candidates.length;
+    const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
+    const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json || "{}") : node.policy_json;
+    const capsJson = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
+    const now = new Date().toISOString();
+    for (const task of candidates) {
+      meta.considered++;
+      if ((await this.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
+      if ((await this.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
+      if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
+      const result = matchTaskToNode(task, {
+        name: node.name ?? nodeId,
+        policy,
+        capabilitiesJson: capsJson,
+        capabilitiesObservedAt: node.capabilities_observed_at,
+      }, dispatch, routing, Date.parse(now));
+      if ("skip" in result) { skip(result.skip); continue; }
+      const m = result.match;
+      const id = `job-${randomUUID().slice(0, 8)}`;
+      const spec = buildLaunchSpec({
+        taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
+        workspace: m.workspace, harness: m.harness, model: m.model, model_flag: m.model_flag,
+      });
+      try {
+        await this.nodeQuery(
+          `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,dedupe_key)
+           VALUES (?,?,?,'node','',?,?,'dispatch:'||?)`,
+          [id, task.id, m.agent_id, nodeId, JSON.stringify(spec), task.id],
+        );
+      } catch { skip("live_job"); continue; }
+      await this.log("job", id, "submitted", "dispatch", {
+        type: "node", via: "pull-through", target_node_id: nodeId, task_id: task.id,
+        harness: m.harness, tier: m.tier, model: m.model ?? null, workspace: m.workspace,
+      });
+      meta.formed = true;
+      return meta;
+    }
+    return meta;
   }
 
   async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal, exclude: string[] = []) {

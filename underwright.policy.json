@@ -109,7 +109,7 @@
         {
           "match_regex": "5.?hour|quota|rate.?limit|429",
           "action": "escalate",
-          "note": "quota — needs seat failover or human"
+          "note": "quota \u2014 needs seat failover or human"
         }
       ]
     }
@@ -249,5 +249,26 @@
       "grok": "-m",
       "cursor": "--model"
     }
+  },
+  "dispatch": {
+    "enabled": true,
+    "default_workspace": "underwright",
+    "workspaces": {
+      "underwright/underwright": "underwright",
+      "alandennis1024/kraftina": "kraftina"
+    },
+    "harness_order": [
+      "claude",
+      "codex",
+      "grok",
+      "cursor",
+      "opencode",
+      "agy",
+      "kimi",
+      "devin",
+      "command-code",
+      "copilot",
+      "pi"
+    ]
   }
 }

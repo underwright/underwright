@@ -47,7 +47,7 @@ const id = z.string().min(1).max(128);
 const argv = z.array(z.string().max(4096)).max(64).default([]);
 const subdir = z.string().max(512).default('.');
 const schemas = {
-  'launch-agent': z.object({ workspace_id: id, harness: id, prompt: z.string().min(1).max(32768), cwd: subdir }).strict(),
+  'launch-agent': z.object({ workspace_id: id, harness: id, prompt: z.string().min(1).max(32768), cwd: subdir, model: id.optional(), model_flag: z.string().max(16).optional() }).strict(),
   provision: z.object({ workspace_id: id, repository_id: id, dest: z.string().min(1).max(512) }).strict(),
   'install-harness': z.object({ harness: id }).strict(),
   'run-script': z.object({ workspace_id: id, script: id, args: argv, cwd: subdir }).strict(),
@@ -99,7 +99,10 @@ export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig
   switch (task.type) {
     case 'launch-agent': {
       const h = approved(cfg.harnesses, p.harness, 'harness');
-      return { executable: h.executable, args: [...(h.args ?? []), p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
+      // gh-126: dispatch may pin a concrete model; the flag is shipped in the
+      // payload (model_routing.flags) and inserted before the prompt.
+      const modelArgs = p.model && p.model_flag ? [p.model_flag, p.model] : [];
+      return { executable: h.executable, args: [...(h.args ?? []), ...modelArgs, p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
     }
     case 'provision': {
       if (!(policy.repository_ids ?? []).includes(p.repository_id)) throw new PolicyError(`repository ${p.repository_id} not approved`);
