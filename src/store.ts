@@ -419,7 +419,7 @@ export class SqliteStore implements IStore {
     // bad node-local config) and only execution reveals it.
     const avoid = new Set(
       (s.nodeQuery(
-        "SELECT agent_id FROM jobs WHERE type='node' AND target_node_id=? AND dedupe_key LIKE 'dispatch:%' AND status='failed' AND finished_at > datetime('now','-15 minutes')",
+        "SELECT agent_id FROM jobs WHERE type='node' AND target_node_id=? AND dedupe_key LIKE 'dispatch:%' AND status='failed' AND datetime(finished_at) > datetime('now','-15 minutes')",
         [nodeId],
       ) as Array<{ agent_id: string }>).map(r => r.agent_id.split("@")[0]),
     );
@@ -432,7 +432,7 @@ export class SqliteStore implements IStore {
       // parks the task. Failure is the obvious case; a 'done' job on a task
       // still open means the agent couldn't complete it via the board —
       // re-dispatching instantly just reruns the same dead-end session.
-      if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND datetime(finished_at) > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,

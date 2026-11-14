@@ -260,3 +260,27 @@ it("dispatch forms jobs across free concurrency slots, not just one", async () =
   const j3 = await store.pollNodeJob(node.token, node.session.session_id, 0, undefined, [j1.id, j2.id]);
   expect(j3.empty).toBe(true);                             // both live → nothing left
 });
+
+it("cooldown expires — ISO-format finished_at older than the window does not park the task", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const t = await store.createTask(task());
+
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.task_id).toBe(t.id);
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "boom");
+
+  // fresh failure parks the task
+  const parked = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(parked.empty).toBe(true);
+  expect(parked.match.skipped.recent_failure).toBe(1);
+
+  // backdate finished_at to an ISO T-format stamp outside the window — a raw
+  // text comparison vs datetime('now') space-format keeps 'T' > ' ' forever,
+  // permanently parking the task; the datetime() read must normalize it.
+  const old = new Date(Date.now() - 10 * 60_000).toISOString();
+  store.db.prepare("UPDATE jobs SET finished_at=? WHERE id=?").run(old, j1.id);
+  const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j2.task_id).toBe(t.id);
+});
