@@ -420,32 +420,34 @@ export class PgStore implements IStore {
     });
   }
 
-  private async leaseNodeJob(token: string, sessionId: string) {
+  private async leaseNodeJob(token: string, sessionId: string, exclude: string[] = []) {
     await this.sweepExpiredNodeJobs();
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
       await s.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [new Date().toISOString(), principal.node_id]);
-      const held = (await s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>now() AND session_id=? FOR UPDATE",
-        [principal.node_id, sessionId],
-      ))[0];
-      if (held) return publicNodeJob(held);
-      const busy = (await s.nodeQuery(
-        "SELECT id FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>now() FOR UPDATE",
-        [principal.node_id],
-      ))[0];
-      if (busy) return { empty: true, status_code: 204 };
-      const queued = (await s.nodeQuery(
-        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED",
-        [principal.node_id],
-      ))[0];
-      if (!queued) return { empty: true, status_code: 204 };
-      let spec: any = queued.node_spec;
-      if (typeof spec === "string") { try { spec = JSON.parse(spec); } catch { spec = {}; } }
       const node = (await s.nodeQuery("SELECT policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
+      // gh-91: capacity is the node's attested max_concurrency, not 1.
+      const running = (await s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='running' AND lease_expires>now() FOR UPDATE",
+        [principal.node_id],
+      )) as any[];
+      let maxConcurrency = 1;
+      try {
+        const capsJson = typeof node.capabilities_json === "string" ? JSON.parse(node.capabilities_json) : (node.capabilities_json ?? {});
+        const advertised = Number(capsJson.max_concurrency);
+        if (Number.isFinite(advertised)) maxConcurrency = Math.max(1, Math.min(8, Math.floor(advertised)));
+      } catch { /* default 1 */ }
+      const held = running.find((j: any) => j.session_id === sessionId && !exclude.includes(j.id));
+      const queued = running.length < maxConcurrency ? (await s.nodeQuery(
+        "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED",
+        [principal.node_id],
+      ))[0] : undefined;
+      if (!queued) return held ? publicNodeJob(held) : { empty: true, status_code: 204 };
+      let spec: any = queued.node_spec;
+      if (typeof spec === "string") { try { spec = JSON.parse(spec); } catch { spec = {}; } }
       const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json) : node.policy_json;
       const capabilities = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
       if (!s.nodePolicyAllows(policy, spec, capabilities, node.capabilities_observed_at)) {
@@ -471,13 +473,13 @@ export class PgStore implements IStore {
     });
   }
 
-  async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal) {
+  async pollNodeJob(token: string, sessionId: string, waitSeconds = 0, signal?: AbortSignal, exclude: string[] = []) {
     const waitMs = Math.max(0, Math.min(NODE_POLL_MAX_WAIT, waitSeconds)) * 1000;
     const deadline = Date.now() + waitMs;
     try {
       while (true) {
         if (signal?.aborted) return nodeError("canceled", 499);
-        const leased = await this.leaseNodeJob(token, sessionId);
+        const leased = await this.leaseNodeJob(token, sessionId, exclude);
         if (!leased || !("empty" in leased)) return leased;
         if (Date.now() >= deadline) return leased;
         await sleepSignal(Math.min(50, Math.max(1, deadline - Date.now())), signal);

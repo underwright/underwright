@@ -57,7 +57,7 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
     } else if (req.url === '/nodes/v1/poll') {
       const a = nodePollSchema.parse(body);
       const token = nodeBearer(req);
-      result = token ? await store.pollNodeJob(token, a.session_id, a.wait_seconds, abort.signal) : { error: 'unauthorized', status_code: 401 };
+      result = token ? await store.pollNodeJob(token, a.session_id, a.wait_seconds, abort.signal, a.held_job_ids) : { error: 'unauthorized', status_code: 401 };
     } else if (/^\/nodes\/v1\/jobs\/job-[a-f0-9]{8}\/(renew|finish|worker)$/.test(req.url ?? '')) {
       const jobId = req.url!.split('/')[4];
       const action = req.url!.split('/')[5];

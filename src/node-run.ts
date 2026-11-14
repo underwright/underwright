@@ -1,5 +1,6 @@
 /** Outbound daemon with independent liveness and lease loops, typed execution and durable receipts. */
 import { createExecutorRegistry, redact, type ExecutorConfig } from './node-executors.js';
+import { NODE_MAX_CONCURRENCY } from './node-protocol.js';
 import { AttemptJournal, processStart } from './node-journal.js';
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { arch, platform } from "node:os";
@@ -90,8 +91,14 @@ export async function runNode(opts: {
   signal.addEventListener("abort", onAbort);
   let session_id = "";
   let capabilities_version = 0;
-  let active_job_id: string | undefined;
-  let phase: "idle" | "polling" | "running" = "idle";
+  // gh-91: N parallel worker loops. The jobs themselves already run as child
+  // processes via the executor registry — the serial part was only the
+  // poll/execute/finish bookkeeping, which is now per-slot.
+  const maxConcurrency = Math.max(1, Math.min(NODE_MAX_CONCURRENCY, Math.floor(opts.config?.concurrency ?? 1) || 1));
+  if (opts.config?.concurrency !== undefined && Math.floor(opts.config.concurrency) !== maxConcurrency) {
+    console.error(`[underwright-node] config.concurrency=${opts.config.concurrency} clamped to ${maxConcurrency}`);
+  }
+  const activeJobs = new Set<string>();
   const backoff = async (error: any) => {
     const wait = Math.max(1, Math.min(30, Number(error?.retry_after) || 1 + Math.floor(Math.random() * 3)));
     await sleep(wait * 1000, abort.signal);
@@ -118,6 +125,8 @@ export async function runNode(opts: {
     const beat = async () => {
       while (!abort.signal.aborted) {
         try {
+          const active_job_id = [...activeJobs][0];
+          const phase = activeJobs.size ? "running" : "idle";
           const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase }, "POST", abort.signal);
           if ([401, 409].includes(result.status)) { abort.abort(); return; }
         } catch (error) { if (abort.signal.aborted) return; await backoff(error); }
@@ -127,10 +136,12 @@ export async function runNode(opts: {
     const caps = async () => {
       while (!abort.signal.aborted) {
         try {
-          const inventory = await Promise.race([
+          const probed: any = await Promise.race([
             Promise.resolve(probe()),
             sleep(5_000, abort.signal).then(() => { throw Object.assign(new Error("probe timeout"), { timeout: true }); }),
           ]);
+          // Live numbers always win over whatever the probe advertises (gh-91).
+          const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size };
           capabilities_version += 1;
           const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", abort.signal);
           if ([401, 409].includes(result.status)) { abort.abort(); return; }
@@ -138,15 +149,19 @@ export async function runNode(opts: {
         await sleep(capabilitiesMs, abort.signal).catch(() => undefined);
       }
     };
-    const work = async () => {
+    const work = async (slot: number) => {
+      // Stagger slot starts so a fleet restart doesn't stampede the poll endpoint.
+      if (slot) await sleep((slot * 250) + Math.floor(Math.random() * 250), abort.signal).catch(() => undefined);
       while (!abort.signal.aborted) {
+        let job: any;
+        let held = false;
         try {
-          phase = "polling";
-          const job = await nodeCall(cred, "/nodes/v1/poll", { session_id, wait_seconds: 25 }, "POST", abort.signal);
+          job = await nodeCall(cred, "/nodes/v1/poll", { session_id, wait_seconds: 25, held_job_ids: [...activeJobs] }, "POST", abort.signal);
           if ([401, 409].includes(job.status)) { abort.abort(); return; }
-          if (job.empty || job.status === 204 || !job.id) { phase = "idle"; continue; }
-          active_job_id = job.id;
-          phase = "running";
+          if (job.empty || job.status === 204 || !job.id) continue;
+          if (activeJobs.has(job.id)) continue; // duplicate delivery; another slot holds it
+          activeJobs.add(job.id);
+          held = true;
           let record = journal.read(job.id, job.attempt_id);
           let finished = record?.outcome;
           if (!record) {
@@ -183,12 +198,12 @@ export async function runNode(opts: {
           if (abort.signal.aborted) return;
           await backoff(error);
         } finally {
-          active_job_id = undefined;
-          phase = "idle";
+          if (held) activeJobs.delete(job?.id);
         }
       }
     };
-    const loops = [beat, caps, work].map(async loop => { try { await loop(); } catch (error) { abort.abort(); throw error; } });
+    const loops = [beat, caps, ...Array.from({ length: maxConcurrency }, (_v, i) => () => work(i))]
+      .map(async loop => { try { await loop(); } catch (error) { abort.abort(); throw error; } });
     const settled = await Promise.allSettled(loops);
     const failure = settled.find(r => r.status === 'rejected');
     if (failure?.status === 'rejected' && !signal.aborted) throw failure.reason;
