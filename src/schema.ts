@@ -10,6 +10,27 @@ export function isArtifactKind(kind: string): boolean {
   return (ARTIFACT_KINDS as readonly string[]).includes(kind);
 }
 
+export const LEDGER_STATUSES = ["started", "progress", "blocked", "done", "cancelled"] as const;
+
+/** Append-only per-task progress ledger (gh-112). operation_id is the
+ *  idempotency key: retrying the same operation_id + payload returns the
+ *  prior row; reusing it with a different payload is an error. Portable DDL —
+ *  shared by SQLite and Postgres. */
+export const LEDGER_SCHEMA = `
+CREATE TABLE IF NOT EXISTS task_ledger (
+  operation_id TEXT PRIMARY KEY,
+  task_id      TEXT NOT NULL REFERENCES tasks(id),
+  agent_id     TEXT NOT NULL,
+  job_id       TEXT,
+  attempt_id   TEXT,
+  status       TEXT NOT NULL CHECK (status IN ('started','progress','blocked','done','cancelled')),
+  summary      TEXT NOT NULL,
+  details      TEXT NOT NULL DEFAULT '',
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS task_ledger_task ON task_ledger(task_id, created_at);
+`;
+
 export const TASK_DEPENDENCIES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -131,6 +152,8 @@ CREATE TABLE IF NOT EXISTS locks (
   lease_expires TEXT NOT NULL,
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+${LEDGER_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

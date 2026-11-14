@@ -2,7 +2,7 @@ import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpir
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind } from "./schema.js";
+import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, type DispatcherPolicy } from "./policy.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -276,6 +276,7 @@ export class SqliteStore implements IStore {
         case 'complete_task': return s.completeTask(w.task_id, w.agent_id, true);
         case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
+        case 'record_progress': return s.recordProgress({ ...args, task_id: w.task_id, agent_id: w.agent_id, job_id: w.job_id, attempt_id: w.attempt_id } as any);
         default: return nodeError('worker tool denied', 403);
       }
     });
@@ -702,6 +703,7 @@ export class SqliteStore implements IStore {
       ...t, ...this.dependencies(id, t.status),
       ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
       artifacts: this.listArtifacts(id),
+      ledger: this.listLedger(id),
       reviews: this.reviewIds(id),
     };
   }
@@ -944,6 +946,41 @@ export class SqliteStore implements IStore {
 
   importSpecKit(args: ImportSpecKitArgs) {
     return importSpecKit(this, args);
+  }
+
+  /** Append a progress event to the task ledger (gh-112). Idempotent by
+   *  operation_id: a retried write with the same payload returns the prior
+   *  row, a reused operation_id with a different payload is an error. */
+  recordProgress(args: { task_id: string; agent_id: string; status: string; summary: string; details?: string; operation_id?: string; job_id?: string; attempt_id?: string }) {
+    if (!args.summary?.trim()) return { error: "summary is required" };
+    if (args.summary.length > 500) return { error: "summary exceeds 500 characters" };
+    if (args.details && args.details.length > 20000) return { error: "details exceeds 20000 characters" };
+    if (!(LEDGER_STATUSES as readonly string[]).includes(args.status)) return { error: `unknown ledger status: ${args.status}` };
+    const op = args.operation_id ?? `op-${randomUUID().slice(0, 8)}`;
+    return this.db.transaction(() => {
+      const prior = this.db.prepare("SELECT * FROM task_ledger WHERE operation_id = ?").get(op) as any;
+      if (prior) {
+        const same = prior.task_id === args.task_id && prior.agent_id === args.agent_id && prior.status === args.status
+          && prior.summary === args.summary && prior.details === (args.details ?? "")
+          && prior.job_id === (args.job_id ?? null) && prior.attempt_id === (args.attempt_id ?? null);
+        if (!same) return { error: "operation_id already used with different input" };
+        return prior;
+      }
+      const task = this.db.prepare("SELECT status FROM tasks WHERE id = ?").get(args.task_id) as any;
+      if (!task) return { error: `task ${args.task_id} not found` };
+      if (task.status === "done") return { error: `task ${args.task_id} is completed; ledger is closed` };
+      const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id = ?").get(args.task_id) as any;
+      if (claim && claim.agent_id !== args.agent_id) return { error: `task ${args.task_id} is claimed by ${claim.agent_id}` };
+      this.db.prepare("INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details) VALUES (?,?,?,?,?,?,?,?)")
+        .run(op, args.task_id, args.agent_id, args.job_id ?? null, args.attempt_id ?? null, args.status, args.summary, args.details ?? "");
+      this.log("task", args.task_id, "ledger", args.agent_id, { operation_id: op, status: args.status, job_id: args.job_id ?? null });
+      return this.db.prepare("SELECT * FROM task_ledger WHERE operation_id = ?").get(op);
+    }).immediate();
+  }
+
+  listLedger(taskId: string, limit = 20) {
+    return this.db.prepare("SELECT operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details, created_at FROM task_ledger WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?")
+      .all(taskId, Math.max(1, Math.min(limit, 500)));
   }
 
   reportEvidence(args: {
