@@ -1,28 +1,11 @@
-import { execSync } from "node:child_process";
-import type { IStore, TaskStatus } from "./istore.js";
+import { defaultGhRunner, priorityFromLabels, type GhRunner } from "./github-issues.js";
+export { syncIssues } from "./github-issues.js";
+export type { GhRunner, Issue } from "./github-issues.js";
+import type { IStore } from "./istore.js";
 import { getAutoMergePolicy, loadPolicy, type Policy } from "./policy.js";
 
 // GitHub adapter v1: issue & PR sync + review gates via the `gh` CLI.
 // Requires `gh` to be installed and authenticated — no token plumbing here.
-
-export type GhRunner = (cmd: string, input?: string) => any;
-
-const defaultGhRunner: GhRunner = (args: string, input?: string) => {
-  if (input !== undefined) {
-    return execSync(`gh ${args}`, { encoding: "utf8", input });
-  }
-  const out = execSync(`gh ${args}`, { encoding: "utf8" });
-  return args.includes("--json") ? JSON.parse(out) : out;
-};
-
-export type Issue = {
-  number: number;
-  title: string;
-  body: string;
-  url: string;
-  state: string;
-  labels: { name: string }[];
-};
 
 export type PullRequest = {
   number: number;
@@ -52,80 +35,6 @@ export interface CheckGateResult {
   checks: CheckStatus[];
   evidenceId?: string;
   error?: string;
-}
-
-const priorityFromLabels = (labels: { name: string }[]) => {
-  for (const l of labels) {
-    const m = l.name.match(/^p([0-4])$/i);
-    if (m) return Number(m[1]);
-  }
-  return 2;
-};
-
-const taskStatusToIssueState = (s: TaskStatus) =>
-  s === "done" ? "closed" : "open";
-
-/** Import open issues as tasks; close tasks whose issues were closed;
- *  close issues whose tasks are done. */
-export async function syncIssues(
-  store: IStore,
-  repo: string,
-  actor = "github-sync",
-  options: { runner?: GhRunner } = {}
-) {
-  const runner = options.runner ?? defaultGhRunner;
-  const issues = (await runner(
-    `issue list --repo ${repo} --state all --limit 200 --json number,title,body,url,state,labels`
-  )) as Issue[];
-  const out = { imported: 0, closed_tasks: [] as string[], closed_issues: [] as number[], skipped: 0 };
-
-  for (const issue of issues) {
-    // Marker link: "uw:<task-id>" in the body binds the issue to an existing
-    // task instead of importing a duplicate.
-    const marker = issue.body?.match(/uw:([\w-]+)/)?.[1];
-    if (marker) {
-      const task = await store.getTask(marker);
-      if (task) {
-        if (task.spec_ref !== issue.url) await store.linkTask(marker, issue.url);
-        if (issue.state === "CLOSED" && task.status !== "done") {
-          await store.setTaskStatus(marker, "done", actor);
-          out.closed_tasks.push(marker);
-        } else if (task.status === "done" && issue.state === "OPEN") {
-          await runner(`issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`);
-          out.closed_issues.push(issue.number);
-        }
-        out.skipped++;
-        continue;
-      }
-    }
-
-    const id = `gh-${issue.number}`;
-    const task = await store.getTask(id);
-
-    if (!task) {
-      if (issue.state === "CLOSED") { out.skipped++; continue; }
-      await store.createTask({
-        id,
-        title: `[#${issue.number}] ${issue.title}`,
-        description: issue.body ?? "",
-        spec_ref: issue.url,
-        priority: priorityFromLabels(issue.labels),
-        created_by: actor,
-      });
-      out.imported++;
-      continue;
-    }
-
-    // Reconcile: issue closed → task done; task done → close issue.
-    if (issue.state === "CLOSED" && task.status !== "done") {
-      await store.setTaskStatus(id, "done", actor);
-      out.closed_tasks.push(id);
-    } else if (task.status === "done" && issue.state === "OPEN") {
-      await runner(`issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`);
-      out.closed_issues.push(issue.number);
-    }
-  }
-  return out;
 }
 
 /** Import and map PRs to tasks; link PRs with marker or branch references;

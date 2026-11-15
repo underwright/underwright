@@ -1,3 +1,4 @@
+import { raiseIssue, type GithubRaiseArgs } from "./github-issues.js";
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
@@ -754,6 +755,10 @@ export class SqliteStore implements IStore {
         ? `task ${t.id} unblocked: all blockers done (completed ${blockerId})`
         : `task ${t.id}: blocker ${blockerId} completed; remaining blockers: ${remaining.join(", ") || "none"}`);
     }
+  }
+
+  async raiseGithubIssue(args: GithubRaiseArgs) {
+    return raiseIssue(this, args);
   }
 
   createTask(args: CreateTaskArgs) {

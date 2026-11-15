@@ -81,6 +81,7 @@ underwright digest --since 24h # standup summary of board delta [--to AGENT] [--
 underwright create --template feature --title "Add search"   # create a task from a template
 underwright templates          # list builtin + policy-defined templates
 underwright speckit import --path .specify --task TASK_ID    # import Spec Kit docs & link ac_ids
+underwright github raise "Fix discovered bug" --repo o/n --body "Scope and reproduction"
 underwright github sync --repo o/n   # sync GitHub issues ⇄ tasks
 ```
 
@@ -98,6 +99,20 @@ mutations stay on `/mcp`. With `UNDERWRIGHT_TOKEN` set, pass the token via
 path so check runs, issue edits, and pull-request reviews update tasks and
 evidence without polling. Setup steps are in [docs/webhook.md](docs/webhook.md).
 The webhook authenticates with HMAC. The bearer token stays on `/mcp`.
+
+`underwright github raise "TITLE" --repo OWNER/NAME [--body TEXT] [--by AGENT]`
+creates a GitHub issue and imports it as a board task in one call. The server or
+CLI needs an authenticated `gh` executable. The MCP equivalent is `github_raise`
+with `repo`, `title`, optional `body`, `agent_id`, and `task_extras`.
+Both return `{issue, task_id}`. Defaults (`feature`, estimate `S`, acceptance
+criteria `impl`, `tests`, `review`) make the task claimable. Override task fields
+with `--task-extras '{"type":"bug","estimate":"M","ac_ids":["fixed"]}'`;
+extras also accept severity, priority, ownership, and blocked_by.
+Re-syncing preserves the task and its extras. Repeating `raise` creates another
+issue. If board import fails after issue creation, the result includes the issue,
+`task_id: null`, an error, and sync recovery instructions; the CLI exits nonzero.
+Boards use `gh-N` identifiers, so a collision with another repository is reported
+without overwriting that task.
 
 Tasks can declare `blocked_by: [task_ids]` in `create_task` or `update_task`.
 Updating this field replaces the dependency list; `[]` clears it, while omitting
