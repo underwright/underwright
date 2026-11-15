@@ -284,3 +284,42 @@ it("cooldown expires — ISO-format finished_at older than the window does not p
   const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(j2.task_id).toBe(t.id);
 });
+
+it("done job on an unclosed task parks it in_review instead of re-dispatching", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const t = await store.createTask(task());
+
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.task_id).toBe(t.id);
+  // Worker jobs hold no board credential, so 'done' means "exited clean", not
+  // "task closed". The task must leave the dispatch pool — in_review — rather
+  // than burn quota re-running a dead-end session every cooldown.
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "done", "could not reach the board");
+
+  const row = store.db.prepare("SELECT status FROM tasks WHERE id=?").get(t.id) as { status: string };
+  expect(row.status).toBe("in_review");
+
+  // and it must not come back through dispatch, even after the cooldown window
+  const again = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(again.empty).toBe(true);
+});
+
+it("failed job keeps the task open and re-dispatchable after cooldown", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const t = await store.createTask(task());
+
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "boom");
+
+  // failure leaves the task open — it parks for the cooldown then retries
+  const row = store.db.prepare("SELECT status FROM tasks WHERE id=?").get(t.id) as { status: string };
+  expect(row.status).toBe("open");
+  const old = new Date(Date.now() - 10 * 60_000).toISOString();
+  store.db.prepare("UPDATE jobs SET finished_at=? WHERE id=?").run(old, j1.id);
+  const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j2.task_id).toBe(t.id);
+});

@@ -527,6 +527,18 @@ export class SqliteStore implements IStore {
       if (!updated.length) return nodeError("job lease not owned or expired", 409);
       s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
       if (job.task_id) s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
+      // A dispatch-formed job that reports done on a still-open task could not
+      // close it (worker jobs hold no control-plane credential). Leaving the
+      // task 'open' re-dispatches it after every cooldown — deterministic quota
+      // burn. Move it to in_review: out of the open pool, into the honest
+      // backlog a closer/reviewer path (task-37ab2493) will consume.
+      if (status === "done" && job.task_id && job.dedupe_key?.startsWith("dispatch:")) {
+        const moved = s.nodeQuery(
+          "UPDATE tasks SET status='in_review', updated_at=datetime('now') WHERE id=? AND status='open' RETURNING id",
+          [job.task_id],
+        );
+        if (moved.length) s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
+      }
       return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
     });
   }
