@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { SqliteStore } from "../src/store.js";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -283,4 +283,19 @@ it("cooldown expires — ISO-format finished_at older than the window does not p
   store.db.prepare("UPDATE jobs SET finished_at=? WHERE id=?").run(old, j1.id);
   const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(j2.task_id).toBe(t.id);
+});
+
+it("routes a spawned review to another family on node polling", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const policyPath = process.env.UNDERWRIGHT_POLICY!;
+  writeFileSync(policyPath, JSON.stringify({ ...JSON.parse(readFileSync(policyPath, "utf8")), lifecycle: { enabled: true } }));
+  const t = await store.createTask(task());
+  await store.reportEvidence({ task_id: t.id, agent_id: "claude-sdk@author", kind: "test_run", exit_code: 0, ac_ids: ["ac-1"] });
+  await store.completeTask(t.id, "claude-sdk@author", true);
+  const [reviewId] = (await store.getTask(t.id)).reviews;
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(leased.task_id).toBe(reviewId);
+  expect(leased.agent_id).toBe("codex@node");
 });

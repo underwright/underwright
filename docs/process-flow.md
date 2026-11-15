@@ -170,13 +170,27 @@ controls warn vs refuse).
 
 *Customize:* `policy.dod` per-type evidence lists, `enforcement` level.
 
-### 7. Review — independent harness 🟡
+### 7. Review — independent harness ✅
 
-Completed work gets reviewed by a *different* harness family
-(`policy.dispatcher.review`: `require_different_harness`,
-`prefer_stronger`). Review tasks exist and the family-separation bug is
-fixed (gh-68) — but spawning them on completion is manual today.
-Auto-spawn as a pipeline stage: gh-90.
+With `policy.lifecycle.enabled: true` (the repository default), successful
+`complete_task` creates a linked `type:review` task in the same transaction,
+before mailbox dispatch. Scoped node workers also create the review; node
+polling then selects an eligible harness. `architecture` and `design` tasks
+get design reviews; other tasks get code reviews. Review tasks never spawn
+another review. Completion still requires the source task's existing evidence
+and DoD gates; automatic creation does not bypass them.
+
+`policy.dispatcher.review` controls harness-family separation and preference
+for stronger reviewers on both dispatch paths. If no eligible reviewer exists,
+the review stays open. Claims also enforce the configured family separation
+(including aliases such as `claude-sdk` → `claude`).
+
+Set `lifecycle.pipelines.<type>.review: false` to skip automatic review for a
+type, or `review_kind: "design"` to override its kind. An absent or disabled
+lifecycle preserves manual review creation. Existing linked reviews of the
+same kind are reused, including across completion retries and reopened tasks.
+The identity is `(source task, review kind)`, so tasks sharing a PR each retain
+their own review and evidence trail.
 
 ### 8. PR — agent raises the pull request ✅
 

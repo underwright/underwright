@@ -143,6 +143,12 @@ export interface Policy {
   templates?: TaskTemplate[];
   automerge?: boolean | string[] | Record<string, boolean | AutoMergeRule>;
   dispatcher?: DispatcherRule;
+  /** Automatic completion reviews are enabled with the default lifecycle. */
+  lifecycle?: {
+    enabled?: boolean;
+    design_estimates?: string[];
+    pipelines?: Record<string, { review?: boolean; review_kind?: "code" | "design" }>;
+  };
   dispatch?: DispatchRule;
   model_routing?: ModelRoutingRule;
   human_notify?: string | HumanNotifyRule;
@@ -156,6 +162,14 @@ export interface Policy {
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
+
+/** Select the completion review stage; review tasks cannot recursively spawn work. */
+export function completionReviewKind(task: { type?: string }, policy: Policy): "code" | "design" | null {
+  if (!policy.lifecycle?.enabled || task.type === "review") return null;
+  const pipeline = policy.lifecycle.pipelines?.[task.type ?? "feature"];
+  if (pipeline?.review === false) return null;
+  return pipeline?.review_kind ?? (["architecture", "design"].includes(task.type ?? "") ? "design" : "code");
+}
 
 export function getAutoMergePolicy(
   repo: string,

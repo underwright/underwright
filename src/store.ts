@@ -3,7 +3,7 @@ import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, completionReviewKind, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -407,7 +407,7 @@ export class SqliteStore implements IStore {
     if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
     const candidates = s.nodeQuery(
-      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
+      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_of,review_kind,priority,updated_at FROM tasks
        WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
        ORDER BY priority ASC, updated_at ASC LIMIT 25`,
     ) as DispatchTask[];
@@ -433,6 +433,7 @@ export class SqliteStore implements IStore {
       // still open means the agent couldn't complete it via the board —
       // re-dispatching instantly just reruns the same dead-end session.
       if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND datetime(finished_at) > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      if (task.type === "review" && task.review_of) task.review_implementer = this.implementerOf(task.review_of);
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
@@ -892,7 +893,7 @@ export class SqliteStore implements IStore {
     }
 
     if (task.type === "review" && task.review_of && existing?.agent_id !== agentId) {
-      const independence = reviewIndependenceError(agentId, this.implementerOf(task.review_of), task.review_of);
+      const independence = reviewIndependenceError(agentId, this.implementerOf(task.review_of), task.review_of, getDispatcherPolicy().review.require_different_harness);
       if (independence) return { error: independence };
     }
 
@@ -1151,6 +1152,7 @@ export class SqliteStore implements IStore {
     this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     this.notifyWatchers(taskId, `task ${taskId} → done`);
     this.unblockDependents(taskId, agentId);
+    this.ensureCompletionReview(task, policy);
     const dispatched = scoped ? undefined : this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
@@ -1163,6 +1165,22 @@ export class SqliteStore implements IStore {
         agent_id: agentId,
       },
     };
+  }
+
+  /** Called inside the immediate transaction so retries reuse manual or spawned reviews. */
+  private ensureCompletionReview(task: any, policy: ReturnType<typeof loadPolicy>) {
+    const kind = completionReviewKind(task, policy);
+    if (!kind) return;
+    if (this.db.prepare("SELECT id FROM tasks WHERE review_of=? AND review_kind=? LIMIT 1").get(task.id, kind)) return;
+    const review = this.createTaskAtomic({
+      title: `${kind === "design" ? "Design" : "Code"} review: ${task.title}`,
+      description: `Independent ${kind} review of ${task.id}. Inspect the subject's artifacts, evidence and linked changes; post a review artifact and report findings.`,
+      type: "review", review_of: task.id, review_kind: kind,
+      spec_ref: task.spec_ref ?? undefined, priority: task.priority,
+      estimate: task.estimate || "S", ac_ids: ["review"], created_by: DISPATCHER_AGENT,
+    });
+    if (review.error) throw new Error(review.error);
+    this.log("task", task.id, "review_spawned", DISPATCHER_AGENT, { review_id: review.id, review_kind: kind });
   }
 
   private taskRouteMeta(id: string) {
