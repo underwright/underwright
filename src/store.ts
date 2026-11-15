@@ -982,7 +982,8 @@ export class SqliteStore implements IStore {
       if (!claim) return { error: `task ${taskId} is not claimed` };
       if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
       this.db.prepare("DELETE FROM claims WHERE task_id = ?").run(taskId);
-      this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=?").run(taskId);
+      // Release the lease without undoing an explicit blocked/review transition.
+      this.db.prepare("UPDATE tasks SET status='open', updated_at=datetime('now') WHERE id=? AND status='claimed'").run(taskId);
       this.log("task", taskId, "released", agentId);
       const dispatched = scoped ? undefined : this.dispatchNext(agentId, taskId, "release");
       return { released: taskId, ...(dispatched ? { dispatched } : {}) };

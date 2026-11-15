@@ -222,6 +222,38 @@ for (const backend of ["sqlite", "postgres"] as const) {
       expect((await store.inbox("agent-A")).map((m: any) => m.body)).toContain(nextTaskMessage(next.id));
     });
 
+    it.each([
+      ["blocked", false], ["in_review", false],
+      ["blocked", true], ["in_review", true],
+    ] as const)("preserves %s on release (scoped=%s)", async (status, scoped) => {
+      const held = await ready("explicit status");
+      await store.claimTask(held.id, "agent-A");
+      await store.setTaskStatus(held.id, status, "agent-A");
+
+      expect((await store.releaseTask(held.id, "agent-A", scoped) as any).released).toBe(held.id);
+      expect(await store.getTask(held.id)).toMatchObject({ status, claim: null });
+      expect((await store.auditLog(20)).some((e: any) =>
+        e.entity_id === held.id && e.action === "released" && e.actor === "agent-A"
+      )).toBe(true);
+    });
+
+    it("skips blocked tasks across successive releases instead of ping-ponging", async () => {
+      const first = await ready("first blocked", { priority: 0 });
+      const second = await ready("second blocked", { priority: 1 });
+      const next = await ready("available", { priority: 2 });
+      await store.claimTask(first.id, "agent-A");
+      await store.setTaskStatus(first.id, "blocked", "agent-A");
+      expect((await store.releaseTask(first.id, "agent-A") as any).dispatched?.task_id).toBe(second.id);
+
+      await store.setTaskStatus(second.id, "blocked", "agent-A");
+      expect((await store.releaseTask(second.id, "agent-A") as any).dispatched?.task_id).toBe(next.id);
+      expect((await store.releaseTask(next.id, "agent-A") as any).dispatched).toBeUndefined();
+      for (const task of [first, second]) {
+        expect(await store.getTask(task.id)).toMatchObject({ status: "blocked", claim: null });
+      }
+      expect((await store.inbox("agent-A")).map((m: any) => m.task_id)).toEqual([second.id, next.id]);
+    });
+
     it("does not assign when the dispatcher is off, the agent is at the cap, or completion was refused", async () => {
       writePolicy({ enabled: false, max_tasks_per_agent: 5, idle_minutes: 0 });
       const offNext = await ready("off-next");
