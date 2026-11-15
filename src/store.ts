@@ -287,6 +287,8 @@ export class SqliteStore implements IStore {
         case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'record_progress': return s.recordProgress({ ...args, task_id: w.task_id, agent_id: w.agent_id, job_id: w.job_id, attempt_id: w.attempt_id } as any);
+        case 'search_context': return s.searchContext(String(args.query ?? ""), args.kinds as string[] | undefined);
+        case 'send_message': return s.sendMessage("human", w.agent_id, String(args.body ?? ""), w.task_id);
         default: return nodeError('worker tool denied', 403);
       }
     });
@@ -407,10 +409,23 @@ export class SqliteStore implements IStore {
     const dispatch = getDispatchPolicy();
     if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
+    // Agent ids this node can execute as: harness@node for every attested
+    // ready harness. Tasks claimed to one of these stay dispatchable to this
+    // node — mailbox assignment to a fleet agent otherwise parks work forever
+    // (node daemons don't read inboxes, and 'claimed' is outside the open pool).
+    const myAgents = new Set<string>();
+    try {
+      for (const h of (JSON.parse(node.capabilities_json || "{}").harnesses ?? []) as any[])
+        if (h.installed && h.auth_status === "ready") myAgents.add(`${h.id}@${node.name ?? nodeId}`);
+    } catch { /* capabilities unreadable — matcher decides harness anyway */ }
     const candidates = s.nodeQuery(
       `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
-       WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
+       WHERE estimate<>'' AND ac_ids<>'[]' AND (
+         status='open'${myAgents.size
+           ? ` OR (status='claimed' AND id IN (SELECT task_id FROM claims WHERE agent_id IN (${[...myAgents].map(() => "?").join(",")})))`
+           : ""})
        ORDER BY priority ASC, updated_at ASC LIMIT 25`,
+      [...myAgents],
     ) as DispatchTask[];
     meta.eligible = candidates.length;
     const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
@@ -426,7 +441,8 @@ export class SqliteStore implements IStore {
     );
     for (const task of candidates) {
       meta.considered++;
-      if ((s.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
+      const claim = (s.nodeQuery("SELECT agent_id FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]) as any[])[0];
+      if (claim && !myAgents.has(claim.agent_id)) { skip("claimed"); continue; }
       if ((s.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
       // Cooldown: any dispatch-formed job that finished in the last 5 min
@@ -442,6 +458,10 @@ export class SqliteStore implements IStore {
       }, dispatch, routing, Date.parse(now), avoid);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
+      // A task claimed to one of this node's agents must run AS that agent —
+      // the worker's claim_task only renews its own claim, so a different
+      // harness would be denied and burn the attempt.
+      if (claim && m.agent_id !== claim.agent_id) { skip("claimed"); continue; }
       const id = `job-${randomUUID().slice(0, 8)}`;
       const spec = buildLaunchSpec({
         taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
@@ -1314,14 +1334,40 @@ export class SqliteStore implements IStore {
     };
   }
 
+  /** Agents the fleet can execute as right now: harness@node for approved
+   *  nodes that polled recently and attest the harness ready. */
+  private liveNodeAgentIds(now = Date.now(), windowMs = 10 * 60_000): Set<string> {
+    const ids = new Set<string>();
+    const rows = this.db.prepare(
+      "SELECT name, capabilities_json, last_poll_at, last_seen_at FROM nodes WHERE state IN ('approved','draining')",
+    ).all() as any[];
+    for (const n of rows) {
+      const seen = Date.parse(n.last_poll_at ?? n.last_seen_at ?? "");
+      if (!Number.isFinite(seen) || seen < now - windowMs) continue;
+      try {
+        for (const h of (JSON.parse(n.capabilities_json || "{}").harnesses ?? []) as any[])
+          if (h.installed && h.auth_status === "ready") ids.add(`${h.id}@${n.name}`);
+      } catch { continue; }
+    }
+    return ids;
+  }
+
+  /** Interactive agents with recent board activity — they actually read inbox. */
+  private recentActorIds(minutes = 60): Set<string> {
+    const rows = this.db.prepare(
+      `SELECT DISTINCT actor FROM events
+       WHERE datetime(created_at) > datetime('now', ?)
+         AND action IN ('claimed','released','completed','progress','evidence','artifact')`,
+    ).all(`-${minutes} minutes`) as { actor: string }[];
+    return new Set(rows.map(r => r.actor).filter(a => a && !isSystemActor(a)));
+  }
+
+  /** Reassignment/reviewer candidates: live node agents plus warm interactive
+   *  agents. Event-history alone is wrong — dead interactive ids sit at
+   *  workload 0 and win every sweep, parking tasks under claims nothing reads. */
   private knownAgentWorkloads() {
-    const rows = this.db.prepare(`
-      SELECT DISTINCT actor AS id FROM events
-      WHERE entity_type = 'task' AND action IN ('claimed', 'completed', 'released')
-    `).all() as { id: string }[];
-    return rows
-      .filter((row) => row.id && !isSystemActor(row.id))
-      .map((row) => ({ id: row.id, workload: this.agentWorkload(row.id) }));
+    const ids = new Set<string>([...this.liveNodeAgentIds(), ...this.recentActorIds(60)]);
+    return [...ids].map(id => ({ id, workload: this.agentWorkload(id) }));
   }
 
   /** Mailbox "your next task" older than idle_minutes, task no longer held → reassign or log once. */

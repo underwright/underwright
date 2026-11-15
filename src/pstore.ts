@@ -383,6 +383,8 @@ export class PgStore implements IStore {
         case 'post_artifact': return s.postArtifact({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'report_evidence': return s.reportEvidence({ ...args, task_id: w.task_id, agent_id: w.agent_id } as any);
         case 'record_progress': return s.recordProgress({ ...args, task_id: w.task_id, agent_id: w.agent_id, job_id: w.job_id, attempt_id: w.attempt_id } as any);
+        case 'search_context': return s.searchContext(String(args.query ?? ""), args.kinds as string[] | undefined);
+        case 'send_message': return s.sendMessage("human", w.agent_id, String(args.body ?? ""), w.task_id);
         default: return nodeError('worker tool denied', 403);
       }
     });
@@ -500,10 +502,23 @@ export class PgStore implements IStore {
     const dispatch = getDispatchPolicy();
     if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
+    // Agent ids this node can execute as: harness@node for every attested
+    // ready harness. Tasks claimed to one of these stay dispatchable to this
+    // node — mailbox assignment to a fleet agent otherwise parks work forever.
+    const myAgents = new Set<string>();
+    const capsForAgents = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
+    try {
+      for (const h of (JSON.parse(capsForAgents).harnesses ?? []) as any[])
+        if (h.installed && h.auth_status === "ready") myAgents.add(`${h.id}@${node.name ?? nodeId}`);
+    } catch { /* capabilities unreadable — matcher decides harness anyway */ }
     const candidates = (await this.nodeQuery(
       `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
-       WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
+       WHERE estimate<>'' AND ac_ids<>'[]' AND (
+         status='open'${myAgents.size
+           ? ` OR (status='claimed' AND id IN (SELECT task_id FROM claims WHERE agent_id IN (${[...myAgents].map(() => "?").join(",")})))`
+           : ""})
        ORDER BY priority ASC, updated_at ASC LIMIT 25`,
+      [...myAgents],
     )) as DispatchTask[];
     meta.eligible = candidates.length;
     const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
@@ -518,7 +533,8 @@ export class PgStore implements IStore {
     );
     for (const task of candidates) {
       meta.considered++;
-      if ((await this.nodeQuery("SELECT 1 FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]))[0]) { skip("claimed"); continue; }
+      const claim = ((await this.nodeQuery("SELECT agent_id FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now])) as any[])[0];
+      if (claim && !myAgents.has(claim.agent_id)) { skip("claimed"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > now() - interval '5 minutes' LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
@@ -530,6 +546,9 @@ export class PgStore implements IStore {
       }, dispatch, routing, Date.parse(now), avoid);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
+      // A task claimed to one of this node's agents must run AS that agent —
+      // the worker's claim_task only renews its own claim.
+      if (claim && m.agent_id !== claim.agent_id) { skip("claimed"); continue; }
       const id = `job-${randomUUID().slice(0, 8)}`;
       const spec = buildLaunchSpec({
         taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
@@ -1242,15 +1261,42 @@ export class PgStore implements IStore {
     };
   }
 
-  private async knownAgentWorkloads() {
-    const rows = await this.sql<{ id: string }[]>`
-      SELECT DISTINCT actor AS id FROM events
-      WHERE entity_type = 'task' AND action IN ('claimed', 'completed', 'released')`;
-    const out: { id: string; workload: number }[] = [];
-    for (const row of rows) {
-      if (!row.id || isSystemActor(row.id)) continue;
-      out.push({ id: row.id, workload: await this.agentWorkload(row.id) });
+  /** Agents the fleet can execute as right now: harness@node for approved
+   *  nodes that polled recently and attest the harness ready. */
+  private async liveNodeAgentIds(now = Date.now(), windowMs = 10 * 60_000): Promise<Set<string>> {
+    const ids = new Set<string>();
+    const rows = await this.sql<any[]>`
+      SELECT name, capabilities_json, last_poll_at, last_seen_at
+      FROM nodes WHERE state IN ('approved','draining')`;
+    for (const n of rows) {
+      const seen = Date.parse(String(n.last_poll_at ?? n.last_seen_at ?? ""));
+      if (!Number.isFinite(seen) || seen < now - windowMs) continue;
+      try {
+        const caps = typeof n.capabilities_json === "string" ? JSON.parse(n.capabilities_json) : n.capabilities_json;
+        for (const h of caps?.harnesses ?? []) if (h.installed && h.auth_status === "ready") ids.add(`${h.id}@${n.name}`);
+      } catch { continue; }
     }
+    return ids;
+  }
+
+  /** Interactive agents doing agent work recently — claims, completions,
+   *  progress, evidence. Task creators/messengers/approvers alone don't count:
+   *  they don't necessarily hold claims or read inbox. */
+  private async recentActorIds(minutes = 60): Promise<Set<string>> {
+    const rows = await this.sql<{ actor: string }[]>`
+      SELECT DISTINCT actor FROM events
+      WHERE created_at::timestamptz > now() - (${minutes} || ' minutes')::interval
+        AND action IN ('claimed','released','completed','progress','evidence','artifact')`;
+    return new Set(rows.map(r => r.actor).filter(a => a && !isSystemActor(a)));
+  }
+
+  /** Reassignment/reviewer candidates: live node agents plus warm interactive
+   *  agents. Event-history alone is wrong — dead interactive ids sit at
+   *  workload 0 and win every sweep, parking tasks under claims nothing reads. */
+  private async knownAgentWorkloads() {
+    const ids = new Set<string>([...(await this.liveNodeAgentIds()), ...(await this.recentActorIds(60))]);
+    const out: { id: string; workload: number }[] = [];
+    for (const id of ids) out.push({ id, workload: await this.agentWorkload(id) });
     return out;
   }
 

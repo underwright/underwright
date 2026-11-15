@@ -21,6 +21,7 @@ beforeEach(() => {
       workspaces: { "underwright/underwright": "underwright", "alandennis1024/omnigent": "omnigent" },
       harness_order: ["claude", "codex"],
     },
+    dispatcher: { enabled: true, idle_minutes: 60 },
     model_routing: {
       enabled: true, default_tier: "standard",
       rules: [{ estimate: ["L"], tier: "heavy" }, { estimate: ["S"], tier: "light" }],
@@ -322,4 +323,52 @@ it("failed job keeps the task open and re-dispatchable after cooldown", async ()
   store.db.prepare("UPDATE jobs SET finished_at=? WHERE id=?").run(old, j1.id);
   const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(j2.task_id).toBe(t.id);
+});
+
+it("pull-through runs tasks claimed to this node's own agent ids", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node);
+  const t = await store.createTask(task());
+  const c = await store.claimTask(t.id, "claude@box");
+  expect(c.error).toBeUndefined();
+  // mailbox assignment to a fleet agent must actually deliver: the node picks
+  // up its own claim and runs it AS that agent
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(t.id);
+  expect(j.agent_id).toBe("claude@box");
+});
+
+it("tasks claimed to other agents are still skipped", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node);
+  const t = await store.createTask(task());
+  const c = await store.claimTask(t.id, "ghost@elsewhere");
+  expect(c.error).toBeUndefined();
+  const res = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(res.empty).toBe(true);
+  expect(res.match.eligible).toBe(0);   // foreign claims never enter the candidate list
+});
+
+it("idle sweep reassigns to live agents, never to dead interactive ids", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node);
+  const t = await store.createTask(task());
+  // ghost id with workload-0 history but no recent activity — the old pool
+  // would pick it every time
+  store.db.prepare(
+    "INSERT INTO events (entity_type,entity_id,action,actor,data,created_at) VALUES ('task',?,'claimed','ghost@dead','{}',datetime('now','-2 days'))",
+  ).run(t.id);
+  await store.sendMessage("ghost@dead", "dispatcher", `your next task: ${t.id}`, t.id);
+  store.db.prepare("UPDATE messages SET created_at=datetime('now','-2 hours') WHERE task_id=?").run(t.id);
+  const r = await store.sweepIdleDispatches();
+  expect(r.reassigned).toEqual([t.id]);
+  const claim = store.db.prepare("SELECT agent_id FROM claims WHERE task_id=?").get(t.id) as { agent_id: string };
+  expect(claim.agent_id).toBe("claude@box");   // live node agent, not the ghost
+  // and the claim actually delivers through the node's next poll
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(t.id);
+  expect(j.agent_id).toBe("claude@box");
 });
