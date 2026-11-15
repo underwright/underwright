@@ -26,8 +26,8 @@ function fixture() {
 }
 function caller(store: SqliteStore): JobCall {
   return async (name, a: any) => name === "next_job" ? store.nextJob(a.agent_id, a.host, a.ttl_seconds) :
-    name === "renew_job" ? store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result) :
-    store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token);
+    name === "renew_job" ? store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result, a.omni) :
+    store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token, a.omni);
 }
 
 describe("remote queue leases", () => {
@@ -313,6 +313,7 @@ describe("omnigent backend", () => {
       const done = store.getJob(j.id);
       expect(done.status).toBe("done");
       expect(done.result).toContain("omnigent session: https://omni.example/s/abc123");
+      expect(done.omni_session).toBe("abc123");
     } finally {
       process.env.PATH = oldPath;
     }

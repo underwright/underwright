@@ -1,3 +1,4 @@
+import { omniUpdateSchema } from "./omnigent.js";
 import { createWorkerServer } from './node-worker.js';
 import { handleNodeHttp } from "./node-http.js";
 import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
@@ -269,13 +270,13 @@ Rules of engagement:
 
   server.tool("renew_job", "Renew an owned job lease and upload a bounded live output snapshot.", {
     job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
-    ttl_seconds: z.number().int().min(5).max(3600).optional(), result: z.string().optional(),
-  }, async (a) => text(await store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result)));
+    ttl_seconds: z.number().int().min(5).max(3600).optional(), result: z.string().optional(), omni: omniUpdateSchema.optional(),
+  }, async (a) => text(await store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result, a.omni)));
 
   server.tool("finish_job", "Finish a job only while holding its current lease. Stale or foreign runners are rejected.", {
     job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
-    status: z.enum(["done", "failed"]), result: z.string(),
-  }, async (a) => text(await store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token)));
+    status: z.enum(["done", "failed"]), result: z.string(), omni: omniUpdateSchema.optional(),
+  }, async (a) => text(await store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token, a.omni)));
 
   server.tool("job_status", "Check a submitted job's status and result.", {
     job_id: z.string(),

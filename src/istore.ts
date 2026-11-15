@@ -3,6 +3,8 @@
 
 import type { NodeEnrollmentInput, NodePolicy, NodePrincipal, NodeError, NodeEnrollment, NodeSpec } from "./node-protocol.js";
 
+import type { OmniUpdate } from "./omnigent.js";
+
 type Awaitable<T> = T | Promise<T>;
 
 export type TaskStatus = "open" | "claimed" | "in_review" | "done" | "blocked";
@@ -98,8 +100,8 @@ export interface IStore {
   startNodeSession(token: string): Awaitable<any>;
   submitNodeTask(a: SubmitNodeTaskArgs): Awaitable<any>;
   pollNodeJob(token: string, sessionId: string, waitSeconds?: number, signal?: AbortSignal, exclude?: string[]): Awaitable<any>;
-  renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
-  finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
+  renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string, omni?: OmniUpdate): Awaitable<any>;
+  finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown, omni?: OmniUpdate): Awaitable<any>;
   sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;
   nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
   putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
@@ -148,8 +150,9 @@ export interface IStore {
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
   submitJob(a: SubmitJobArgs): Awaitable<any>;
   nextJob(agentId: string, host?: string, ttlSeconds?: number): Awaitable<any>;
-  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string): Awaitable<any>;
-  renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string): Awaitable<any>;
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, omni?: OmniUpdate): Awaitable<any>;
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string, omni?: OmniUpdate): Awaitable<any>;
+  recordOmnigent(jobId: string, agentId: string, token: string, update: OmniUpdate): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
   digest(args?: string | DigestArgs): Awaitable<DigestResult>;

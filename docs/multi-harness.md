@@ -485,3 +485,47 @@ need independent review evidence before merge (peer-review policy).
 
 Review tasks route to a different harness than the implementer, preferring
 a stronger tier. Design reviews prefer a high-tier harness.
+
+## Omnigent live hooks (gh-66)
+
+For `uw-runner` agent jobs and approved node executors using an `omni` or
+`omnigent` executable, the runner
+extracts the session marker during execution, uploads `jobs.omni_session`
+with its next lease heartbeat, and preserves it after completion. The
+session id is separate from the node protocol's `jobs.session_id`.
+`jobs.omni_usage` stores cumulative token buckets and `total_cost_usd` as
+JSON. These are snapshots, not additive deltas: consumers must not sum
+successive snapshots. A reclaimed job clears the prior attempt's binding.
+
+Configure `UNDERWRIGHT_OMNI_URL` on the runner and control-plane service to
+an explicitly trusted Omnigent API origin, e.g. `http://127.0.0.1:6767`.
+Configure `UNDERWRIGHT_OMNI_TOKEN` with the credentials appropriate to that
+service. The runner reads session usage snapshots and the session SSE
+stream. It forwards bounded subagent, human-intervention, approval and
+policy events through the same owned job lease; the store deduplicates
+event ids and exposes recent events as `board.omni_events` and in the
+dashboard audit stream. Read streams reconnect after interruption; final
+usage is fetched before the job's completion receipt. Missing credentials
+or an unavailable API leave the last known telemetry intact.
+
+Inbox push uses the same `/v1/sessions/{id}/events` `session_message`
+contract as `sys_session_message`. It additionally requires an authenticated
+**runner** credential and `UNDERWRIGHT_OMNI_SOURCE_SESSION`, the authorized
+source session for the `X-Omnigent-Orchestration-Source` header. A normal
+user token alone does not authorize this operation. Keep credentials in
+the service environment, outside git. Transcript URLs never supply the
+API origin or receive credentials.
+
+`send_message`, dispatcher mail and watcher notifications commit board
+mail first and attempt push to the recipient's active runner or node job.
+A refused, timed-out or ambiguous push is not retried automatically; the
+durable mailbox remains available to `inbox`. A successful push means
+accepted, not that the receiving agent ran it. Without the optional API
+configuration, session linkage is still persisted and ordinary mailbox
+behavior continues.
+
+Node executors observe only locally approved `omni`/`omnigent` commands.
+The daemon uploads telemetry with its authenticated node renewals and
+completion receipts. A node's durable receipt journal preserves the final
+snapshot across retries; node-session and lease checks still apply. Raw
+harness executables continue to run without Omnigent observation.

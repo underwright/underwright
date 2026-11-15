@@ -317,8 +317,8 @@ switch (cmd) {
         ran++;
         console.log(`[underwright] running ${job.id}: ${job.command}`);
         const finished = await executeLeasedJob(job, async (name, a) => name === "renew_job"
-          ? store.renewJob(a.job_id as string, a.agent_id as string, a.lease_token as string, a.ttl_seconds as number, a.result as string)
-          : store.finishJob(a.job_id as string, a.status as "done" | "failed", a.result as string, a.agent_id as string, a.lease_token as string),
+          ? store.renewJob(a.job_id as string, a.agent_id as string, a.lease_token as string, a.ttl_seconds as number, a.result as string, a.omni as import("./omnigent.js").OmniUpdate | undefined)
+          : store.finishJob(a.job_id as string, a.status as "done" | "failed", a.result as string, a.agent_id as string, a.lease_token as string, a.omni as import("./omnigent.js").OmniUpdate | undefined),
           { agentId: "local-runner", host: hostname(), signal: shutdown.signal, output: chunk => process.stdout.write(chunk) });
         console.log(`[underwright] ${job.id} ${finished?.status ?? "interrupted"}`);
       }

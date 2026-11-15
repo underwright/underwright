@@ -134,3 +134,19 @@ it("dedupes active node tasks, bounds results, and waits/cancels long-poll witho
   const timed = await store.pollNodeJob(node.token, node.session.session_id, 1);
   expect(timed.empty).toBe(true);
 });
+
+it('persists Omnigent telemetry through authenticated node renewals and receipts', async () => {
+  const { store } = fixture();
+  const a = await enrolled(store, 'omni-node');
+  const submitted = await store.submitNodeTask({ target_node_id: a.node_id, node_spec: spec(), agent_id: 'codex@omni-node' });
+  const job = await store.pollNodeJob(a.token, a.session.session_id, 0);
+  const update = { session_id: 'omni-session', usage: { input_tokens: 99, total_cost_usd: 0.25 }, events: [{ id: 'child-1', type: 'session.child_session.updated', data: { status: 'running' } }] };
+  expect((await store.renewNodeJob(a.token, a.session.session_id, job.id, 'wrong', '', update)).error).toBeTruthy();
+  expect((await store.renewNodeJob(a.token, a.session.session_id, job.id, job.lease_token, '', update)).error).toBeUndefined();
+  expect(store.getJob(submitted.id).omni_session).toBe('omni-session');
+  const final = { ...update, usage: { input_tokens: 120, total_cost_usd: 0.3 } };
+  const done = await store.finishNodeJob(a.token, a.session.session_id, job.id, job.lease_token, 'done', 'ok', undefined, final);
+  expect(done.error).toBeUndefined();
+  expect(JSON.parse(store.getJob(job.id).omni_usage).input_tokens).toBe(120);
+  expect((await store.finishNodeJob(a.token, a.session.session_id, job.id, job.lease_token, 'done', 'ok', undefined, final)).idempotent).toBe(true);
+});

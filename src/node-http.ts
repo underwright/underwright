@@ -65,13 +65,13 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
       if (!token) { reply(401, { error: 'unauthorized' }); return; }
       if (action === 'renew') {
         const a = nodeRenewSchema.parse(body);
-        result = await store.renewNodeJob(token, a.session_id, jobId, a.lease_token, a.result);
+        result = await store.renewNodeJob(token, a.session_id, jobId, a.lease_token, a.result, a.omni);
       } else if (action === 'worker') {
         const a = nodeRenewSchema.parse(body);
         result = await store.issueNodeWorker(token, a.session_id, jobId, a.lease_token);
       } else {
         const a = nodeFinishSchema.parse(body);
-        result = await store.finishNodeJob(token, a.session_id, jobId, a.lease_token, a.status, a.result, a.result_metadata);
+        result = await store.finishNodeJob(token, a.session_id, jobId, a.lease_token, a.status, a.result, a.result_metadata, a.omni);
       }
     } else { reply(404, { error: 'unknown node endpoint' }); return; }
     if (result?.empty || result?.status_code === 204) { reply(204); return; }

@@ -1,3 +1,4 @@
+import { omniUpdateSchema, pushBoardMail, type OmniUpdate } from "./omnigent.js";
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
@@ -128,7 +129,7 @@ export class PgStore implements IStore {
     return this.sql.begin(async sql => {
       // Serialize enrollment quotas and auth transitions across control-plane replicas.
       await sql.unsafe('LOCK TABLE node_enrollments, nodes, node_tokens, node_workers, node_rate_limits, task_dependencies IN SHARE ROW EXCLUSIVE MODE');
-      return work(new PgStore(sql as unknown as postgres.Sql));
+      return work(new PgStore(sql as unknown as postgres.Sql, this.deliverySql));
     });
   }
 
@@ -278,7 +279,7 @@ export class PgStore implements IStore {
     if (!parsed.success) return nodeError("invalid node_spec", 400);
     const spec = parsed.data;
     return this.sql.begin(async sql => {
-      const s = new PgStore(sql as unknown as postgres.Sql);
+      const s = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       await sql.unsafe('LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE');
       const targetId = args.target_node_id ?? selectNode(
         (await s.nodeQuery("SELECT id,policy_json,capabilities_json,capabilities_observed_at,last_seen_at FROM nodes WHERE state='approved'"))
@@ -399,7 +400,7 @@ export class PgStore implements IStore {
 
   async sweepExpiredNodeJobs() {
     return this.sql.begin(async sql => {
-      const s = new PgStore(sql as unknown as postgres.Sql);
+      const s = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       await sql.unsafe('LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE');
       const expired = await s.nodeQuery(
         "SELECT * FROM jobs WHERE type='node' AND status='running' AND lease_expires<=now()", []) as any[];
@@ -435,7 +436,7 @@ export class PgStore implements IStore {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     return this.sql.begin(async sql => {
-      const s = new PgStore(sql as unknown as postgres.Sql);
+      const s = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       await s.nodeQuery("UPDATE nodes SET last_seen_at=now(), last_poll_at=now() WHERE id=?", [principal.node_id]);
       const node = (await s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
@@ -570,7 +571,7 @@ export class PgStore implements IStore {
     }
   }
 
-  async renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string) {
+  async renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string, omni?: OmniUpdate) {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const lease_expires = new Date(Date.now() + NODE_LEASE_SECONDS * 1000);
@@ -581,16 +582,24 @@ export class PgStore implements IStore {
       [lease_expires.toISOString(), result === undefined ? null : boundNodeResult(result), jobId, principal.node_id, principal.node_id, sessionId, leaseToken],
     );
     if (!updated.length) return nodeError("job lease not owned or expired", 409);
+    if (omni) {
+      const recorded = await this.recordOmnigent(jobId, principal.node_id, leaseToken, omni);
+      if ("error" in recorded) return nodeError(recorded.error, 409);
+    }
     await this.log("job", jobId, "renewed", principal.node_id);
     return { id: jobId, lease_expires: lease_expires.toISOString() };
   }
 
-  async finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown) {
+  async finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown, omni?: OmniUpdate) {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const bounded = boundNodeResult(result);
+    if (omni && (await this.getJob(jobId))?.status === 'running') {
+      const recorded = await this.recordOmnigent(jobId, principal.node_id, leaseToken, omni);
+      if ("error" in recorded) return nodeError(recorded.error, 409);
+    }
     return this.sql.begin(async sql => {
-      const s = new PgStore(sql as unknown as postgres.Sql);
+      const s = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       const job = (await s.nodeQuery("SELECT * FROM jobs WHERE id=? AND type='node' AND target_node_id=? FOR UPDATE", [jobId, principal.node_id]))[0];
       if (!job) return nodeError("job lease not owned or expired", 409);
       if (job.lease_token !== leaseToken || job.session_id !== sessionId) return nodeError("job lease not owned or expired", 409);
@@ -657,7 +666,7 @@ export class PgStore implements IStore {
     return { node_id: principal.node_id, version, server_time: now };
   }
 
-  private constructor(sql: postgres.Sql) {
+  private constructor(sql: postgres.Sql, private deliverySql: postgres.Sql = sql) {
     this.sql = sql;
   }
 
@@ -686,7 +695,7 @@ export class PgStore implements IStore {
     return this.sql.begin(async sql => {
       // Serialize graph edits with claim/completion checks across server instances.
       await sql`LOCK TABLE task_dependencies IN SHARE ROW EXCLUSIVE MODE`;
-      return work(new PgStore(sql as unknown as postgres.Sql));
+      return work(new PgStore(sql as unknown as postgres.Sql, this.deliverySql));
     });
   }
 
@@ -904,7 +913,7 @@ export class PgStore implements IStore {
 
   async releaseTask(taskId: string, agentId: string, scoped = false) {
     return this.sql.begin(async sql => {
-      const tx = new PgStore(sql as unknown as postgres.Sql);
+      const tx = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       return tx.releaseTaskAtomic(taskId, agentId, scoped);
     });
   }
@@ -1245,7 +1254,7 @@ export class PgStore implements IStore {
     const policy = getDispatcherPolicy(loadPolicy());
     if (!policy.enabled) return { reassigned: [] as string[], logged: [] as string[] };
     return this.sql.begin(async sql => {
-      const tx = new PgStore(sql as unknown as postgres.Sql);
+      const tx = new PgStore(sql as unknown as postgres.Sql, this.deliverySql);
       return tx.sweepIdleAtomic(policy);
     });
   }
@@ -1350,7 +1359,7 @@ export class PgStore implements IStore {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000);
     const [job] = await this.sql<any[]>`
       UPDATE jobs SET status='running', started_at=now(), finished_at=NULL, result='',
-      runner_id=${agentId}, lease_token=${randomUUID()}, lease_expires=${expires}
+      omni_session=NULL, omni_usage=NULL, omni_event_ids='[]', runner_id=${agentId}, lease_token=${randomUUID()}, lease_expires=${expires}
       WHERE id = (SELECT id FROM jobs WHERE (status='queued' OR (status='running' AND lease_expires<=now()))
       AND type<>'node' AND target_node_id IS NULL
       AND (host IS NULL OR host=${host ?? null}) AND (target_agent_id IS NULL OR target_agent_id=${agentId})
@@ -1360,17 +1369,25 @@ export class PgStore implements IStore {
     return job;
   }
 
-  async renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+  async renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string, omni?: OmniUpdate) {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000);
     const [job] = await this.sql`UPDATE jobs SET lease_expires=${expires}, result=COALESCE(${result?.slice(-64000) ?? null},result)
       WHERE id=${jobId} AND status='running' AND runner_id=${agentId} AND lease_token=${token}
       AND lease_expires>now() RETURNING id`;
     if (!job) return { error: "job lease not owned or expired" };
+    if (omni) {
+      const recorded = await this.recordOmnigent(jobId, agentId, token, omni);
+      if ("error" in recorded) return recorded;
+    }
     await this.log("job", jobId, "renewed", agentId);
     return { id: jobId, lease_expires: expires.toISOString() };
   }
 
-  async finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+  async finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, omni?: OmniUpdate) {
+    if (omni) {
+      const recorded = await this.recordOmnigent(jobId, agentId, token, omni);
+      if ("error" in recorded) return recorded;
+    }
     const [job] = await this.sql`UPDATE jobs SET status=${status}, result=${result.slice(-64000)},
       finished_at=now(), lease_expires=NULL WHERE id=${jobId} AND status='running'
       AND runner_id=${agentId} AND lease_token=${token} AND lease_expires>now() RETURNING *`;
@@ -1378,6 +1395,32 @@ export class PgStore implements IStore {
     await this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
     if (job.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
+  }
+
+  async recordOmnigent(jobId: string, agentId: string, token: string, update: OmniUpdate): Promise<{ id: string } | { error: string }> {
+    const parsed = omniUpdateSchema.safeParse(update);
+    if (!parsed.success) return { error: "invalid Omnigent update" };
+    return await this.sql.begin(async tx => {
+      const [job] = await tx`SELECT * FROM jobs WHERE id=${jobId} AND status='running' AND runner_id=${agentId}
+        AND lease_token=${token} AND lease_expires>now() FOR UPDATE`;
+      if (!job) return { error: "job lease not owned or expired" };
+      if (job.omni_session && job.omni_session !== update.session_id) return { error: "Omnigent session already bound" };
+      const ids = new Set<string>(JSON.parse(job.omni_event_ids));
+      for (const event of parsed.data.events ?? []) {
+        if (ids.has(event.id)) continue;
+        ids.add(event.id);
+        await tx`INSERT INTO events (entity_type,entity_id,action,actor,data) VALUES ('job',${jobId},'omni_event',${agentId},
+          ${tx.json({ task_id: job.task_id, session_id: update.session_id, event } as any)})`;
+      }
+      const usage = { ...JSON.parse(job.omni_usage ?? "{}"), ...parsed.data.usage };
+      if (job.omni_session === parsed.data.session_id && job.omni_usage === JSON.stringify(usage)
+        && job.omni_event_ids === JSON.stringify([...ids].slice(-1000))) return { id: jobId };
+      await tx`UPDATE jobs SET omni_session=${parsed.data.session_id}, omni_usage=${JSON.stringify(usage)},
+        omni_event_ids=${JSON.stringify([...ids].slice(-1000))} WHERE id=${jobId}`;
+      await tx`INSERT INTO events (entity_type,entity_id,action,actor,data) VALUES ('job',${jobId},'omni_updated',${agentId},
+        ${tx.json({ session_id: update.session_id })})`;
+      return { id: jobId };
+    }) as { id: string } | { error: string };
   }
 
   async getJob(id: string) {
@@ -1397,6 +1440,7 @@ export class PgStore implements IStore {
     return {
       tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))),
       job_counts,
+      omni_events: await this.sql`SELECT * FROM events WHERE action='omni_event' ORDER BY id DESC LIMIT 25`,
       helpers_registered: n,
       nodes: await this.listNodes(),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
@@ -1421,8 +1465,19 @@ export class PgStore implements IStore {
   }
 
   async sendMessage(to: string, from: string, body: string, taskId?: string) {
-    await this.sql`INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (${to},${from},${taskId ?? null},${body})`;
+    const [inserted] = await this.sql`INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (${to},${from},${taskId ?? null},${body}) RETURNING id`;
     await this.log("message", to, "sent", from, { task_id: taskId });
+    const [live] = await this.sql`SELECT omni_session FROM jobs WHERE status='running' AND lease_expires>now()
+      AND (runner_id=${to} OR (type='node' AND agent_id=${to})) AND omni_session IS NOT NULL ORDER BY started_at DESC LIMIT 1`;
+    if (live) pushBoardMail(live.omni_session, from, body, async () => {
+      // A separate connection sees only committed mail, including when this store wraps a transaction.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const rows = await this.deliverySql`SELECT id FROM messages WHERE id=${inserted.id}`;
+        if (rows.length) return true;
+        await sleepSignal(100);
+      }
+      return false;
+    });
     return { sent: to };
   }
 
@@ -1443,7 +1498,7 @@ export class PgStore implements IStore {
   async notifyWatchers(taskId: string, body: string) {
     const watchers = await this.sql`SELECT agent_id FROM watches WHERE task_id=${taskId}`;
     for (const w of watchers as any[]) {
-      await this.sql`INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (${w.agent_id},'underwright',${taskId},${body})`;
+      await this.sendMessage(w.agent_id, 'underwright', body, taskId);
     }
   }
 

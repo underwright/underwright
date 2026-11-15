@@ -1,3 +1,4 @@
+import { OmniClient, OmniObserver, omniSessionId } from "./omnigent.js";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentBackend, AgentJobSpec } from "./istore.js";
@@ -89,8 +90,24 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
   const ttl = options.ttlSeconds ?? 60;
   const owner = { job_id: job.id, agent_id: options.agentId, lease_token: job.lease_token };
   let result = "";
-  const append = (chunk: string) => { result = (result + chunk).slice(-64000); options.output?.(chunk); };
-  let invocation;
+  let observer: OmniObserver | undefined;
+  let lastRefresh = 0;
+  const observe = (output: string) => {
+    if (observer || invocation?.backend !== "omnigent") return;
+    const locator = extractOmnigentSession(output);
+    if (!locator) return;
+    const session = omniSessionId(locator);
+    if (!session) return;
+    let client: OmniClient | undefined;
+    try { client = OmniClient.configured(); } catch { /* optional service is unconfigured */ }
+    observer = new OmniObserver(session, client);
+    observer.refresh(); lastRefresh = Date.now();
+  };
+  const append = (chunk: string) => {
+    result = (result + chunk).slice(-64000); options.output?.(chunk);
+    observe(result.slice(0, result.lastIndexOf("\n") + 1));
+  };
+  let invocation: AgentInvocation | undefined;
   try {
     invocation = job.type === "agent" ? agentInvocation(job, options.agentId, options.host) :
       { executable: job.command, args: [], backend: "raw" as const };
@@ -133,7 +150,8 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     renewing = true;
     heartbeat = (async () => {
       try {
-        const renewal = await call("renew_job", { ...owner, ttl_seconds: ttl, result });
+        if (Date.now() - lastRefresh > 5000) { observer?.refresh(); lastRefresh = Date.now(); }
+        const renewal = await call("renew_job", { ...owner, ttl_seconds: ttl, result, ...(observer ? { omni: observer.snapshot() } : {}) });
         if (renewal.error) { leaseLost = true; stop(); }
         else leaseDeadline = Date.parse(renewal.lease_expires);
       } catch { if (Date.now() >= leaseDeadline) { leaseLost = true; stop(); } }
@@ -148,6 +166,9 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     await heartbeat;
     if (leaseLost) throw new Error(`lost lease for ${job.id}`);
     if (invocation.backend === "omnigent") {
+      observe(result);
+      observer?.refresh();
+      await observer?.stop();
       // Link the task to the omnigent transcript: normalize whatever the CLI printed.
       const session = extractOmnigentSession(result);
       if (session && !new RegExp(`omnigent session: ?${session.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(result)) {
@@ -157,7 +178,7 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     // Retry completion while heartbeats keep ownership alive during transient outages.
     while (Date.now() < leaseDeadline && !leaseLost) {
       try {
-        const finished = await call("finish_job", { ...owner, status: code === 0 && !stopped ? "done" : "failed", result });
+        const finished = await call("finish_job", { ...owner, status: code === 0 && !stopped ? "done" : "failed", result, ...(observer ? { omni: observer.snapshot() } : {}) });
         if (finished.error) throw new Error(finished.error);
         return finished;
       } catch (error) {
@@ -172,6 +193,7 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     if (killTimer) { kill("SIGKILL"); clearTimeout(killTimer); }
     options.signal?.removeEventListener("abort", abort);
     await heartbeat;
+    await observer?.stop();
   }
 }
 

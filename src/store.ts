@@ -1,3 +1,4 @@
+import { omniUpdateSchema, pushBoardMail, type OmniUpdate } from "./omnigent.js";
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
@@ -482,7 +483,7 @@ export class SqliteStore implements IStore {
     }
   }
 
-  renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string) {
+  renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string, omni?: OmniUpdate) {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
@@ -494,11 +495,15 @@ export class SqliteStore implements IStore {
       [lease_expires, result === undefined ? null : boundNodeResult(result), jobId, principal.node_id, principal.node_id, sessionId, leaseToken, now],
     );
     if (!updated.length) return nodeError("job lease not owned or expired", 409);
+    if (omni) {
+      const recorded = this.recordOmnigent(jobId, principal.node_id, leaseToken, omni);
+      if ("error" in recorded) return nodeError(recorded.error, 409);
+    }
     this.log("job", jobId, "renewed", principal.node_id);
     return { id: jobId, lease_expires };
   }
 
-  finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown) {
+  finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown, omni?: OmniUpdate) {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const bounded = boundNodeResult(result);
@@ -516,6 +521,10 @@ export class SqliteStore implements IStore {
       const now = new Date().toISOString();
       if (job.status !== "running" || !job.lease_expires || job.lease_expires <= now) {
         return nodeError("job lease not owned or expired", 409);
+      }
+      if (omni) {
+        const recorded = s.recordOmnigent(jobId, principal.node_id, leaseToken, omni);
+        if ("error" in recorded) return nodeError(recorded.error, 409);
       }
       const metadata = resultMetadata == null ? null : JSON.stringify(resultMetadata);
       const updated = s.nodeQuery(
@@ -694,12 +703,15 @@ export class SqliteStore implements IStore {
       if (!cols.has("last_poll_at")) this.db.exec("ALTER TABLE nodes ADD COLUMN last_poll_at TEXT;");
       this.db.exec("PRAGMA user_version = 11;");
     }
+    const jobCols = new Set(this.db.prepare("SELECT name FROM pragma_table_info('jobs')").all().map((r: any) => r.name));
+    for (const [name, ddl] of [["omni_session", "TEXT"], ["omni_usage", "TEXT"], ["omni_event_ids", "TEXT NOT NULL DEFAULT '[]'"]]) {
+      if (!jobCols.has(name)) this.db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${ddl}`);
+    }
   }
 
   notifyWatchers(taskId: string, body: string) {
     const watchers = this.db.prepare("SELECT agent_id FROM watches WHERE task_id=?").all(taskId) as any[];
-    const stmt = this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)");
-    for (const w of watchers) stmt.run(w.agent_id, "underwright", taskId, body);
+    for (const w of watchers) this.sendMessage(w.agent_id, "underwright", body, taskId);
   }
 
   log(entityType: string, entityId: string, action: string, actor: string, data: unknown = {}) {
@@ -948,9 +960,14 @@ export class SqliteStore implements IStore {
   }
 
   sendMessage(to: string, from: string, body: string, taskId?: string) {
-    this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)")
+    const inserted = this.db.prepare("INSERT INTO messages (to_agent, from_agent, task_id, body) VALUES (?,?,?,?)")
       .run(to, from, taskId ?? null, body);
     this.log("message", to, "sent", from, { task_id: taskId });
+    const live = this.db.prepare(`SELECT omni_session FROM jobs WHERE status='running' AND lease_expires>?
+      AND (runner_id=? OR (type='node' AND agent_id=?)) AND omni_session IS NOT NULL ORDER BY started_at DESC LIMIT 1`).get(new Date().toISOString(), to, to) as any;
+    if (live) pushBoardMail(live.omni_session, from, body, () => !!this.db.prepare(
+      "SELECT 1 FROM messages WHERE id=? AND to_agent=? AND from_agent=? AND body=?"
+    ).get(inserted.lastInsertRowid, to, from, body));
     return { sent: to };
   }
 
@@ -1512,7 +1529,7 @@ export class SqliteStore implements IStore {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
     return this.db.transaction(() => {
       const job = this.db.prepare(`UPDATE jobs SET status='running', started_at=?, finished_at=NULL,
-        result='', runner_id=?, lease_token=?, lease_expires=? WHERE id=(
+        result='', omni_session=NULL, omni_usage=NULL, omni_event_ids='[]', runner_id=?, lease_token=?, lease_expires=? WHERE id=(
         SELECT id FROM jobs WHERE (status='queued' OR (status='running' AND lease_expires<=?))
         AND type<>'node' AND target_node_id IS NULL
         AND (host IS NULL OR host=?) AND (target_agent_id IS NULL OR target_agent_id=?)
@@ -1524,18 +1541,26 @@ export class SqliteStore implements IStore {
     })();
   }
 
-  renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string, omni?: OmniUpdate) {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
     const updated = this.db.prepare(`UPDATE jobs SET lease_expires=?, result=COALESCE(?,result)
       WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
       .run(expires, result?.slice(-64000) ?? null, jobId, agentId, token, new Date().toISOString());
     if (!updated.changes) return { error: "job lease not owned or expired" };
+    if (omni) {
+      const recorded = this.recordOmnigent(jobId, agentId, token, omni);
+      if ("error" in recorded) return recorded;
+    }
     this.log("job", jobId, "renewed", agentId);
     return { id: jobId, lease_expires: expires };
   }
 
-  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, omni?: OmniUpdate) {
     return this.db.transaction(() => {
+      if (omni) {
+        const recorded = this.recordOmnigent(jobId, agentId, token, omni);
+        if ("error" in recorded) return recorded;
+      }
       const updated = this.db.prepare(`UPDATE jobs SET status=?, result=?, finished_at=datetime('now'), lease_expires=NULL
         WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
         .run(status, result.slice(-64000), jobId, agentId, token, new Date().toISOString());
@@ -1544,6 +1569,30 @@ export class SqliteStore implements IStore {
       const job = this.getJob(jobId) as any;
       if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
       return { id: jobId, status };
+    })();
+  }
+
+  recordOmnigent(jobId: string, agentId: string, token: string, update: OmniUpdate): { id: string } | { error: string } {
+    const parsed = omniUpdateSchema.safeParse(update);
+    if (!parsed.success) return { error: "invalid Omnigent update" };
+    return this.db.transaction(() => {
+      const job = this.db.prepare(`SELECT * FROM jobs WHERE id=? AND status='running' AND runner_id=?
+        AND lease_token=? AND lease_expires>?`).get(jobId, agentId, token, new Date().toISOString()) as any;
+      if (!job) return { error: "job lease not owned or expired" };
+      if (job.omni_session && job.omni_session !== update.session_id) return { error: "Omnigent session already bound" };
+      const ids = new Set<string>(JSON.parse(job.omni_event_ids));
+      for (const event of parsed.data.events ?? []) {
+        if (ids.has(event.id)) continue;
+        ids.add(event.id);
+        this.log("job", jobId, "omni_event", agentId, { task_id: job.task_id, session_id: update.session_id, event });
+      }
+      const usage = { ...JSON.parse(job.omni_usage ?? "{}"), ...parsed.data.usage };
+      if (job.omni_session === parsed.data.session_id && job.omni_usage === JSON.stringify(usage)
+        && job.omni_event_ids === JSON.stringify([...ids].slice(-1000))) return { id: jobId };
+      this.db.prepare("UPDATE jobs SET omni_session=?, omni_usage=?, omni_event_ids=? WHERE id=?")
+        .run(parsed.data.session_id, JSON.stringify(usage), JSON.stringify([...ids].slice(-1000)), jobId);
+      this.log("job", jobId, "omni_updated", agentId, { session_id: update.session_id });
+      return { id: jobId };
     })();
   }
 
@@ -1566,6 +1615,7 @@ export class SqliteStore implements IStore {
     return {
       tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })),
       job_counts: jobs,
+      omni_events: this.db.prepare("SELECT * FROM events WHERE action='omni_event' ORDER BY id DESC LIMIT 25").all(),
       helpers_registered: helpers,
       nodes: this.listNodes(),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
