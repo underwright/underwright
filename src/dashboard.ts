@@ -36,6 +36,7 @@ export type DashboardData = {
   events?: any[];
   job_counts?: Array<{ status: string; n: number }>;
   nodes?: any[];
+  providers?: any[];
 };
 
 /** Narrow screens (phones, portrait tablets): tables collapse into labelled cards,
@@ -153,6 +154,7 @@ export function renderDashboard(data: DashboardData, opts: { refreshSeconds?: nu
   const jobs = data.jobs ?? [];
   const events = data.events ?? [];
   const nodes = data.nodes ?? [];
+  const providers = data.providers ?? [];
   const counts = data.job_counts ?? [];
   const jobSummary = counts.length ? counts.map((c) => `${c.n} ${c.status}`).join(" · ") : "no jobs";
 
@@ -188,6 +190,11 @@ tr.blocked td,tr.blocked .title{color:#f6c27a}
 .poll-silent{color:#f87171;font-weight:600}
 .poll-ok{color:#4ade80}
 .muted{color:#6f7a89}
+.iss-billing{color:#f87171;font-weight:600}
+.iss-rate_limit{color:#f6c27a;font-weight:600}
+.iss-auth{color:#f6c27a}
+.iss-config{color:#7dd3fc}
+.iss-aborted,.iss-other{color:#6f7a89}
 ${MOBILE_CSS}
 </style>
 </head>
@@ -234,6 +241,18 @@ ${section("Nodes", nodes, [
   { label: "Current job", render: field("current_job_id", "—") },
   { label: "Capabilities", render: field("capabilities_freshness") },
   { label: "Harnesses", render: (n) => escapeHtml((n.harnesses ?? []).map((h: any) => h.id).join(", ") || "—") },
+])}
+
+${section("Providers", providers, [
+  { label: "Provider", render: field("id") },
+  { label: "Nodes", render: (p) => `${p.ready}/${p.nodes} ready` },
+  { label: "Quota", render: (p) => p.exhausted
+      ? `<span class="iss-billing">exhausted×${p.exhausted}</span>${p.resets_at ? ` <span class="muted">→ ${escapeHtml(p.resets_at.slice(0, 16))}</span>` : ""}`
+      : `<span class="muted">ok/unknown</span>` },
+  { label: "Jobs 6h", render: (p) => `${p.jobs_6h.done} done · ${p.jobs_6h.failed} failed` },
+  { label: "Issues", render: (p) => p.issues.length
+      ? p.issues.slice(0, 2).map((i: any) => `<span class="iss-${i.kind}">${i.kind}×${i.count}</span>`).join(" ") + ` <span class="muted">${escapeHtml(p.issues[0].last_msg)}</span>`
+      : `<span class="poll-ok">clean</span>` },
 ])}
 
 ${section("Open jobs", jobs, [

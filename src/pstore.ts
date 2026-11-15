@@ -5,6 +5,7 @@ import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, AR
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { aggregateProviders } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -1394,11 +1395,15 @@ export class PgStore implements IStore {
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;
     const unread = await this.sql`SELECT to_agent, COUNT(*)::int AS n FROM messages WHERE read=false GROUP BY to_agent`;
     const activity = await this.sql`SELECT actor, MAX(created_at) AS last_at FROM events GROUP BY actor ORDER BY last_at DESC LIMIT 50`;
+    const nodes = await this.listNodes();
+    const failures = await this.sql`SELECT agent_id, right(result,-800) AS result, finished_at FROM jobs WHERE type='node' AND status='failed' AND finished_at::timestamptz > now() - interval '6 hours'`;
+    const counts = await this.sql`SELECT agent_id, status, COUNT(*)::int AS n FROM jobs WHERE type='node' AND created_at::timestamptz > now() - interval '6 hours' GROUP BY agent_id, status`;
     return {
       tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))),
       job_counts,
       helpers_registered: n,
-      nodes: await this.listNodes(),
+      nodes,
+      providers: aggregateProviders(nodes, failures as any, counts as any),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
       agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
     };

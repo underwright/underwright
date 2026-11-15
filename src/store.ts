@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { aggregateProviders } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -1563,11 +1564,18 @@ export class SqliteStore implements IStore {
     const helpers = (this.db.prepare("SELECT COUNT(*) n FROM helpers").get() as any).n;
     const unread = this.db.prepare("SELECT to_agent, COUNT(*) n FROM messages WHERE read=0 GROUP BY to_agent").all() as any[];
     const activity = this.db.prepare("SELECT actor, MAX(created_at) last_at FROM events GROUP BY actor ORDER BY last_at DESC LIMIT 50").all() as any[];
+    const nodes = this.listNodes();
+    const providers = aggregateProviders(
+      nodes,
+      this.db.prepare("SELECT agent_id,substr(result,-800) result,finished_at FROM jobs WHERE type='node' AND status='failed' AND datetime(finished_at) > datetime('now','-6 hours')").all() as any[],
+      this.db.prepare("SELECT agent_id,status,COUNT(*) n FROM jobs WHERE type='node' AND datetime(created_at) > datetime('now','-6 hours') GROUP BY agent_id,status").all() as any[],
+    );
     return {
       tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })),
       job_counts: jobs,
       helpers_registered: helpers,
-      nodes: this.listNodes(),
+      nodes,
+      providers,
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
       agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
     };
