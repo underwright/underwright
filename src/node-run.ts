@@ -128,7 +128,17 @@ export async function runNode(opts: {
       const linkAbort = () => sessionAbort.abort();
       signal.addEventListener("abort", linkAbort);
       try {
-        const session = await nodeCall(cred, "/nodes/v1/session", { version: 1 }, "POST", sessionAbort.signal);
+        let session;
+        try {
+          session = await nodeCall(cred, "/nodes/v1/session", { version: 1 }, "POST", sessionAbort.signal);
+        } catch (error) {
+          if (signal.aborted) break;
+          // Transport failures and non-JSON gateway responses are transient,
+          // just like a denied session. Keep the credential and retry in place.
+          console.error("[underwright-node] session request failed; retrying");
+          await backoff(error, sessionAbort.signal).catch(() => undefined);
+          continue;
+        }
         if (session.error || !session.session_id) {
           console.error(`[underwright-node] session denied (${session.status ?? "unknown"}); retrying`);
           await backoff(session, sessionAbort.signal).catch(() => undefined);
