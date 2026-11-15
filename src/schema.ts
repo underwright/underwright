@@ -79,6 +79,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, ded
   WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
 `;
 
+/** Durable reporting cursor, portable across SQLite and Postgres. */
+export const GITHUB_STATUS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS github_status (
+  repo TEXT NOT NULL,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  state TEXT NOT NULL,
+  PRIMARY KEY (repo, task_id)
+);
+`;
+
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS tasks (
   id            TEXT PRIMARY KEY,
@@ -101,6 +111,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 ${TASK_DEPENDENCIES_SCHEMA}
+${GITHUB_STATUS_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS claims (
   task_id        TEXT PRIMARY KEY REFERENCES tasks(id),

@@ -1600,6 +1600,17 @@ export class SqliteStore implements IStore {
     return { ...this.board(), locks, jobs, events: this.auditLog(eventsLimit) };
   }
 
+  getGithubStatus(repo: string, taskId: string): string | null {
+    const row = this.db.prepare("SELECT state FROM github_status WHERE repo=? AND task_id=?").get(repo, taskId) as { state: string } | undefined;
+    return row?.state ?? null;
+  }
+
+  putGithubStatus(repo: string, taskId: string, state: string) {
+    this.db.prepare(`INSERT INTO github_status (repo,task_id,state) VALUES (?,?,?)
+      ON CONFLICT(repo,task_id) DO UPDATE SET state=excluded.state`).run(repo, taskId, state);
+    this.log("github_status", taskId, "checkpoint", "github-status", { repo });
+  }
+
   auditLog(limit = 50) {
     return this.db.prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit);
   }

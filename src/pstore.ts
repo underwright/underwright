@@ -1,5 +1,5 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
-import { NODES_SCHEMA } from "./schema.js";
+import { GITHUB_STATUS_SCHEMA, NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
@@ -668,6 +668,7 @@ export class PgStore implements IStore {
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
     await sql.unsafe(LEDGER_SCHEMA);
+    await sql.unsafe(GITHUB_STATUS_SCHEMA);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
@@ -1452,6 +1453,17 @@ export class PgStore implements IStore {
     const locks = await this.sql`SELECT * FROM locks WHERE lease_expires > now() ORDER BY resource`;
     const jobs = await this.sql`SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at DESC`;
     return { ...await this.board(), locks, jobs, events: await this.auditLog(eventsLimit) };
+  }
+
+  async getGithubStatus(repo: string, taskId: string): Promise<string | null> {
+    const rows = await this.sql`SELECT state FROM github_status WHERE repo=${repo} AND task_id=${taskId}`;
+    return rows[0]?.state ?? null;
+  }
+
+  async putGithubStatus(repo: string, taskId: string, state: string) {
+    await this.sql`INSERT INTO github_status (repo,task_id,state) VALUES (${repo},${taskId},${state})
+      ON CONFLICT(repo,task_id) DO UPDATE SET state=EXCLUDED.state`;
+    await this.log("github_status", taskId, "checkpoint", "github-status", { repo });
   }
 
   async auditLog(limit = 50) {

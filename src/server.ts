@@ -12,6 +12,7 @@ import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
+import { startGithubStatusLoop } from "./github-status.js";
 import { initTelemetry } from "./telemetry.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
@@ -317,6 +318,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
   initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
   const stopSweeper = startLeaseSweeper(store);
+  const stopGithub = startGithubStatusLoop(store);
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
     if (req.url?.startsWith("/nodes/")) {
@@ -436,7 +438,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   http.headersTimeout = 10000;
   http.maxConnections = 128;
   http.once("close", () => {
-    void stopSweeper().then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
+    void Promise.all([stopSweeper(), stopGithub()]).then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
   });
   try {
     await new Promise<void>((resolve, reject) => {
@@ -447,7 +449,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       });
     });
   } catch (error) {
-    await stopSweeper();
+    await Promise.all([stopSweeper(), stopGithub()]);
     await store.close();
     throw error;
   }
