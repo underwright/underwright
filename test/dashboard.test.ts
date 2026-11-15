@@ -108,6 +108,48 @@ describe("task list filters + sorting", () => {
 });
 
 describe("/board route with filters", () => {
+  it.each([0, 5, 15, 60])("offers refresh=%i in the GET form and preserves token and filters", async (refresh) => {
+    const url = new URL(`http://x/board?refresh=${refresh}&status=open&q=board&sort=updated`);
+    const { html } = await handleDashboardRequest(store, "GET", url, new URLSearchParams(), 'a&"b');
+    expect(html).toContain('<form class="inline task-filters" method="get" action="/board">');
+    expect(html).toContain('<label>Auto-refresh <select name="refresh">');
+    for (const interval of [0, 5, 15, 60]) {
+      expect(html).toContain(`<option value="${interval}"${interval === refresh ? " selected" : ""}>${interval ? `${interval}s` : "Off"}</option>`);
+    }
+    expect(html).not.toContain('type="hidden" name="refresh"');
+    expect(html).toContain('<input type="hidden" name="token" value="a&amp;&quot;b">');
+    expect(html).toContain('<option value="open" selected>');
+    expect(html).toContain('value="board"');
+    expect(html).toContain('<option value="updated" selected>');
+    expect(html).toContain(`href="/board?refresh=${refresh}&amp;token=a%26%22b">clear</a>`);
+    if (refresh === 0) {
+      expect(html).not.toContain('http-equiv="refresh"');
+      expect(html).toContain("auto-refresh off");
+    } else {
+      expect(html).toContain(`<meta http-equiv="refresh" content="${refresh}">`);
+    }
+  });
+
+  it.each(["", "?refresh=invalid", "?refresh=-1", "?refresh=1.5", "?refresh=Infinity", "?refresh=10", "?refresh="])("uses the board default for missing or unsupported intervals: %s", async (query) => {
+    const { html } = await handleDashboardRequest(store, "GET", new URL(`http://x/board${query}`), new URLSearchParams());
+    expect(html).toContain('<meta http-equiv="refresh" content="15">');
+    expect(html).toContain('<option value="15" selected>');
+  });
+
+  it("disables refresh on the root board alias too", async () => {
+    const { html } = await handleDashboardRequest(store, "GET", new URL("http://x/?refresh=0"), new URLSearchParams());
+    expect(html).not.toContain('http-equiv="refresh"');
+  });
+
+  it("never refreshes task details, inboxes, or chat composition pages", async () => {
+    const task = store.createTask({ title: "Read without interruptions", ac_ids: ["a"], type: "triage", estimate: "S" });
+    for (const path of [`/task/${task.id}`, "/inbox/human", "/chat", "/chat/agent-A"]) {
+      const { html } = await handleDashboardRequest(store, "GET", new URL(`http://x${path}?refresh=5`), new URLSearchParams());
+      expect(html).toBeDefined();
+      expect(html).not.toContain('http-equiv="refresh"');
+    }
+  });
+
   it("applies status/q/sort and preserves the token through the form", async () => {
     store.createTask({ title: "Dashboard filters work", ac_ids: ["a"], type: "triage", estimate: "S" });
     store.createTask({ title: "Unrelated chore", ac_ids: ["a"], type: "triage", estimate: "S" });
@@ -121,6 +163,12 @@ describe("/board route with filters", () => {
 });
 
 describe("dashboard rendering", () => {
+  it("omits meta refresh entirely when disabled", () => {
+    const html = renderDashboard({}, { refreshSeconds: 0 });
+    expect(html).not.toContain('http-equiv="refresh"');
+    expect(html).toContain("auto-refresh off");
+  });
+
   it("renders every required section with auto-refresh", () => {
     const html = renderDashboard({
       tasks: [{ id: "task-1", title: "Ship it", status: "open", priority: 1, claimed_by: null, lease_expires: null }],

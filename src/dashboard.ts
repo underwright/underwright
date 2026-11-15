@@ -123,19 +123,19 @@ export function filterSortTasks(tasks: any[], query: TaskListQuery): any[] {
 }
 
 /** GET form for the task list. Zero JS; the token rides as a hidden field so it survives submit. */
-function taskControls(query: TaskListQuery, opts: { token?: string; refreshSeconds?: number }): string {
+function taskControls(query: TaskListQuery, opts: { token?: string; refreshSeconds: number }): string {
   const sel = (name: string, options: readonly string[], current: string) =>
     `<select name="${name}">${options.map((o) => `<option value="${o}"${o === current ? " selected" : ""}>${o}</option>`).join("")}</select>`;
-  const hidden = [
-    opts.token ? `<input type="hidden" name="token" value="${escapeHtml(opts.token)}">` : "",
-    opts.refreshSeconds !== undefined ? `<input type="hidden" name="refresh" value="${escapeHtml(String(opts.refreshSeconds))}">` : "",
-  ].join("");
+  const hidden = opts.token ? `<input type="hidden" name="token" value="${escapeHtml(opts.token)}">` : "";
+  const clear = new URLSearchParams({ refresh: String(opts.refreshSeconds) });
+  if (opts.token) clear.set("token", opts.token);
   return `<form class="inline task-filters" method="get" action="/board">${hidden}
 ${sel("status", TASK_STATUS_FILTERS, query.status)}
 <input name="q" placeholder="search id or title" value="${escapeHtml(query.q)}">
 ${sel("sort", TASK_SORTS, query.sort)}
+<label>Auto-refresh <select name="refresh">${[0, 5, 15, 60].map((seconds) => `<option value="${seconds}"${seconds === opts.refreshSeconds ? " selected" : ""}>${seconds ? `${seconds}s` : "Off"}</option>`).join("")}</select></label>
 <button>Apply</button>
-<a href="/board${opts.token ? `?token=${encodeURIComponent(opts.token)}` : ""}">clear</a>
+<a href="/board?${escapeHtml(clear.toString())}">clear</a>
 </form>`;
 }
 
@@ -161,7 +161,7 @@ export function renderDashboard(data: DashboardData, opts: { refreshSeconds?: nu
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="${refresh}">
+${refresh > 0 ? `<meta http-equiv="refresh" content="${refresh}">` : ""}
 ${PWA_META}
 <title>Underwright board</title>
 <style>
@@ -195,7 +195,7 @@ ${MOBILE_CSS}
 <main>
 <header>
 <h1>Underwright board</h1>
-<p class="meta">read-only · auto-refresh ${refresh}s · rendered ${escapeHtml(new Date().toISOString())}</p>
+<p class="meta">read-only · auto-refresh ${refresh > 0 ? `${refresh}s` : "off"} · rendered ${escapeHtml(new Date().toISOString())}</p>
 </header>
 <p class="meta">jobs: ${escapeHtml(jobSummary)} · tasks: ${tasks.length} · active locks: ${locks.length} · nodes: ${nodes.length}</p>
 
@@ -530,8 +530,10 @@ export async function handleDashboardRequest(store: any, method: string, url: UR
   }
   if (path === "/" || path === "/board") {
     const data = await store.dashboard();
+    const requestedRefresh = url.searchParams.get("refresh");
+    const refreshSeconds = ["0", "5", "15", "60"].includes(requestedRefresh ?? "") ? Number(requestedRefresh) : 15;
     const html = renderDashboard(data, {
-      refreshSeconds: Number(url.searchParams.get("refresh") ?? 15),
+      refreshSeconds,
       tasks: { query: parseTaskQuery(url), token },
     })
       .replace("<main>", `<main>
