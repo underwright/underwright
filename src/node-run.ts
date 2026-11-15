@@ -1,3 +1,4 @@
+import type { OmniUpdate } from "./omnigent.js";
 /** Outbound daemon with independent liveness and lease loops, typed execution and durable receipts. */
 import { createExecutorRegistry, redact, type ExecutorConfig } from './node-executors.js';
 import { NODE_MAX_CONCURRENCY } from './node-protocol.js';
@@ -9,7 +10,7 @@ import { nodeStateDirectory, readNodeCredential, secureDirectory } from "./node-
 import { sleepSignal, type NodeCredential } from "./node-protocol.js";
 import { initTelemetry } from "./telemetry.js";
 
-export type NodeExecutor = (job: any, signal?: AbortSignal) => Promise<{ status: "done" | "failed"; result: string }>;
+export type NodeExecutor = (job: any, signal?: AbortSignal) => Promise<{ status: "done" | "failed"; result: string; omni?: OmniUpdate }>;
 export type NodeProbe = () => Promise<unknown> | unknown;
 
 function acquireDaemonLock(dir: string) {
@@ -135,11 +136,13 @@ export async function runNode(opts: {
           continue;
         }
         session_id = session.session_id;
+        const omniSnapshots = new Map<string, () => OmniUpdate>();
         const execute = opts.executor ?? (async (job: any, childSignal?: AbortSignal) => {
           if (!opts.config) return { status: 'failed' as const, result: 'executor config required; use node run --config FILE' };
           const registry = createExecutorRegistry(session.policy, {
             ...opts.config,
             timeoutMs: Math.min(opts.config.timeoutMs ?? 600000, (job.node_spec.timeout_seconds ?? 600) * 1000),
+            onOmnigent: snapshot => omniSnapshots.set(job.id, snapshot),
             onSpawn: pid => journal.write({ job_id: job.id, attempt_id: job.attempt_id, phase: 'started', pid, process_start: processStart(pid) }),
           });
           let worker: Record<string, string> | undefined;
@@ -213,7 +216,7 @@ export async function runNode(opts: {
                   if (Date.now() >= expires) childAbort.abort();
                   if (renewing || childAbort.signal.aborted) return;
                   renewing = true;
-                  void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token }, 'POST', AbortSignal.timeout(Math.max(1, Math.min(10000, expires - Date.now()))))
+                  void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token, ...(omniSnapshots.has(job.id) ? { omni: omniSnapshots.get(job.id)!() } : {}) }, 'POST', AbortSignal.timeout(Math.max(1, Math.min(10000, expires - Date.now()))))
                     .then(r => { if (r.error || !r.lease_expires) childAbort.abort(); else expires = Date.parse(r.lease_expires); })
                     .catch(() => childAbort.abort()).finally(() => { renewing = false; });
                 }, opts.renewMs ?? 10000);
@@ -221,15 +224,15 @@ export async function runNode(opts: {
                 const execSpan = tel.span("job.execute", { job_id: job.id, task_id: job.task_id, attempt_id: job.attempt_id, slot });
                 try {
                   finished = await execute(job, childAbort.signal);
-                  finished = { status: childAbort.signal.aborted ? 'failed' : finished.status, result: redact(finished.result).slice(-64000) };
+                  finished = { ...finished, status: childAbort.signal.aborted ? 'failed' : finished.status, result: redact(finished.result).slice(-64000) };
                   execSpan.end(finished.status === 'done' ? 'ok' : 'error', undefined, { outcome: finished.status });
                 } catch (error) { execSpan.end("error", error); finished = { status: 'failed', result: 'executor failed/outcome_unknown' }; }
-                finally { clearInterval(timer); clearInterval(expiryTimer); sessionAbort.signal.removeEventListener('abort', stopChild); }
+                finally { clearInterval(timer); clearInterval(expiryTimer); omniSnapshots.delete(job.id); sessionAbort.signal.removeEventListener('abort', stopChild); }
                 journal.write({ ...record, phase: 'finished', outcome: finished });
               }
               finished ??= { status: 'failed', result: 'restart/outcome_unknown; automatic replay refused' };
               const receipt = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/finish`, {
-                session_id, lease_token: job.lease_token, status: finished.status, result: finished.result,
+                session_id, lease_token: job.lease_token, status: finished.status, result: finished.result, ...(finished.omni ? { omni: finished.omni } : {}),
               });
               if (receipt.error) { if ([401, 409].includes(receipt.status)) sessionAbort.abort(); else throw new Error('finish failed'); }
             } catch (error) {

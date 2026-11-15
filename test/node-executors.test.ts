@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createExecutorRegistry, containedPath, redact, sanitizedEnv, type NodeTask, type NodeTransport } from '../src/node-executors.js';
@@ -135,4 +135,18 @@ it('model flag precedes config args so flag-value pairs stay adjacent to the pro
     task('launch-agent', { workspace_id: 'w1', harness: 'groklike', prompt: 'PROMPT-XYZ', model: 'grok-4.7', model_flag: '-m' }));
   expect(r.status).toBe('done');
   expect(r.result.trim()).toBe('-m grok-4.7 --single PROMPT-XYZ');
+});
+
+
+it('observes an approved omni executable and returns its session on the receipt', async () => {
+  const ws = tmp();
+  const omni = join(ws, 'omni');
+  writeFileSync(omni, '#!/bin/sh\necho "omnigent session: http://localhost:6767/c/observed-session"\n', { mode: 0o755 });
+  let snapshot: (() => any) | undefined;
+  const cfg = { workspaces: { w1: ws }, harnesses: { omni: { executable: omni } }, onOmnigent: (get: () => any) => { snapshot = get; } };
+  const policy = { allowed_task_types: ['launch-agent'] as any, workspace_ids: ['w1'] };
+  const outcome = await createExecutorRegistry(policy, cfg).execute(task('launch-agent', { workspace_id: 'w1', harness: 'omni', prompt: 'work' }));
+  expect(outcome.status).toBe('done');
+  expect((outcome as any).omni?.session_id).toBe('observed-session');
+  expect(snapshot?.().session_id).toBe('observed-session');
 });

@@ -34,6 +34,7 @@ export type DashboardData = {
   locks?: any[];
   jobs?: any[];
   events?: any[];
+  omni_events?: any[];
   job_counts?: Array<{ status: string; n: number }>;
   nodes?: any[];
 };
@@ -244,6 +245,16 @@ ${section("Open jobs", jobs, [
   { label: "Agent", render: field("agent_id") },
   { label: "Command", render: field("command"), cls: "cmd" },
   { label: "Created", render: field("created_at") },
+])}
+
+${section("Omnigent activity", data.omni_events ?? [], [
+  { label: "Time", render: field("created_at") },
+  { label: "Session", render: (e) => escapeHtml(eventPayload(e).session_id) },
+  { label: "Event", render: (e) => escapeHtml((eventPayload(e).event as any)?.type) },
+  { label: "Detail", render: (e) => {
+    const payload = (eventPayload(e).event as any)?.data;
+    return escapeHtml(payload?.reason ?? payload?.data?.reason ?? payload?.child?.status ?? payload?.elicitation_id ?? "");
+  } },
 ])}
 
 ${section("Recent events", events, [

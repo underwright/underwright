@@ -1,3 +1,4 @@
+import { omniUpdateSchema } from "./omnigent.js";
 /** Versioned node wire contract. Device credentials never authorize the admin MCP. */
 import { createHash, randomBytes } from 'node:crypto';
 import { z } from 'zod';
@@ -51,6 +52,7 @@ export const nodeRenewSchema = z.object({
   session_id: z.string().min(1).max(64),
   lease_token: z.string().min(1).max(128),
   result: z.string().max(NODE_RESULT_LIMIT).optional(),
+  omni: omniUpdateSchema.optional(),
 }).strict();
 export const nodeFinishSchema = z.object({
   session_id: z.string().min(1).max(64),
@@ -58,6 +60,7 @@ export const nodeFinishSchema = z.object({
   status: z.enum(['done', 'failed']),
   result: z.string().max(NODE_RESULT_LIMIT),
   result_metadata: z.record(z.string(), z.unknown()).optional(),
+  omni: omniUpdateSchema.optional(),
 }).strict().superRefine((value, ctx) => {
   if (value.result_metadata && JSON.stringify(value.result_metadata).length > 4096) {
     ctx.addIssue({ code: 'custom', message: 'result_metadata too large', path: ['result_metadata'] });

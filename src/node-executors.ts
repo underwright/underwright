@@ -1,3 +1,5 @@
+import { OmniClient, OmniObserver, omniSessionId, type OmniUpdate } from './omnigent.js';
+import { extractOmnigentSession } from './runner.js';
 /**
  * Typed executor registry for node task types (gh-57 design, part D).
  * Every operation is a literal argv spawned with shell:false and a sanitized env.
@@ -15,7 +17,7 @@ export const NODE_TASK_TYPES = ['launch-agent', 'provision', 'install-harness', 
 export type NodeTaskType = (typeof NODE_TASK_TYPES)[number];
 
 export interface NodeTask { id: string; type: NodeTaskType; params: unknown; lease_expires?: string; worker?: Record<string, string> }
-export interface NodeResult { status: 'done' | 'failed'; result: string }
+export interface NodeResult { status: 'done' | 'failed'; result: string; omni?: OmniUpdate }
 
 /** Injectable transport for single-attempt callers; the daemon owns its HTTP receipt journal. */
 export interface NodeTransport {
@@ -38,6 +40,7 @@ export interface ExecutorConfig {
   concurrency?: number;
   timeoutMs?: number;
   onSpawn?: (pid: number) => void;
+  onOmnigent?: (snapshot: () => OmniUpdate) => void;
   maxOutput?: number;
 }
 
@@ -136,11 +139,26 @@ export const redact = (text: string) =>
 export function runPlan(plan: Plan, cfg: ExecutorConfig, signal?: AbortSignal, onOutput?: (s: string) => void): Promise<NodeResult> {
   const max = Math.max(1, Math.min(64000, cfg.maxOutput ?? 64000));
   let out = '';
+  let observer: OmniObserver | undefined;
+  let refreshTimer: ReturnType<typeof setInterval> | undefined;
+  const observe = (output: string) => {
+    if (observer || !/^(omni|omnigent)(?:\.exe)?$/.test(plan.executable.split(/[\\/]/).pop() ?? '')) return;
+    const locator = extractOmnigentSession(output);
+    const session = locator && omniSessionId(locator);
+    if (!session) return;
+    let client: OmniClient | undefined;
+    try { client = OmniClient.configured(); } catch { /* optional configuration */ }
+    observer = new OmniObserver(session, client);
+    observer.refresh();
+    cfg.onOmnigent?.(() => observer!.snapshot());
+    refreshTimer = setInterval(() => observer?.refresh(), 5000);
+  };
   const append = (s: string) => {
     // Scrub complete scoped secrets before trimming. The extra tail retains any
     // split credential until its next chunk, even with a tiny output budget.
     out = (out + s).replace(/uw_(?:node|worker)_[a-f0-9]{64}/g, '[redacted]').slice(-Math.max(256, max));
     onOutput?.(redact(s));
+    observe(out.slice(0, out.lastIndexOf('\n') + 1));
   };
   return new Promise(done => {
     if (signal?.aborted) return done({ status: 'failed', result: 'aborted before start' });
@@ -162,7 +180,18 @@ export function runPlan(plan: Plan, cfg: ExecutorConfig, signal?: AbortSignal, o
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
     const timer = setTimeout(() => stop('timed out'), cfg.timeoutMs ?? 600000);
-    const end = (r: NodeResult) => { clearTimeout(timer); if (killTimer) { kill('SIGKILL'); clearTimeout(killTimer); } signal?.removeEventListener('abort', onAbort); done({ status: r.status, result: redact(r.result).slice(-max) }); };
+    let settling = false;
+    const end = async (r: NodeResult) => {
+      if (settling) return;
+      settling = true;
+      clearTimeout(timer);
+      if (killTimer) { kill('SIGKILL'); clearTimeout(killTimer); }
+      signal?.removeEventListener('abort', onAbort);
+      observe(out);
+      if (refreshTimer) clearInterval(refreshTimer);
+      await observer?.stop();
+      done({ status: r.status, result: redact(r.result).slice(-max), ...(observer ? { omni: observer.snapshot() } : {}) });
+    };
     child.once('error', e => { append(`\n${e.message}\n`); end({ status: 'failed', result: out }); });
     child.once('close', code => end({ status: code === 0 && !stopped ? 'done' : 'failed', result: out }));
   });
