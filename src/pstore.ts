@@ -3,7 +3,7 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, completionReviewKind, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -500,7 +500,7 @@ export class PgStore implements IStore {
     if (!dispatch.enabled) { span.end(); return meta; }
     const routing = getModelRouting();
     const candidates = (await this.nodeQuery(
-      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
+      `SELECT id,title,type,estimate,ac_ids,spec_ref,review_of,review_kind,priority,updated_at FROM tasks
        WHERE status='open' AND estimate<>'' AND ac_ids<>'[]'
        ORDER BY priority ASC, updated_at ASC LIMIT 25`,
     )) as DispatchTask[];
@@ -521,6 +521,7 @@ export class PgStore implements IStore {
       if ((await this.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > now() - interval '5 minutes' LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      if (task.type === "review" && task.review_of) task.review_implementer = await this.implementerOf(task.review_of);
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
@@ -857,7 +858,7 @@ export class PgStore implements IStore {
     }
 
     if (task.type === "review" && task.review_of && claim?.agent_id !== agentId) {
-      const independence = reviewIndependenceError(agentId, await this.implementerOf(task.review_of), task.review_of);
+      const independence = reviewIndependenceError(agentId, await this.implementerOf(task.review_of), task.review_of, getDispatcherPolicy().review.require_different_harness);
       if (independence) return { error: independence };
     }
 
@@ -1082,6 +1083,7 @@ export class PgStore implements IStore {
     await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     await this.notifyWatchers(taskId, `task ${taskId} → done`);
     await this.unblockDependents(taskId, agentId);
+    await this.ensureCompletionReview(task, policy);
     const dispatched = scoped ? undefined : await this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
@@ -1094,6 +1096,23 @@ export class PgStore implements IStore {
         agent_id: agentId,
       },
     };
+  }
+
+  /** Called inside the graph transaction, which serializes completion/reopen retries. */
+  private async ensureCompletionReview(task: any, policy: ReturnType<typeof loadPolicy>) {
+    const kind = completionReviewKind(task, policy);
+    if (!kind) return;
+    const existing = await this.sql`SELECT id FROM tasks WHERE review_of=${task.id} AND review_kind=${kind} LIMIT 1`;
+    if (existing.length) return;
+    const review = await this.createTaskAtomic({
+      title: `${kind === "design" ? "Design" : "Code"} review: ${task.title}`,
+      description: `Independent ${kind} review of ${task.id}. Inspect the subject's artifacts, evidence and linked changes; post a review artifact and report findings.`,
+      type: "review", review_of: task.id, review_kind: kind,
+      spec_ref: task.spec_ref ?? undefined, priority: task.priority,
+      estimate: task.estimate || "S", ac_ids: ["review"], created_by: DISPATCHER_AGENT,
+    });
+    if (review.error) throw new Error(review.error);
+    await this.log("task", task.id, "review_spawned", DISPATCHER_AGENT, { review_id: review.id, review_kind: kind });
   }
 
   private async taskRouteMeta(id: string) {

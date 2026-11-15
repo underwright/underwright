@@ -2,9 +2,10 @@
 // PgStore. When a node polls and has no queued job, the control plane evaluates
 // eligible board tasks against that node's live capabilities and forms a
 // launch-agent job. Nodes stay dumb pullers; routing stays centralized here.
-import { LAUNCH_PROMPT } from "./dispatcher.js";
+import { LAUNCH_PROMPT, chooseReviewer } from "./dispatcher.js";
 import {
   getDispatchPolicy,
+  getDispatcherPolicy,
   getModelRouting,
   tierForTask,
   modelForHarness,
@@ -20,6 +21,8 @@ export interface DispatchTask {
   ac_ids: string;
   spec_ref: string | null;
   review_kind?: string | null;
+  review_of?: string | null;
+  review_implementer?: string | null;
   priority: number;
   updated_at: string;
 }
@@ -145,21 +148,28 @@ export function matchTaskToNode(
     { type: task.type, estimate: task.estimate, ac_count: acCount, review_kind: task.review_kind ?? undefined },
     routing,
   );
-  for (const harness of ready) {
+  // Apply node admission before ranking review harnesses, so an unavailable
+  // preferred family cannot hide another eligible reviewer on the same node.
+  const admitted = ready.filter(harness => nodeSpecAllowed(node.policy as never, {
+    version: 1, kind: "launch-agent", workspace_id: workspace,
+    payload: { workspace_id: workspace, harness, prompt: "x" },
+  } as never, node.capabilitiesJson, node.capabilitiesObservedAt, now));
+  let candidates = admitted;
+  if (task.type === "review") {
+    const review = getDispatcherPolicy().review;
+    const reviewer = chooseReviewer({
+      implementer: task.review_implementer ?? null,
+      agents: admitted.map(h => ({ id: `${h}@${node.name}`, workload: 0 })), max: 0,
+      requireDifferentHarness: review.require_different_harness,
+      preferStronger: review.prefer_stronger, designReview: task.review_kind === "design",
+    });
+    candidates = reviewer ? admitted.filter(h => `${h}@${node.name}` === reviewer) : [];
+  }
+  for (const harness of candidates) {
     const resolved = modelForHarness(routing, harness, tier);
     const { model, model_flag } = modelFlagOk ? resolved : { model: undefined, model_flag: undefined };
     const agent_id = `${harness}@${node.name}`;
-    // probe spec: harness+workspace decide admissibility; prompt/model don't
-    // affect nodeSpecAllowed
-    const probe = {
-      version: 1,
-      kind: "launch-agent",
-      workspace_id: workspace,
-      payload: { workspace_id: workspace, harness, prompt: "x" },
-    };
-    if (nodeSpecAllowed(node.policy as never, probe as never, node.capabilitiesJson, node.capabilitiesObservedAt, now)) {
-      return { match: { task, workspace, harness, agent_id, tier, model, model_flag } };
-    }
+    return { match: { task, workspace, harness, agent_id, tier, model, model_flag } };
   }
   return { skip: "no_harness" };
 }

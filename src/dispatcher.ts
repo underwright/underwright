@@ -80,7 +80,8 @@ export type ReviewKind = "code" | "design";
 export function harnessOf(agentId: string): string {
   const at = agentId.indexOf("@");
   const name = at === -1 ? agentId : agentId.slice(0, at);
-  return name.trim().toLowerCase();
+  const normalized = name.trim().toLowerCase();
+  return ({ "claude-sdk": "claude", "claude-code": "claude", "command-code": "cmdc" } as Record<string, string>)[normalized] ?? normalized;
 }
 
 export function tierOf(agentId: string): number {
@@ -111,14 +112,18 @@ export function implementerFromRecords(args: {
   );
 }
 
-/** Claim gate: the reviewer must be a different agent than the implementer. */
+/** Claim gate: independent agents and, by policy, independent harness families. */
 export function reviewIndependenceError(
   reviewer: string,
   implementer: string | null,
   subjectId: string,
+  requireDifferentHarness = false,
 ): string | null {
   if (implementer && reviewer === implementer) {
     return `reviewer ${reviewer} cannot claim this review: they implemented ${subjectId}`;
+  }
+  if (requireDifferentHarness && implementer && harnessOf(reviewer) === harnessOf(implementer)) {
+    return `reviewer ${reviewer} cannot claim this review: same harness family as implementer of ${subjectId}`;
   }
   return null;
 }
