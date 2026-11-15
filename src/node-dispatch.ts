@@ -54,20 +54,51 @@ export function workspaceForTask(task: DispatchTask, workspaces: Record<string, 
   return (repo && workspaces[repo]) || fallback;
 }
 
+/** Overlay control-plane-observed provider exhaustion onto an attested
+ *  capabilities doc. Quota is per-account — a provider observed exhausted by
+ *  one node's job blocks it on every node until resets_at or a success. */
+export function mergeObservedQuota(
+  capabilitiesJson: string,
+  observed: ReadonlyMap<string, { state?: string; resets_at?: string | null }>,
+): string {
+  if (!observed.size) return capabilitiesJson;
+  try {
+    const caps = JSON.parse(capabilitiesJson || "{}");
+    if (!Array.isArray(caps.harnesses)) return capabilitiesJson;
+    let changed = false;
+    for (const h of caps.harnesses) {
+      const o = h?.id ? observed.get(h.id) : undefined;
+      if (o?.state === "exhausted") { h.quota = { state: "exhausted", ...(o.resets_at ? { resets_at: o.resets_at } : {}) }; changed = true; }
+    }
+    return changed ? JSON.stringify(caps) : capabilitiesJson;
+  } catch { return capabilitiesJson; }
+}
+
 /** Node's launchable harnesses: attested, installed, auth ready, quota open,
- *  ordered by dispatch.harness_order then attestation order. */
-export function launchableHarnesses(capabilitiesJson: string, harnessOrder: string[], now = Date.now()): string[] {
+ *  ordered by dispatch.harness_order then attestation order. When the node
+ *  has an installed+ready harness blocked by quota and freeFallback names
+ *  cheaper harnesses, those are promoted first — spend free capacity before
+ *  draining another paid provider while quota is scarce. */
+export function launchableHarnesses(capabilitiesJson: string, harnessOrder: string[], now = Date.now(), freeFallback: readonly string[] = []): string[] {
   let caps: { harnesses?: Array<{ id?: string; installed?: boolean; auth_status?: string; quota?: { state?: string; resets_at?: string } }> };
   try {
     caps = JSON.parse(capabilitiesJson || "{}");
   } catch {
     return [];
   }
+  let quotaBlocked = false;
   const ready = (caps.harnesses ?? [])
-    .filter(h => h?.id && h.installed && h.auth_status === "ready" && quotaAllows(h.quota, now))
+    .filter(h => {
+      if (!h?.id || !h.installed || h.auth_status !== "ready") return false;
+      if (!quotaAllows(h.quota, now)) { quotaBlocked = true; return false; }
+      return true;
+    })
     .map(h => h.id as string);
   const ranked = harnessOrder.filter(h => ready.includes(h));
-  return [...ranked, ...ready.filter(h => !ranked.includes(h))];
+  const ordered = [...ranked, ...ready.filter(h => !ranked.includes(h))];
+  if (quotaBlocked && freeFallback.length && ordered.some(h => freeFallback.includes(h)))
+    return [...ordered.filter(h => freeFallback.includes(h)), ...ordered.filter(h => !freeFallback.includes(h))];
+  return ordered;
 }
 
 export interface LaunchSpecInput {
@@ -130,7 +161,7 @@ export function matchTaskToNode(
   if (!workspace || !((node.policy as { workspace_ids?: string[] })?.workspace_ids ?? []).includes(workspace)) {
     return { skip: "no_workspace" };
   }
-  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now)
+  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now, dispatch.free_fallback)
     .filter(h => !avoidHarnesses.has(h));
   // Model args only ship to daemons that attest launch-model-flag — older
   // strict payload schemas reject unknown keys ("invalid task parameters").

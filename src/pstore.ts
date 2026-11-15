@@ -4,8 +4,8 @@ import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, matchAttrs, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
-import { aggregateProviders } from "./provider-health.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -523,7 +523,10 @@ export class PgStore implements IStore {
     meta.eligible = candidates.length;
     const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
     const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json || "{}") : node.policy_json;
-    const capsJson = typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {});
+    const capsJson = mergeObservedQuota(
+      typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {}),
+      await this.observedExhaustedProviders(),
+    );
     const now = new Date().toISOString();
     const avoid = new Set(
       ((await this.nodeQuery(
@@ -633,6 +636,7 @@ export class PgStore implements IStore {
       );
       if (!updated.length) return nodeError("job lease not owned or expired", 409);
       await s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
+      await s.observeProviderOutcome(jobId, job.agent_id, status, bounded);
       if (job.task_id) await s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
       // A dispatch-formed job that reports done on a still-open task could not
       // close it (worker jobs hold no control-plane credential). Leaving the
@@ -1259,6 +1263,41 @@ export class PgStore implements IStore {
       claimAgent: (row.claim_agent ?? null) as string | null,
       leaseExpires: row.lease_expires ?? null,
     };
+  }
+
+  /** Provider-level quota exhaustion observed from a finished job's result.
+   *  Quota is per-account: a rate-limit or billing failure marks the provider
+   *  exhausted fleet-wide until resets_at (parsed or a class default);
+   *  a successful job clears the mark — the provider proved itself alive. */
+  private async observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null) {
+    const provider = agentId?.split("@")[0];
+    if (!provider) return;
+    if (status === "done") {
+      await this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
+      return;
+    }
+    if (status !== "failed") return;
+    const kind = classifyFailure(result);
+    if (kind !== "rate_limit" && kind !== "billing") return;
+    const resetsAt = parseResetAt(result ?? "")
+      ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
+    await this.nodeQuery(
+      `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
+       ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
+         observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
+      [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+    );
+  }
+
+  /** Providers currently observed-exhausted (reset window not yet passed). */
+  private async observedExhaustedProviders(now = Date.now()): Promise<Map<string, { state: string; resets_at: string | null }>> {
+    const rows = await this.nodeQuery("SELECT provider, resets_at FROM provider_quota WHERE state='exhausted'", []) as { provider: string; resets_at: string | null }[];
+    const m = new Map<string, { state: string; resets_at: string | null }>();
+    for (const r of rows) {
+      if (r.resets_at && Date.parse(String(r.resets_at)) <= now) continue;
+      m.set(r.provider, { state: "exhausted", resets_at: r.resets_at ? String(r.resets_at) : null });
+    }
+    return m;
   }
 
   /** Agents the fleet can execute as right now: harness@node for approved

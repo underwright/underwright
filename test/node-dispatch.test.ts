@@ -372,3 +372,54 @@ it("idle sweep reassigns to live agents, never to dead interactive ids", async (
   expect(j.task_id).toBe(t.id);
   expect(j.agent_id).toBe("claude@box");
 });
+
+it("a rate-limit failure marks the provider exhausted on every node", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  const node2 = await enrolled(store, "box2");
+  await attest(store, node);
+  await attest(store, node2);
+  const t = await store.createTask(task());
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.agent_id).toBe("claude@box");
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "You've hit your 5-hour limit");
+  // provider-level mark: the OTHER node must also refuse claude, not just
+  // back it off locally — the subscription is shared
+  const t2 = await store.createTask(task());
+  const j2 = await store.pollNodeJob(node2.token, node2.session.session_id, 0);
+  expect(j2.task_id).toBe(t2.id);
+  expect(j2.agent_id).toBe("codex@box2");
+});
+
+it("a successful job clears observed provider exhaustion", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  const node2 = await enrolled(store, "box2");
+  await attest(store, node);
+  await attest(store, node2);
+  const t1 = await store.createTask(task());
+  const t2 = await store.createTask(task());
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j2.agent_id).toBe("claude@box");
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "402 Payment Required: usage balance exhausted");
+  await store.finishNodeJob(node.token, node.session.session_id, j2.id, j2.lease_token, "done", "all good");
+  const t3 = await store.createTask(task());
+  const j3 = await store.pollNodeJob(node2.token, node2.session.session_id, 0);
+  expect(j3.task_id).toBe(t3.id);
+  expect(j3.agent_id).toBe("claude@box2");   // success proved it alive
+});
+
+it("promotes free_fallback harnesses while any ready harness is quota-blocked", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node, READY_CAPS([
+    { id: "claude", quota: { state: "exhausted", resets_at: new Date(Date.now() + 3600_000).toISOString() } },
+    { id: "codex" },
+    { id: "devin" },
+  ]));
+  const t = await store.createTask(task());
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(t.id);
+  expect(j.agent_id).toBe("devin@box");   // zero-cost promoted ahead of codex
+});

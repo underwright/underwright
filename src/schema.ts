@@ -289,4 +289,15 @@ CREATE TABLE IF NOT EXISTS node_workers (
 CREATE TABLE IF NOT EXISTS node_rate_limits (
   bucket TEXT PRIMARY KEY, window_start TEXT NOT NULL, attempts INTEGER NOT NULL
 );
+/** Provider-level quota exhaustion observed from job results — keyed by
+ *  provider (harness id), not node+harness, because subscription quota is
+ *  per-account: claude exhausted on one node is exhausted fleet-wide. */
+CREATE TABLE IF NOT EXISTS provider_quota (
+  provider TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  resets_at TEXT,
+  observed_at TEXT NOT NULL,
+  source_job_id TEXT,
+  reason TEXT
+);
 `;

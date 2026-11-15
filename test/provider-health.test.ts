@@ -70,3 +70,22 @@ it("treats exhausted with a past resets_at as usable again", () => {
   expect(rows[0].exhausted).toBe(1);          // still declared exhausted, but allowed
   expect(rows[0].resets_at).toBeNull();        // reset is past → nothing upcoming
 });
+
+it("parses reset times from provider error text", async () => {
+  const { parseResetAt } = await import("../src/provider-health.js");
+  const now = Date.parse("2026-11-15T20:00:00Z");
+  expect(parseResetAt("resets 2026-11-16T16:46:00Z", now)).toBe("2026-11-16T16:46:00.000Z");
+  expect(parseResetAt("resets in 3 hours", now)).toBe("2026-11-15T23:00:00.000Z");
+  expect(parseResetAt("resets in 45 minutes", now)).toBe("2026-11-15T20:45:00.000Z");
+  // clock-time "resets HH:MMpm": next occurrence, capped at +12h
+  const clocked = parseResetAt("resets 8:50am (America/New_York)", now)!;
+  expect(clocked).toBeTruthy();
+  expect(Date.parse(clocked)).toBeGreaterThan(now);
+  expect(Date.parse(clocked)).toBeLessThanOrEqual(now + 12 * 3600_000);
+  const tod = parseResetAt("resets 11:59pm", now)!;
+  expect(tod).toBeTruthy();
+  expect(Date.parse(tod)).toBeGreaterThan(now);
+  expect(Date.parse(tod)).toBeLessThanOrEqual(now + 12 * 3600_000);
+  expect(parseResetAt("no reset info", now)).toBeNull();
+  expect(parseResetAt(null, now)).toBeNull();
+});

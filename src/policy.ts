@@ -114,12 +114,15 @@ export interface HumanNotifyPolicy {
  *  ("owner/name", from the task's spec_ref URL) to the workspace_id the node
  *  policy knows; `default_workspace` covers tasks with no resolvable repo.
  *  `harness_order` is a preference list — attested harnesses not listed are
- *  tried afterwards in attestation order. */
+ *  tried afterwards in attestation order. `free_fallback` names no-marginal-
+ *  cost harnesses promoted first whenever quota blocks any ready harness —
+ *  spend free capacity before draining other paid providers. */
 export interface DispatchRule {
   enabled?: boolean;
   default_workspace?: string;
   workspaces?: Record<string, string>;
   harness_order?: string[];
+  free_fallback?: string[];
 }
 
 export interface ModelRoutingRule {
@@ -483,12 +486,13 @@ export function expandTemplate<T extends TemplateSeedArgs>(args: T, policy: Poli
 /** gh-126 pull-through dispatch policy. Disabled when the block is absent. */
 export function getDispatchPolicy(policy: Policy = loadPolicy()): Required<DispatchRule> & { workspaces: Record<string, string> } {
   const d = policy.dispatch;
-  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [] };
+  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [], free_fallback: [] };
   return {
     enabled: d.enabled !== false,
     default_workspace: typeof d.default_workspace === "string" ? d.default_workspace : "",
     workspaces: d.workspaces && typeof d.workspaces === "object" ? d.workspaces : {},
     harness_order: Array.isArray(d.harness_order) ? d.harness_order.filter(h => typeof h === "string") : [],
+    free_fallback: Array.isArray(d.free_fallback) ? d.free_fallback.filter(h => typeof h === "string") : ["devin", "cmdc", "command-code", "opencode"],
   };
 }
 

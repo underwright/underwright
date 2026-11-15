@@ -35,6 +35,35 @@ export function classifyFailure(result: string | null | undefined): IssueKind {
   return "other";
 }
 
+/** Extract a reset time from provider error text. Understands explicit ISO
+ *  timestamps, "resets 8:50am"-style clock times (next occurrence, capped at
+ *  +12h — over-blocking a window beats burning retries), and "resets in N
+ *  hours/minutes" relatives. Returns ISO or null when nothing parses. */
+export function parseResetAt(result: string | null | undefined, now = Date.now()): string | null {
+  const r = result ?? "";
+  const iso = r.match(/\b(20\d{2}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d(?::[0-5]\d)?\s*(?:Z|[+-][0-2]\d:?[0-5]\d)?)\b/);
+  if (iso) {
+    const t = Date.parse(iso[1].replace(" ", "T"));
+    if (Number.isFinite(t) && t > now) return new Date(t).toISOString();
+  }
+  const rel = r.match(/resets? (?:in|after) (\d+)\s*(hours?|hrs?|h|minutes?|mins?|m)\b/i);
+  if (rel) {
+    const ms = /^h/i.test(rel[2]) ? Number(rel[1]) * 3_600_000 : Number(rel[1]) * 60_000;
+    if (ms > 0) return new Date(now + ms).toISOString();
+  }
+  const tod = r.match(/resets? (?:at )?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i);
+  if (tod) {
+    let h = Number(tod[1]) % 12;
+    if (tod[3].toLowerCase() === "pm") h += 12;
+    const d = new Date(now);
+    d.setHours(h, Number(tod[2] ?? 0), 0, 0);
+    if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+    const capped = Math.min(d.getTime(), now + 12 * 3_600_000);
+    return new Date(capped).toISOString();
+  }
+  return null;
+}
+
 /** One line to show next to an issue kind — the tail of the last failure. */
 function excerpt(result: string): string {
   const line = (result ?? "").split("\n").map(l => l.trim()).filter(l => l && !l.startsWith("Omnigent session:") && !l.startsWith("omnigent:")).pop() ?? "";

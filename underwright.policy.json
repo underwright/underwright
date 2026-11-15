@@ -269,6 +269,12 @@
       "command-code",
       "copilot",
       "pi"
+    ],
+    "free_fallback": [
+      "devin",
+      "cmdc",
+      "command-code",
+      "opencode"
     ]
   }
 }
