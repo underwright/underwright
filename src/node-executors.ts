@@ -4,10 +4,10 @@
  * Nothing here falls back to legacy shell-command execution. The control-plane
  * link is the injected NodeTransport, so the HTTP client can land independently.
  */
-import { spawn } from 'node:child_process';
-import { lstatSync, realpathSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import { appendFileSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { isAbsolute, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { NodePolicy } from './node-protocol.js';
 
@@ -80,6 +80,57 @@ export function containedPath(root: string, sub: string): string {
 
 interface Plan { executable: string; args: string[]; cwd?: string; env?: Record<string, string> }
 
+/** Best-effort git plumbing: failures never block a job — the fallback is a
+ *  per-job directory that still isolates the worker MCP configs. */
+const git = (cwd: string, args: string[]) =>
+  execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+/** Append entries to <gitdir>/info/exclude so worker-injected config files can
+ *  never be staged by an agent's `git add -A` (they carry the scoped token). */
+const exclude = (cwd: string, ...lines: string[]) => {
+  try {
+    const dir = join(resolve(cwd, git(cwd, ['rev-parse', '--git-dir'])), 'info');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, 'exclude'), lines.join('\n') + '\n');
+  } catch { /* non-repo or odd gitdir — nothing to exclude */ }
+};
+
+/** Project-level MCP client configs for the scoped worker credential. The
+ *  token is task+lease-scoped and dies with the job; files are git-excluded so
+ *  they cannot leak into a commit. */
+function writeWorkerMcpConfigs(dir: string, worker?: Record<string, string>) {
+  const url = worker?.UNDERWRIGHT_MCP_URL, token = worker?.UNDERWRIGHT_TOKEN;
+  if (!url || !token) return;
+  const servers = { mcpServers: { underwright: { type: 'http', url, headers: { Authorization: `Bearer ${token}` } } } };
+  writeFileSync(join(dir, '.mcp.json'), JSON.stringify(servers, null, 2));
+  mkdirSync(join(dir, '.claude'), { recursive: true });
+  writeFileSync(join(dir, '.claude', 'settings.local.json'), JSON.stringify({ enabledMcpjsonServers: ['underwright'] }, null, 2));
+  mkdirSync(join(dir, '.cursor'), { recursive: true });
+  writeFileSync(join(dir, '.cursor', 'mcp.json'), JSON.stringify(servers, null, 2));
+  exclude(dir, '.mcp.json', '.claude/', '.cursor/');
+}
+
+/** Isolated launch dir per job: a git worktree on branch `uw/<task>` when the
+ *  workspace is a repo (retries check out the existing branch, preserving the
+ *  prior attempt's commits), else a plain per-job subdir. Returns the launch
+ *  cwd after applying the spec's cwd subdir inside it. */
+export function prepareLaunchDir(root: string, task: NodeTask, cwdSub: string): { cwd: string; branch?: string } {
+  const jobKey = task.id.replace(/[^a-zA-Z0-9_-]/g, '-');
+  const taskId = task.worker?.UNDERWRIGHT_TASK_ID ?? jobKey;
+  const branch = `uw/${taskId}`.replace(/[^\w/-]/g, '-');
+  const dir = join(root, '.uw', 'wt', jobKey);
+  mkdirSync(join(root, '.uw', 'wt'), { recursive: true });
+  let onBranch = false;
+  try {
+    try { git(root, ['worktree', 'add', '--force', dir, '-b', branch, 'HEAD']); }
+    catch { git(root, ['worktree', 'add', '--force', dir, branch]); }   // retry: branch exists — resume it
+    onBranch = true;
+    exclude(root, '.uw/');                                              // keep the parent checkout's status clean
+  } catch { mkdirSync(dir, { recursive: true }); }
+  writeWorkerMcpConfigs(dir, task.worker);
+  return { cwd: containedPath(dir, cwdSub), branch: onBranch ? branch : undefined };
+}
+
 export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig): Plan {
   if (!policy.allowed_task_types.includes(task.type)) throw new PolicyError(`task type ${task.type} not allowed for this node`);
   const schema = schemas[task.type];
@@ -104,7 +155,8 @@ export function planTask(task: NodeTask, policy: NodePolicy, cfg: ExecutorConfig
       // them and the prompt it would split pairs like `--single <prompt>` whose
       // value must stay adjacent to its flag.
       const modelArgs = p.model && p.model_flag ? [p.model_flag, p.model] : [];
-      return { executable: h.executable, args: [...modelArgs, ...(h.args ?? []), p.prompt], cwd: containedPath(workspace(p.workspace_id), p.cwd) };
+      const prep = prepareLaunchDir(workspace(p.workspace_id), task, p.cwd);
+      return { executable: h.executable, args: [...modelArgs, ...(h.args ?? []), p.prompt], cwd: prep.cwd };
     }
     case 'provision': {
       if (!(policy.repository_ids ?? []).includes(p.repository_id)) throw new PolicyError(`repository ${p.repository_id} not approved`);

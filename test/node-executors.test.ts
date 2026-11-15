@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createExecutorRegistry, containedPath, redact, sanitizedEnv, type NodeTask, type NodeTransport } from '../src/node-executors.js';
 
 const dirs: string[] = [];
@@ -135,4 +135,26 @@ it('model flag precedes config args so flag-value pairs stay adjacent to the pro
     task('launch-agent', { workspace_id: 'w1', harness: 'groklike', prompt: 'PROMPT-XYZ', model: 'grok-4.7', model_flag: '-m' }));
   expect(r.status).toBe('done');
   expect(r.result.trim()).toBe('-m grok-4.7 --single PROMPT-XYZ');
+});
+
+describe('prepareLaunchDir', () => {
+  it('creates a git worktree on a task branch and writes worker MCP config', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const { prepareLaunchDir } = await import('../src/node-executors.js');
+    const ws = tmp();
+    execFileSync('git', ['init', '-q', ws]);
+    execFileSync('git', ['-C', ws, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'i']);
+    const t: NodeTask = { id: 'job-abc123', type: 'launch-agent', params: {},
+      worker: { UNDERWRIGHT_TASK_ID: 'gh-42', UNDERWRIGHT_MCP_URL: 'http://x/worker/mcp', UNDERWRIGHT_TOKEN: 'uw_worker_' + 'a'.repeat(64) } };
+    const r = prepareLaunchDir(ws, t, '.');
+    expect(r.branch).toBe('uw/gh-42');
+    expect(r.cwd).toContain('.uw');
+    expect(existsSync(join(r.cwd, '.mcp.json'))).toBe(true);
+    const mcp = JSON.parse((await import('node:fs')).readFileSync(join(r.cwd, '.mcp.json'), 'utf8'));
+    expect(mcp.mcpServers.underwright.url).toBe('http://x/worker/mcp');
+    // worktree gitdir excludes the secret-bearing config files
+    const gd = execFileSync('git', ['-C', r.cwd, 'rev-parse', '--git-dir'], { encoding: 'utf8' }).trim();
+    const excl = (await import('node:fs')).readFileSync(join(resolve(r.cwd, gd), 'info', 'exclude'), 'utf8');
+    expect(excl).toContain('.mcp.json');
+  });
 });
