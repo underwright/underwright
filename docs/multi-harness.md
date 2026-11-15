@@ -485,3 +485,24 @@ need independent review evidence before merge (peer-review policy).
 
 Review tasks route to a different harness than the implementer, preferring
 a stronger tier. Design reviews prefer a high-tier harness.
+
+## Spawned Claude workspace permissions
+
+Before a locally approved `launch-agent` for `claude` or `claude-sdk`, the
+node executor merges the launch directory into `~/.claude.json` with
+`hasTrustDialogAccepted: true`. The legacy agent-job runner does the same
+for its current directory. This also applies when the runner selects the
+Omnigent backend; preparation happens on the runner host.
+
+Startup merges these allows into the workspace's `.claude/settings.json`:
+`mcp__underwright__*`, `Bash`, `Read`, `Write`, `Edit`, `Glob`, and `Grep`.
+Existing settings, other trusted workspaces, and permission `deny`/`ask`
+rules are preserved. Explicit restrictions may therefore still prompt or
+deny a tool. Other harnesses are left unchanged.
+
+Configuration is validated before either file is changed. Invalid JSON or
+an incompatible settings shape fails the job before spawning the harness.
+Writes use atomic replacement and a per-home lock to serialize concurrent
+workers. If a process is killed while holding that lock, inspect running
+workers before removing the stale `~/.claude.json.underwright-lock`
+directory. New JSON files are created with mode `0600`.

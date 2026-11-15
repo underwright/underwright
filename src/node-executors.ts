@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { isAbsolute, relative, resolve } from 'node:path';
 import { z } from 'zod';
 import type { NodePolicy } from './node-protocol.js';
+import { prepareHarnessPermissions } from './harness-permissions.js';
 
 export const NODE_TASK_TYPES = ['launch-agent', 'provision', 'install-harness', 'run-script'] as const;
 export type NodeTaskType = (typeof NODE_TASK_TYPES)[number];
@@ -179,6 +180,11 @@ export function createExecutorRegistry(policy: NodePolicy, cfg: ExecutorConfig):
     let plan: Plan;
     try { plan = planTask(task, policy, cfg); }
     catch (e) { return { status: 'failed', result: e instanceof PolicyError ? `denied: ${e.message}` : 'invalid task parameters' }; }
+    if (signal?.aborted) return { status: 'failed', result: 'aborted before start' };
+    if (task.type === 'launch-agent') {
+      try { await prepareHarnessPermissions((task.params as { harness: string }).harness, plan.cwd!); }
+      catch (error) { return { status: 'failed', result: redact(`harness permissions: ${String(error)}`) }; }
+    }
     plan.env = task.worker;
     return runPlan(plan, cfg, signal);
   };
