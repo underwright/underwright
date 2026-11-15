@@ -44,6 +44,25 @@ switch (cmd) {
     break;
   }
 
+  case "models": {
+    if (args[0] !== "refresh") throw new Error("usage: underwright models refresh [--harness X] [--policy FILE] [--publish]");
+    const { refreshCatalog } = await import("./model-catalog.js");
+    const { loadPolicy } = await import("./policy.js");
+    const policyPath = resolve(flag("policy") ?? process.env.UNDERWRIGHT_POLICY ?? "underwright.policy.json");
+    if (!existsSync(policyPath)) throw new Error(`policy file not found: ${policyPath}`);
+    const diffs = await refreshCatalog(loadPolicy(policyPath).model_routing?.models ?? {}, flag("harness"));
+    console.log(JSON.stringify({ review_required: true, diffs }, null, 2));
+    if (args.includes("--publish")) {
+      const { publishCatalog } = await import("./model-refresh.js");
+      const url = flag("url") ?? process.env.UNDERWRIGHT_MCP_URL;
+      const token = process.env.UNDERWRIGHT_TOKEN;
+      if (!url || !token) throw new Error("--publish requires --url or UNDERWRIGHT_MCP_URL, and UNDERWRIGHT_TOKEN");
+      await publishCatalog(diffs, { url, token, taskId: flag("task"), agentId: flag("agent-id") ?? `model-catalog@${hostname()}`, recipient: flag("recipient") ?? "human" });
+    }
+    if (diffs.some(diff => diff.error)) process.exitCode = 1;
+    break;
+  }
+
   case "init": {
     // underwright init [--remote http://host:8741] [--force] [--no-seed]
     const remote = flag("remote");
@@ -386,6 +405,7 @@ Usage:
   underwright serve              MCP server over stdio (local agent config).
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
+  underwright models refresh    Propose model catalog updates; --harness X, --publish.
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
   underwright node status        Show local credential identity/expiry without secrets.
   underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.

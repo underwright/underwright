@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Underwright model catalog review
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+Unit=underwright-model-catalog.service
+
+[Install]
+WantedBy=timers.target
