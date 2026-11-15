@@ -173,7 +173,7 @@ export async function runNode(opts: {
                 probed.supported_operation_kinds = configSupportedKinds(opts.config);
                 probed.approved_workspace_ids = Object.keys(opts.config.workspaces ?? {});
               }
-              const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size, features: ["launch-model-flag"] };
+              const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size, features: ["launch-model-flag", "worktree-mcp"] };
               capabilities_version += 1;
               const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", sessionAbort.signal);
               if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
