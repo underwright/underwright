@@ -138,6 +138,7 @@ export interface ModelRoutingRule {
 }
 
 export interface Policy {
+  github?: { repo?: string; status_comments?: boolean; digest_hours?: number };
   dod: Record<string, DodRule>;
   enforcement: "observe" | "warn" | "block";
   templates?: TaskTemplate[];

@@ -15,6 +15,7 @@ import {
 } from "./service.js";
 import { runNode } from "./node-run.js";
 import { hostname } from "node:os";
+import { publishGithubStatus } from "./github-status.js";
 import { executeLeasedJob } from "./runner.js";
 import { openStore, serve, serveHttp } from "./server.js";
 import { formatInitResult, initWorkspace } from "./init.js";
@@ -333,13 +334,22 @@ switch (cmd) {
 
   case "github": {
     const sub = args[0];
-    const repo = args[args.indexOf("--repo") + 1];
+    const repo = flag("repo");
     if (!repo) {
-      console.error("usage: underwright github sync|sync-prs|gate|post-evidence|link-pr --repo owner/name [--task ID] [--pr NUM]");
+      console.error("usage: underwright github sync|sync-prs|gate|post-evidence|link-pr|status|digest --repo owner/name [--task ID] [--pr NUM]");
       process.exit(1);
     }
     const store = await openStore(dbPath);
-    if (sub === "sync") {
+    if (sub === "status" || sub === "digest") {
+      try {
+        const result = await publishGithubStatus(store, { repo, mode: sub,
+          dryRun: args.includes("--dry-run"), force: args.includes("--force"),
+          digestHours: Number(flag("hours") ?? 168) });
+        console.log(JSON.stringify(result, null, 2));
+        if (result.errors.length) process.exitCode = 1;
+      } finally { await store.close(); }
+      break;
+    } else if (sub === "sync") {
       const wIdx = args.indexOf("--watch");
       const prsFlag = args.includes("--prs");
       if (wIdx !== -1) {

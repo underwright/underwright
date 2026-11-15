@@ -155,5 +155,7 @@ export interface IStore {
   digest(args?: string | DigestArgs): Awaitable<DigestResult>;
   dashboard(eventsLimit?: number): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;
+  getGithubStatus(repo: string, taskId: string): Awaitable<string | null>;
+  putGithubStatus(repo: string, taskId: string, state: string): Awaitable<void>;
   close(): Awaitable<void>;
 }
