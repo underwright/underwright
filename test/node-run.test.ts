@@ -250,7 +250,7 @@ it.each(["network", "json", "denied"])("backs off and recovers when session esta
       if (sessions <= 2) {
         if (failure === "network") throw new TypeError("fetch failed");
         if (failure === "denied") return Response.json({ error: "session denied" }, { status: 429, headers: { "retry-after": sessions === 1 ? "60" : "2" } });
-        return new Response("temporary upstream failure", { status: 502 });
+        return new Response("temporary upstream failure", { status: 502, headers: { "retry-after": sessions === 1 ? "60" : "2" } });
       }
       return Response.json({ session_id: "recovered", policy: {} });
     }
@@ -269,7 +269,7 @@ it.each(["network", "json", "denied"])("backs off and recovers when session esta
     } });
     expect(sessions).toBe(3);
     expect(waits).toHaveLength(2);
-    if (failure === "denied") expect(waits).toEqual([30000, 2000]);
+    if (failure !== "network") expect(waits).toEqual([30000, 2000]);
     expect(waits.every(ms => ms >= 1000 && ms <= 30000)).toBe(true);
     expect(requests.some(url => url.endsWith("/poll"))).toBe(true);
     expect(requests.every(url => !url.includes("enroll"))).toBe(true);

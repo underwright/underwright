@@ -43,7 +43,15 @@ async function nodeCall(cred: NodeCredential, path: string, body: unknown, metho
     signal: controller.signal,
   });
   if (res.status === 204) return { empty: true, status: 204 };
-  const result = await res.json() as any;
+  let result;
+  try {
+    result = await res.json() as any;
+  } catch (error) {
+    // Gateways may return text/HTML while still asking clients to back off.
+    throw Object.assign(error instanceof Error ? error : new Error("invalid node response"), {
+      retry_after: Number(res.headers.get("retry-after") ?? 0),
+    });
+  }
   return { ...result, status: res.status, retry_after: Number(res.headers.get("retry-after") ?? result.retry_after ?? 0) };
   } finally { clearTimeout(timeout); signal?.removeEventListener('abort', onAbort); }
 }
