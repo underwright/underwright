@@ -1,3 +1,4 @@
+import { githubRaiseSchema } from "./github-issues.js";
 import { createWorkerServer } from './node-worker.js';
 import { handleNodeHttp } from "./node-http.js";
 import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
@@ -69,6 +70,9 @@ Rules of engagement:
     to_agent: z.string().optional().describe("if set, send the formatted digest summary to this agent's mailbox"),
     from_agent: z.string().optional().describe("sender agent id when to_agent is set (default: underwright)"),
   }, async (a) => text(await store.digest(a)));
+
+  server.tool("github_raise", "Create a GitHub issue and import a claimable board task. Requires gh authentication on the server. Re-sync is idempotent; calling raise again creates another issue. On import failure, recover with github sync using the returned issue.", githubRaiseSchema.shape,
+    async a => text(await store.raiseGithubIssue(a)));
 
   server.tool("create_task", "Create a task on the board. Reference the spec and list its acceptance criterion ids.", {
     title: z.string(),

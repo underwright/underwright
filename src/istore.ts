@@ -21,6 +21,22 @@ export interface CreateTaskArgs {
   review_kind?: "code" | "design";
 }
 
+export interface GithubRaiseArgs {
+  repo: string;
+  title: string;
+  body?: string;
+  agent_id?: string;
+  task_extras?: {
+    type?: "feature" | "bug" | "deploy" | "architecture" | "docs" | "tdd" | "triage";
+    severity?: "low" | "normal" | "high" | "critical";
+    estimate?: "S" | "M" | "L";
+    ac_ids?: string[];
+    priority?: number;
+    ownership?: { paths?: string[]; symbols?: string[] };
+    blocked_by?: string[];
+  };
+}
+
 export type AgentBackend = "raw" | "omnigent";
 
 export interface AgentJobSpec {
@@ -106,6 +122,7 @@ export interface IStore {
 
   issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string): Awaitable<any>;
   workerTool(token: string, name: string, args: Record<string, unknown>): Awaitable<any>;
+  raiseGithubIssue(a: GithubRaiseArgs): Awaitable<any>;
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;

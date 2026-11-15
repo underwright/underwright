@@ -333,47 +333,59 @@ switch (cmd) {
 
   case "github": {
     const sub = args[0];
-    const repo = args[args.indexOf("--repo") + 1];
+    const repo = flag("repo");
     if (!repo) {
-      console.error("usage: underwright github sync|sync-prs|gate|post-evidence|link-pr --repo owner/name [--task ID] [--pr NUM]");
+      console.error("usage: underwright github raise|sync|sync-prs|gate|post-evidence|link-pr --repo owner/name [--task ID] [--pr NUM]");
       process.exit(1);
     }
     const store = await openStore(dbPath);
-    if (sub === "sync") {
-      const wIdx = args.indexOf("--watch");
-      const prsFlag = args.includes("--prs");
-      if (wIdx !== -1) {
-        const interval = Number(args[wIdx + 1] ?? 60) * 1000;
-        console.error(`[underwright] watching ${repo} every ${interval / 1000}s`);
-        for (;;) {
-          try {
-            console.error(new Date().toISOString(), JSON.stringify(await syncIssues(store, repo)));
-            if (prsFlag) {
-              console.error(new Date().toISOString(), JSON.stringify(await syncPRs(store, repo)));
+    try {
+      if (sub === "raise") {
+        if (!args[1] || args[1].startsWith("--")) throw new Error("github raise requires a title before flags");
+        const extras = flag("task-extras");
+        if (args.includes("--task-extras") && !extras) throw new Error("--task-extras requires a JSON object");
+        if (args.includes("--body") && flag("body") === undefined) throw new Error("--body requires text");
+        const result = await store.raiseGithubIssue({ repo, title: args[1] ?? "", body: flag("body"), agent_id: flag("by") ?? "cli", task_extras: extras === undefined ? undefined : JSON.parse(extras) });
+        console.log(JSON.stringify(result, null, 2));
+        if (result.error) process.exitCode = 1;
+      } else if (sub === "sync") {
+        const wIdx = args.indexOf("--watch");
+        const prsFlag = args.includes("--prs");
+        if (wIdx !== -1) {
+          const interval = Number(args[wIdx + 1] ?? 60) * 1000;
+          console.error(`[underwright] watching ${repo} every ${interval / 1000}s`);
+          for (;;) {
+            try {
+              console.error(new Date().toISOString(), JSON.stringify(await syncIssues(store, repo)));
+              if (prsFlag) {
+                console.error(new Date().toISOString(), JSON.stringify(await syncPRs(store, repo)));
+              }
+            } catch (e: any) {
+              console.error("sync error:", e.message);
             }
-          } catch (e: any) {
-            console.error("sync error:", e.message);
+            await new Promise((r) => setTimeout(r, interval));
           }
-          await new Promise((r) => setTimeout(r, interval));
         }
+        const issueRes = await syncIssues(store, repo);
+        const prRes = prsFlag ? await syncPRs(store, repo) : null;
+        console.log(JSON.stringify(prsFlag ? { issues: issueRes, prs: prRes } : issueRes, null, 2));
+      } else if (sub === "sync-prs") {
+        console.log(JSON.stringify(await syncPRs(store, repo), null, 2));
+      } else if (sub === "gate" || sub === "check-gate") {
+        const task = args[args.indexOf("--task") + 1];
+        console.log(JSON.stringify(await checkPRGate(store, repo, task), null, 2));
+      } else if (sub === "post-evidence") {
+        const task = args[args.indexOf("--task") + 1];
+        console.log(JSON.stringify(await postEvidenceComment(store, repo, task)));
+      } else if (sub === "link-pr") {
+        const task = args[args.indexOf("--task") + 1];
+        const pr = args[args.indexOf("--pr") + 1];
+        console.log(JSON.stringify(await linkPR(store, task, pr, repo)));
       }
-      const issueRes = await syncIssues(store, repo);
-      const prRes = prsFlag ? await syncPRs(store, repo) : null;
-      console.log(JSON.stringify(prsFlag ? { issues: issueRes, prs: prRes } : issueRes, null, 2));
-    } else if (sub === "sync-prs") {
-      console.log(JSON.stringify(await syncPRs(store, repo), null, 2));
-    } else if (sub === "gate" || sub === "check-gate") {
-      const task = args[args.indexOf("--task") + 1];
-      console.log(JSON.stringify(await checkPRGate(store, repo, task), null, 2));
-    } else if (sub === "post-evidence") {
-      const task = args[args.indexOf("--task") + 1];
-      console.log(JSON.stringify(await postEvidenceComment(store, repo, task)));
-    } else if (sub === "link-pr") {
-      const task = args[args.indexOf("--task") + 1];
-      const pr = args[args.indexOf("--pr") + 1];
-      console.log(JSON.stringify(await linkPR(store, task, pr, repo)));
-    }
-    await store.close();
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    } finally { await store.close(); }
     break;
   }
 
@@ -384,6 +396,7 @@ Usage:
   underwright init               Scaffold AGENTS.md, .mcp.json, policy, .gitignore and the triage task.
                                  [--remote http://host:8741] writes the http client variant; [--force] overwrites.
   underwright serve              MCP server over stdio (local agent config).
+  underwright github raise "TITLE" --repo OWNER/NAME [--body TEXT] [--task-extras JSON] [--by AGENT]
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
   underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
