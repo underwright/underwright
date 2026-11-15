@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { rmSync } from "node:fs";
+import Database from "better-sqlite3";
 import { SqliteStore } from "../src/store.js";
 import { renderDashboard, parseTaskQuery, filterSortTasks, handleDashboardRequest } from "../src/dashboard.js";
 
@@ -95,6 +96,13 @@ describe("task list filters + sorting", () => {
     expect(tasks.map((t) => t.id)).toEqual(copy);
   });
 
+  it("sorts Postgres Date values chronologically rather than by their display strings", () => {
+    const postgresTasks = tasks.map((task) => ({
+      ...task, updated_at: new Date(task.updated_at.replace(" ", "T") + "Z"),
+    }));
+    expect(ids(filterSortTasks(postgresTasks, q({ sort: "updated" })))).toEqual(["task-d", "task-c", "task-b", "task-a", "task-e"]);
+  });
+
   it("renders the GET controls with the token as a hidden field when a task query is supplied", () => {
     const html = renderDashboard({ tasks }, { tasks: { query: q({ status: "open", q: "alpha" }), token: "s3cret" } });
     expect(html).toContain('<form class="inline task-filters" method="get" action="/board">');
@@ -108,6 +116,34 @@ describe("task list filters + sorting", () => {
 });
 
 describe("/board route with filters", () => {
+  it("sorts stored tasks by update time while combining status and text filters", async () => {
+    const older = store.createTask({ title: "Dashboard older", ac_ids: ["a"], type: "triage", estimate: "S", priority: 0 });
+    const newer = store.createTask({ title: "Dashboard newer", ac_ids: ["a"], type: "triage", estimate: "S", priority: 3 });
+    store.createTask({ title: "Unrelated task", ac_ids: ["a"], type: "triage", estimate: "S" });
+    const claimed = store.createTask({ title: "Dashboard claimed", ac_ids: ["a"], type: "triage", estimate: "S" });
+    store.claimTask(claimed.id, "agent-A");
+    // Deterministic fixture dates make update order differ from priority order.
+    const fixture = new Database(DB);
+    try {
+      fixture.prepare("UPDATE tasks SET updated_at=? WHERE id=?").run("2026-01-01 00:00:00", older.id);
+      fixture.prepare("UPDATE tasks SET updated_at=? WHERE id=?").run("2026-01-02 00:00:00", newer.id);
+    } finally {
+      fixture.close();
+    }
+
+    const res = await handleDashboardRequest(
+      store, "GET", new URL("http://x/board?status=open&q=dashboard&sort=updated&token=tok123"), new URLSearchParams(), "tok123",
+    );
+    expect(res.html).toContain("Dashboard older");
+    expect(res.html).toContain("Dashboard newer");
+    expect(res.html!.indexOf("Dashboard newer")).toBeLessThan(res.html!.indexOf("Dashboard older"));
+    expect(res.html).not.toContain("Unrelated task");
+    expect(res.html).not.toContain("Dashboard claimed");
+    expect(res.html).toContain('<option value="updated" selected>');
+    expect(res.html).toContain('<input type="hidden" name="token" value="tok123">');
+    expect(res.html).toContain('href="/board?token=tok123"');
+  });
+
   it("applies status/q/sort and preserves the token through the form", async () => {
     store.createTask({ title: "Dashboard filters work", ac_ids: ["a"], type: "triage", estimate: "S" });
     store.createTask({ title: "Unrelated chore", ac_ids: ["a"], type: "triage", estimate: "S" });

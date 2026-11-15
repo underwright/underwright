@@ -1554,7 +1554,7 @@ export class SqliteStore implements IStore {
   board() {
     const tasks = this.db
       .prepare(
-        `SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
+        `SELECT t.id, t.title, t.status, t.priority, t.updated_at, c.agent_id AS claimed_by, c.lease_expires,
                 (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
          FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`
       )

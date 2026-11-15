@@ -106,11 +106,12 @@ export function filterSortTasks(tasks: any[], query: TaskListQuery): any[] {
   });
   const byPriority = (a: any, b: any) => Number(a.priority ?? 0) - Number(b.priority ?? 0);
   const cmpStr = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const updatedTime = (task: any) => new Date(task.updated_at ?? 0).getTime() || 0;
   switch (query.sort) {
     case "status":
       return out.sort((a, b) => cmpStr(String(a.status ?? ""), String(b.status ?? "")) || byPriority(a, b));
     case "updated":
-      return out.sort((a, b) => cmpStr(String(b.updated_at ?? ""), String(a.updated_at ?? "")) || byPriority(a, b));
+      return out.sort((a, b) => updatedTime(b) - updatedTime(a) || byPriority(a, b));
     case "claimed_by":
       // Unclaimed tasks sort last.
       return out.sort((a, b) => {
