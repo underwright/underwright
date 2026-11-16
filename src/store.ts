@@ -593,7 +593,8 @@ export class SqliteStore implements IStore {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const bounded = boundNodeResult(result);
-    return this.nodeTransaction(s => {
+    let taskForReview: string | null = null;
+    const res = this.nodeTransaction(s => {
       const job = (s.nodeQuery("SELECT * FROM jobs WHERE id=? AND type='node' AND target_node_id=?", [jobId, principal.node_id]))[0];
       if (!job) return nodeError("job lease not owned or expired", 409);
       if (job.lease_token !== leaseToken || job.session_id !== sessionId) return nodeError("job lease not owned or expired", 409);
@@ -628,10 +629,21 @@ export class SqliteStore implements IStore {
           "UPDATE tasks SET status='in_review', updated_at=datetime('now') WHERE id=? AND status='open' RETURNING id",
           [job.task_id],
         );
-        if (moved.length) s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
+        if (moved.length) {
+          s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
+          taskForReview = job.task_id;
+        }
       }
       return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
     });
+    // in_review is the "work delivered, considered for review" transition —
+    // the repo rubric's review gate attaches here (also at complete_task for
+    // repos where workers close tasks directly).
+    if (taskForReview) {
+      const task = this.getTask(taskForReview);
+      if (task) this.spawnRubricReview(task, getRubric(repoFromSpecRef(task.spec_ref)));
+    }
+    return res;
   }
 
   nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {

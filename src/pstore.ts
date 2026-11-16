@@ -632,7 +632,8 @@ export class PgStore implements IStore {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const bounded = boundNodeResult(result);
-    return this.sql.begin(async sql => {
+    let taskForReview: string | null = null;
+    const res = await this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
       const job = (await s.nodeQuery("SELECT * FROM jobs WHERE id=? AND type='node' AND target_node_id=? FOR UPDATE", [jobId, principal.node_id]))[0];
       if (!job) return nodeError("job lease not owned or expired", 409);
@@ -668,10 +669,20 @@ export class PgStore implements IStore {
           "UPDATE tasks SET status='in_review', updated_at=now() WHERE id=? AND status='open' RETURNING id",
           [job.task_id],
         );
-        if (moved.length) await s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
+        if (moved.length) {
+          await s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
+          taskForReview = job.task_id;
+        }
       }
       return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
     });
+    // in_review is the "work delivered, considered for review" transition —
+    // the repo rubric's review gate attaches here.
+    if (taskForReview) {
+      const task = await this.getTask(taskForReview);
+      if (task) await this.spawnRubricReview(task, getRubric(repoFromSpecRef(task.spec_ref)));
+    }
+    return res;
   }
 
   async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
