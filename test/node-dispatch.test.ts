@@ -423,3 +423,28 @@ it("promotes free_fallback harnesses while any ready harness is quota-blocked", 
   expect(j.task_id).toBe(t.id);
   expect(j.agent_id).toBe("devin@box");   // zero-cost promoted ahead of codex
 });
+
+it("self-claim pickup delivers for non-top harnesses, not just claude", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node, READY_CAPS([{ id: "claude" }, { id: "kimi" }]));
+  const t = await store.createTask(task());
+  const c = await store.claimTask(t.id, "kimi@box");
+  expect(c.error).toBeUndefined();
+  // unconstrained, the match would pick claude@box first and the claim check
+  // would reject it — the claim must steer matching to kimi itself
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(t.id);
+  expect(j.agent_id).toBe("kimi@box");
+});
+
+it("heartbeat refreshes capabilities_observed_at for a quiet node", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node);
+  store.db.prepare("UPDATE nodes SET capabilities_observed_at=?, capabilities_version=1").run(new Date(Date.now() - 3600_000).toISOString());
+  const hb = await store.nodeHeartbeat(node.token, node.session.session_id, { capabilities_version: 1 });
+  expect(hb.error).toBeUndefined();
+  const row = store.db.prepare("SELECT capabilities_observed_at FROM nodes WHERE id=?").get(node.node_id ?? hb.node_id) as { capabilities_observed_at: string };
+  expect(Date.parse(row.capabilities_observed_at)).toBeGreaterThan(Date.now() - 60_000);
+});

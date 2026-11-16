@@ -489,12 +489,19 @@ export class SqliteStore implements IStore {
       // still open means the agent couldn't complete it via the board —
       // re-dispatching instantly just reruns the same dead-end session.
       if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND datetime(finished_at) > datetime('now','-5 minutes') LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      // A task claimed to one of this node's agents must be matched AS that
+      // exact agent — constrain the search to its harness. Unconstrained,
+      // harness_order picks claude first and the claim check then rejects the
+      // mismatch, so claims on any non-top harness churned without executing.
+      const matchDispatch = claim
+        ? { ...dispatch, harness_order: [claim.agent_id.split("@")[0]], free_fallback: [] }
+        : dispatch;
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
         capabilitiesJson,
         capabilitiesObservedAt: node.capabilities_observed_at,
-      }, dispatch, routing, Date.parse(now), avoid);
+      }, matchDispatch, routing, Date.parse(now), avoid);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
       // A task claimed to one of this node's agents must run AS that agent —
@@ -608,6 +615,16 @@ export class SqliteStore implements IStore {
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // Liveness doubles as attestation freshness: nodes re-PUT capabilities
+    // only when the inventory changes, so a quiet node's observed_at ages past
+    // NODE_STALE_MS and every launch-agent probe is denied while heartbeats
+    // keep landing. When the heartbeat echoes the stored capabilities_version
+    // the node is asserting that inventory is still current — refresh it.
+    if (typeof body.capabilities_version === "number" && body.capabilities_version > 0)
+      this.nodeQuery(
+        "UPDATE nodes SET capabilities_observed_at=? WHERE id=? AND capabilities_version=?",
+        [now, principal.node_id, body.capabilities_version],
+      );
     this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };

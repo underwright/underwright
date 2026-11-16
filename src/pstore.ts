@@ -541,12 +541,17 @@ export class PgStore implements IStore {
       if ((await this.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
       if ((await this.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND dedupe_key=? AND status IN ('failed','done') AND finished_at > now() - interval '5 minutes' LIMIT 1", [task.id, `dispatch:${task.id}`]))[0]) { skip("recent_failure"); continue; }
+      // A task claimed to one of this node's agents must be matched AS that
+      // exact agent — constrain the search to its harness (see store.ts).
+      const matchDispatch = claim
+        ? { ...dispatch, harness_order: [claim.agent_id.split("@")[0]], free_fallback: [] }
+        : dispatch;
       const result = matchTaskToNode(task, {
         name: node.name ?? nodeId,
         policy,
         capabilitiesJson: capsJson,
         capabilitiesObservedAt: node.capabilities_observed_at,
-      }, dispatch, routing, Date.parse(now), avoid);
+      }, matchDispatch, routing, Date.parse(now), avoid);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
       // A task claimed to one of this node's agents must run AS that agent —
@@ -659,6 +664,14 @@ export class PgStore implements IStore {
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     await this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // Liveness doubles as attestation freshness: when the heartbeat echoes
+    // the stored capabilities_version the node asserts that inventory is
+    // still current — refresh observed_at so quiet nodes don't go stale.
+    if (typeof body.capabilities_version === "number" && body.capabilities_version > 0)
+      await this.nodeQuery(
+        "UPDATE nodes SET capabilities_observed_at=? WHERE id=? AND capabilities_version=?",
+        [now, principal.node_id, body.capabilities_version],
+      );
     await this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = await this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
