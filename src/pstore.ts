@@ -737,6 +737,8 @@ export class PgStore implements IStore {
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_kind TEXT`;
     await sql`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS last_poll_at TEXT`;
     await sql`CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of)`;
+    await sql`CREATE INDEX IF NOT EXISTS events_entity_action ON events(entity_type, entity_id, action)`;
+    await sql`CREATE INDEX IF NOT EXISTS messages_from_created ON messages(from_agent, created_at)`;
     return new PgStore(sql);
   }
 
