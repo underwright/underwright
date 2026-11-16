@@ -412,6 +412,57 @@ it("a successful job clears observed provider exhaustion", async () => {
   expect(j3.agent_id).toBe("claude@box2");   // success proved it alive
 });
 
+it("a launch failure quarantines the harness on that node only — success self-heals", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  const node2 = await enrolled(store, "box2");
+  await attest(store, node);
+  await attest(store, node2);
+  const t1 = await store.createTask(task());
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.agent_id).toBe("claude@box");
+  // config-class failure with no UW-RESULT = harness never ran → quarantine
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed", "error: unknown option --bogus\ncommand not found");
+  const row = store.db.prepare("SELECT state, strikes FROM harness_health WHERE node_id=? AND harness='claude'").get(node.node_id) as any;
+  expect(row?.state).toBe("broken");
+  expect(row?.strikes).toBe(1);
+  // node-local: box2's claude is unaffected
+  const t2 = await store.createTask(task());
+  const j2 = await store.pollNodeJob(node2.token, node2.session.session_id, 0);
+  expect(j2.agent_id).toBe("claude@box2");
+  // on box, claude is quarantined → next poll routes to codex
+  const t3 = await store.createTask(task());
+  const j3 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j3.task_id).toBe(t3.id);
+  expect(j3.agent_id).toBe("codex@box");
+  await store.finishNodeJob(node.token, node.session.session_id, j3.id, j3.lease_token, "done", "ok");
+  // retry window expiry makes claude eligible again — the probe job.
+  // (the 15-min dispatch-failure backoff must lapse too — backdate j1)
+  const t4 = await store.createTask(task());
+  store.db.prepare("UPDATE jobs SET finished_at=? WHERE id=?")
+    .run(new Date(Date.now() - 20 * 60_000).toISOString(), j1.id);
+  store.db.prepare("UPDATE harness_health SET retry_at=? WHERE node_id=? AND harness='claude'")
+    .run(new Date(Date.now() - 1000).toISOString(), node.node_id);
+  const j4 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j4.agent_id).toBe("claude@box");   // back on whichever open task
+  // success clears the quarantine row — self-healed
+  await store.finishNodeJob(node.token, node.session.session_id, j4.id, j4.lease_token, "done", "ok");
+  const gone = store.db.prepare("SELECT COUNT(*) c FROM harness_health WHERE node_id=? AND harness='claude'").get(node.node_id) as any;
+  expect(gone.c).toBe(0);
+});
+
+it("a failed job that emitted UW-RESULT is task-level, not harness breakage", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store, "box");
+  await attest(store, node);
+  await store.createTask(task());
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "failed",
+    "command not found\nUW-RESULT branch=uw/x head=abc pr=none tests=fail");
+  const row = store.db.prepare("SELECT COUNT(*) c FROM harness_health WHERE node_id=?").get(node.node_id) as any;
+  expect(row.c).toBe(0);
+});
+
 it("promotes free_fallback harnesses while any ready harness is quota-blocked", async () => {
   const { store } = fixture();
   const node = await enrolled(store, "box");

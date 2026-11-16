@@ -303,4 +303,19 @@ CREATE TABLE IF NOT EXISTS provider_quota (
   source_job_id TEXT,
   reason TEXT
 );
+/** Node-local harness breakage observed from job results — keyed (node,
+ *  harness) because a broken install/auth is the node's problem, not the
+ *  account's. state='broken' with retry_at = next permitted attempt
+ *  (escalating backoff); a successful job clears the row — self-healing. */
+CREATE TABLE IF NOT EXISTS harness_health (
+  node_id TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  state TEXT NOT NULL,
+  strikes INTEGER NOT NULL DEFAULT 0,
+  retry_at TEXT,
+  last_error TEXT,
+  source_job_id TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (node_id, harness)
+);
 `;

@@ -536,9 +536,11 @@ export class PgStore implements IStore {
     meta.eligible = candidates.length;
     const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
     const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json || "{}") : node.policy_json;
+    const observed = await this.observedExhaustedProviders();
+    for (const [h, st] of await this.observedBrokenHarnesses(nodeId)) observed.set(h, st);
     const capsJson = mergeObservedQuota(
       typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {}),
-      await this.observedExhaustedProviders(),
+      observed,
     );
     const now = new Date().toISOString();
     const avoid = new Set(
@@ -657,7 +659,7 @@ export class PgStore implements IStore {
       );
       if (!updated.length) return nodeError("job lease not owned or expired", 409);
       await s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
-      await s.observeProviderOutcome(jobId, job.agent_id, status, bounded);
+      await s.observeProviderOutcome(jobId, job.agent_id, status, bounded, principal.node_id);
       if (job.task_id) await s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
       // A dispatch-formed job that reports done on a still-open task could not
       // close it (worker jobs hold no control-plane credential). Leaving the
@@ -1335,24 +1337,40 @@ export class PgStore implements IStore {
    *  Quota is per-account: a rate-limit or billing failure marks the provider
    *  exhausted fleet-wide until resets_at (parsed or a class default);
    *  a successful job clears the mark — the provider proved itself alive. */
-  private async observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null) {
+  private async observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null, nodeId?: string) {
     const provider = agentId?.split("@")[0];
     if (!provider) return;
     if (status === "done") {
       await this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
+      if (nodeId) await this.nodeQuery("DELETE FROM harness_health WHERE node_id=? AND harness=?", [nodeId, provider]);
       return;
     }
     if (status !== "failed") return;
     const kind = classifyFailure(result);
-    if (kind !== "rate_limit" && kind !== "billing") return;
-    const resetsAt = parseResetAt(result ?? "")
-      ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
+    if (kind === "rate_limit" || kind === "billing") {
+      const resetsAt = parseResetAt(result ?? "")
+        ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
+      await this.nodeQuery(
+        `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
+         ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
+           observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
+        [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+      );
+      return;
+    }
+    if (kind !== "auth" && kind !== "config") return;
+    if (!nodeId || /UW-RESULT/.test(result ?? "")) return;
+    const prior = ((await this.nodeQuery("SELECT strikes FROM harness_health WHERE node_id=? AND harness=?", [nodeId, provider])) as { strikes: number }[])[0];
+    const strikes = (prior?.strikes ?? 0) + 1;
+    const retryAt = new Date(Date.now() + Math.min(15 * 60_000 * Math.pow(2, Math.min(strikes - 1, 4)), 4 * 3_600_000)).toISOString();
+    const lastError = (result ?? "").split("\n").map(l => l.trim()).filter(Boolean).pop()?.slice(0, 200) ?? "";
     await this.nodeQuery(
-      `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
-       ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
-         observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
-      [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+      `INSERT INTO harness_health(node_id,harness,state,strikes,retry_at,last_error,source_job_id,updated_at) VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(node_id,harness) DO UPDATE SET state='broken', strikes=excluded.strikes, retry_at=excluded.retry_at,
+         last_error=excluded.last_error, source_job_id=excluded.source_job_id, updated_at=excluded.updated_at`,
+      [nodeId, provider, "broken", strikes, retryAt, lastError, jobId, new Date().toISOString()],
     );
+    await this.log("harness", provider, "broken", "health-monitor", { node_id: nodeId, strikes, retry_at: retryAt, kind, job_id: jobId });
   }
 
   /** Providers currently observed-exhausted (reset window not yet passed). */
@@ -1362,6 +1380,20 @@ export class PgStore implements IStore {
     for (const r of rows) {
       if (r.resets_at && Date.parse(String(r.resets_at)) <= now) continue;
       m.set(r.provider, { state: "exhausted", resets_at: r.resets_at ? String(r.resets_at) : null });
+    }
+    return m;
+  }
+
+  /** Harnesses quarantined on this node whose retry window hasn't passed.
+   *  Expired windows drop out — the next match is the self-heal probe. */
+  private async observedBrokenHarnesses(nodeId: string, now = Date.now()): Promise<Map<string, { state: string; resets_at: string | null }>> {
+    const rows = await this.nodeQuery(
+      "SELECT harness, retry_at FROM harness_health WHERE node_id=? AND state='broken'", [nodeId],
+    ) as { harness: string; retry_at: string | null }[];
+    const m = new Map<string, { state: string; resets_at: string | null }>();
+    for (const r of rows) {
+      if (r.retry_at && Date.parse(String(r.retry_at)) <= now) continue;
+      m.set(r.harness, { state: "exhausted", resets_at: r.retry_at ? String(r.retry_at) : null });
     }
     return m;
   }

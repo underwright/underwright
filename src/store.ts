@@ -43,25 +43,45 @@ export class SqliteStore implements IStore {
   /** Provider-level quota exhaustion observed from a finished job's result.
    *  Quota is per-account: a rate-limit or billing failure marks the provider
    *  exhausted fleet-wide until resets_at (parsed or a class default);
-   *  a successful job clears the mark — the provider proved itself alive. */
-  private observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null) {
+   *  a successful job clears the mark — the provider proved itself alive.
+   *  Node-local breakage (auth/config: the harness never ran) quarantines
+   *  the harness on THIS node with escalating retry_at backoff — a real
+   *  session emits UW-RESULT, so its absence marks infra failure, not a
+   *  task-level loss that happens to carry trigger words. */
+  private observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null, nodeId?: string) {
     const provider = agentId?.split("@")[0];
     if (!provider) return;
     if (status === "done") {
       this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
+      if (nodeId) this.nodeQuery("DELETE FROM harness_health WHERE node_id=? AND harness=?", [nodeId, provider]);
       return;
     }
     if (status !== "failed") return;
     const kind = classifyFailure(result);
-    if (kind !== "rate_limit" && kind !== "billing") return;
-    const resetsAt = parseResetAt(result ?? "")
-      ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
+    if (kind === "rate_limit" || kind === "billing") {
+      const resetsAt = parseResetAt(result ?? "")
+        ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
+      this.nodeQuery(
+        `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
+         ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
+           observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
+        [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+      );
+      return;
+    }
+    if (kind !== "auth" && kind !== "config") return;
+    if (!nodeId || /UW-RESULT/.test(result ?? "")) return;
+    const prior = (this.nodeQuery("SELECT strikes FROM harness_health WHERE node_id=? AND harness=?", [nodeId, provider]) as { strikes: number }[])[0];
+    const strikes = (prior?.strikes ?? 0) + 1;
+    const retryAt = new Date(Date.now() + Math.min(15 * 60_000 * Math.pow(2, Math.min(strikes - 1, 4)), 4 * 3_600_000)).toISOString();
+    const lastError = (result ?? "").split("\n").map(l => l.trim()).filter(Boolean).pop()?.slice(0, 200) ?? "";
     this.nodeQuery(
-      `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
-       ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
-         observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
-      [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+      `INSERT INTO harness_health(node_id,harness,state,strikes,retry_at,last_error,source_job_id,updated_at) VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(node_id,harness) DO UPDATE SET state='broken', strikes=excluded.strikes, retry_at=excluded.retry_at,
+         last_error=excluded.last_error, source_job_id=excluded.source_job_id, updated_at=excluded.updated_at`,
+      [nodeId, provider, "broken", strikes, retryAt, lastError, jobId, new Date().toISOString()],
     );
+    this.log("harness", provider, "broken", "health-monitor", { node_id: nodeId, strikes, retry_at: retryAt, kind, job_id: jobId });
   }
 
   /** Providers currently observed-exhausted (reset window not yet passed). */
@@ -71,6 +91,21 @@ export class SqliteStore implements IStore {
     for (const r of rows) {
       if (r.resets_at && Date.parse(r.resets_at) <= now) continue;
       m.set(r.provider, { state: "exhausted", resets_at: r.resets_at });
+    }
+    return m;
+  }
+
+  /** Harnesses quarantined on this node whose retry window hasn't passed.
+   *  Expired windows drop out — the next match is the self-heal probe:
+   *  success clears the row, another failure re-arms a longer backoff. */
+  private observedBrokenHarnesses(nodeId: string, now = Date.now()): Map<string, { state: string; resets_at: string | null }> {
+    const rows = this.nodeQuery(
+      "SELECT harness, retry_at FROM harness_health WHERE node_id=? AND state='broken'", [nodeId],
+    ) as { harness: string; retry_at: string | null }[];
+    const m = new Map<string, { state: string; resets_at: string | null }>();
+    for (const r of rows) {
+      if (r.retry_at && Date.parse(r.retry_at) <= now) continue;
+      m.set(r.harness, { state: "exhausted", resets_at: r.retry_at });
     }
     return m;
   }
@@ -490,7 +525,10 @@ export class SqliteStore implements IStore {
     // Provider-level exhaustion observed from job results folds into the
     // node's attested caps — quotaAllows then blocks it on every node, and
     // dispatch.free_fallback promotes zero-cost harnesses while quota is scarce.
-    const capabilitiesJson = mergeObservedQuota(node.capabilities_json, this.observedExhaustedProviders());
+    // Node-local harness breakage (harness_health) overlays the same way.
+    const observed = this.observedExhaustedProviders();
+    for (const [h, st] of this.observedBrokenHarnesses(nodeId)) observed.set(h, st);
+    const capabilitiesJson = mergeObservedQuota(node.capabilities_json, observed);
     // Per-(node,harness) backoff: dispatch-formed failures in the last 15 min
     // park that harness — attested quota/readiness can lie (out-of-credits,
     // bad node-local config) and only execution reveals it.
@@ -617,7 +655,7 @@ export class SqliteStore implements IStore {
       );
       if (!updated.length) return nodeError("job lease not owned or expired", 409);
       s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
-      s.observeProviderOutcome(jobId, job.agent_id, status, bounded);
+      s.observeProviderOutcome(jobId, job.agent_id, status, bounded, principal.node_id);
       if (job.task_id) s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
       // A dispatch-formed job that reports done on a still-open task could not
       // close it (worker jobs hold no control-plane credential). Leaving the
