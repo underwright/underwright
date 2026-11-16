@@ -255,7 +255,8 @@
     "default_workspace": "underwright",
     "workspaces": {
       "underwright/underwright": "underwright",
-      "alandennis1024/kraftina": "kraftina"
+      "alandennis1024/kraftina": "kraftina",
+      "covasant/Aura": "auraa_0"
     },
     "harness_order": [
       "claude",
