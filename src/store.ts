@@ -23,12 +23,14 @@ export class SqliteStore implements IStore {
   private lastDispatchAttempt = new Map<string, number>();
   private lastPollWrite = new Map<string, number>();
   private lastJobSweep = 0;
+  private stmtCache = new Map<string, Database.Statement>();
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
     return this.db.transaction(() => work(this))();
   }
   private nodeQuery(query: string, params: any[] = []): any[] {
-    const statement = this.db.prepare(query);
+    let statement = this.stmtCache.get(query);
+    if (!statement) { statement = this.db.prepare(query); this.stmtCache.set(query, statement); }
     if (statement.reader) return statement.all(...params);
     statement.run(...params);
     return [];
