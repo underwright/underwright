@@ -1,0 +1,42 @@
+// Review diagnostics: assertions confirm the reported defects, not desired behavior.
+import { getModelRouting, tierForTask, loadPolicy } from '../../dist/policy.js';
+import { matchTaskToNode } from '../../dist/node-dispatch.js';
+import { SqliteStore } from '../../dist/store.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import assert from 'node:assert/strict';
+const routing=getModelRouting(loadPolicy());
+const task={id:'probe',title:'small task',type:'feature',estimate:'S',ac_ids:'["a"]',spec_ref:null,priority:2,updated_at:'2026-11-16'};
+const node={name:'probe-node',policy:{allowed_task_types:['launch-agent'],workspace_ids:['w'],repository_ids:[]},capabilitiesObservedAt:new Date().toISOString(),capabilitiesJson:JSON.stringify({features:['launch-model-flag'],harnesses:[{id:'claude',installed:true,auth_status:'ready'}]})};
+const dispatch={enabled:true,default_workspace:'w',workspaces:{},harness_order:['claude']};
+const disabled=matchTaskToNode(task,node,dispatch,{...routing,enabled:false,flags:{claude:'--model'}});
+assert.equal(disabled.match.model,'haiku');
+assert.equal(disabled.match.model_flag,'--model');
+console.log('CONFIRMED disabled routing still emits model:',JSON.stringify({tier:disabled.match.tier,model:disabled.match.model,model_flag:disabled.match.model_flag}));
+const live=matchTaskToNode(task,node,dispatch,routing);
+assert.equal(live.match.model,'haiku');
+assert.equal(live.match.model_flag,undefined);
+console.log('CONFIRMED live Claude selection lacks required executor flag:',JSON.stringify({tier:live.match.tier,model:live.match.model,model_flag:live.match.model_flag??null}));
+const pathTier=tierForTask({type:'feature',estimate:'S',ac_count:1,paths:['src/store.ts']},routing);
+assert.equal(pathTier,'light');
+console.log('CONFIRMED core-store path rule ignored:',pathTier);
+const dir=mkdtempSync(join(tmpdir(),'uw-review-escalation-'));
+writeFileSync(join(dir,'policy.json'),JSON.stringify({dod:{},enforcement:'observe',dispatcher:{enabled:false}}));
+process.env.UNDERWRIGHT_POLICY=join(dir,'policy.json');
+const store=new SqliteStore(join(dir,'store.db'));
+try {
+ const t=store.createTask({title:'needs stronger model',type:'feature',estimate:'S',ac_ids:['a']});
+ assert.ok(!store.claimTask(t.id,'claude@probe').error);
+ store.postArtifact({task_id:t.id,agent_id:'claude@probe',kind:'blocked',content:'needs-stronger-model: requires stronger reasoning'});
+ assert.ok(!store.releaseTask(t.id,'claude@probe').error);
+ const after=store.getTask(t.id);
+ const tier=tierForTask({type:after.type,estimate:after.estimate,ac_count:after.ac_ids.length},routing);
+ assert.equal(after.status,'open');
+ assert.equal(tier,'light');
+ console.log('CONFIRMED escalation marker plus release leaves next routing tier unchanged:',JSON.stringify({status:after.status,tier,artifacts:after.artifacts.length}));
+ const job=store.submitJob({task_id:t.id,agent_id:'claude@probe',type:'agent',agent:{executable:'claude',args:['-p'],prompt:'task'}});
+ const agentSpec=JSON.parse(store.getJob(job.id).agent_spec);
+ assert.deepEqual(agentSpec.args,['-p']);
+ console.log('CONFIRMED legacy submitJob stores unmodified agent spec:',JSON.stringify(agentSpec));
+} finally {store.close();rmSync(dir,{recursive:true,force:true});}
