@@ -11,6 +11,10 @@ function nodeBearer(req: IncomingMessage) {
 export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: ServerResponse, adminConfigured: boolean) {
   const reply = (status: number, value?: unknown) => {
     if (res.destroyed || res.headersSent) return;
+    if (status >= 400) {
+      const msg = value && typeof value === 'object' && 'error' in value ? String((value as { error: unknown }).error) : '';
+      console.warn(`[underwright] node request rejected: ${req.method} ${req.url} -> ${status} ${msg}`.slice(0, 200));
+    }
     const headers: Record<string, string> = { 'content-type': 'application/json', 'cache-control': 'no-store' };
     if (status === 429) headers['retry-after'] = '3';
     if (value === undefined) { res.writeHead(status, headers).end(); return; }
