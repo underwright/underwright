@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -20,6 +20,7 @@ import { PgStore } from "./pstore.js";
 
 export class SqliteStore implements IStore {
   private db: Database.Database;
+  private lastDispatchAttempt = new Map<string, number>();
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
     return this.db.transaction(() => work(this))();
@@ -397,9 +398,16 @@ export class SqliteStore implements IStore {
       // session's already-running job (idempotent re-delivery after restart).
       const queuedSql = "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1";
       let queued = running.length < maxConcurrency ? (s.nodeQuery(queuedSql, [principal.node_id]))[0] : undefined;
-      if (!queued && running.length < maxConcurrency) {
+      // Throttle pull-through matching: the poll retry loop calls us every
+      // ~50ms and dispatchToNode costs dozens of synchronous queries — under
+      // idle polling it saturated the event loop and starved /health, MCP and
+      // lease renewals. Env override is read per call so tests can tune it.
+      const throttleMs = Number(process.env.UNDERWRIGHT_DISPATCH_THROTTLE_MS ?? NODE_DISPATCH_THROTTLE_MS);
+      const lastMatch = this.lastDispatchAttempt.get(principal.node_id) ?? 0;
+      if (!queued && running.length < maxConcurrency && Date.now() - lastMatch >= throttleMs) {
         // gh-126 pull-through dispatch: no pre-queued job — match eligible
         // board tasks to this node's live capabilities and form one.
+        this.lastDispatchAttempt.set(principal.node_id, Date.now());
         const meta = this.dispatchToNode(s, principal.node_id, node, now);
         if (meta.formed) queued = (s.nodeQuery(queuedSql, [principal.node_id]))[0];
         if (!queued) {

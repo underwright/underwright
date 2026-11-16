@@ -8,6 +8,8 @@ import { join } from "node:path";
 // gh-126: pull-through dispatch — poll forms launch-agent jobs from eligible
 // board tasks when no queued job exists for the node.
 
+process.env.UNDERWRIGHT_DISPATCH_THROTTLE_MS = "0"; // tests poll back-to-back
+
 const cleanup: (() => void)[] = [];
 const savedPolicy = process.env.UNDERWRIGHT_POLICY;
 beforeEach(() => {

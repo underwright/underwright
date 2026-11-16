@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
@@ -124,6 +124,7 @@ const EVIDENCE_KINDS = ["test_run","ci_check","review","coverage","deploy","cont
  *  (managed Postgres) unchanged: point DATABASE_URL at the instance. */
 export class PgStore implements IStore {
   private sql: postgres.Sql;
+  private lastDispatchAttempt = new Map<string, number>();
 
   private async nodeTransaction(work: (s: PgStore) => Promise<any>): Promise<any> {
     return this.sql.begin(async sql => {
@@ -457,8 +458,13 @@ export class PgStore implements IStore {
       const queuedSql =
         "SELECT * FROM jobs WHERE type='node' AND target_node_id=? AND status='queued' ORDER BY created_at,id LIMIT 1 FOR UPDATE SKIP LOCKED";
       let queued = running.length < maxConcurrency ? (await s.nodeQuery(queuedSql, [principal.node_id]))[0] : undefined;
-      if (!queued && running.length < maxConcurrency) {
+      // Throttle pull-through matching (same reason as SqliteStore): the ~50ms
+      // poll retry loop must not run full dispatchToNode every iteration.
+      const throttleMs = Number(process.env.UNDERWRIGHT_DISPATCH_THROTTLE_MS ?? NODE_DISPATCH_THROTTLE_MS);
+      const lastMatch = this.lastDispatchAttempt.get(principal.node_id) ?? 0;
+      if (!queued && running.length < maxConcurrency && Date.now() - lastMatch >= throttleMs) {
         // gh-126 pull-through dispatch: match eligible tasks to this node.
+        this.lastDispatchAttempt.set(principal.node_id, Date.now());
         const meta = await s.dispatchToNode(principal.node_id, node);
         if (meta.formed) queued = (await s.nodeQuery(queuedSql, [principal.node_id]))[0];
         if (!queued) {

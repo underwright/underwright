@@ -177,6 +177,11 @@ export async function runNode(opts: {
               capabilities_version += 1;
               const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", sessionAbort.signal);
               if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
+              // Surface silent attestation failures — a schema/policy rejection
+              // otherwise retries invisibly forever while heartbeats keep the
+              // node looking healthy (the 19h stale-capability incident).
+              if (result.error || (result.status ?? 0) >= 400)
+                console.error(`[underwright-node] capabilities PUT v${capabilities_version} rejected (${result.status ?? "?"}): ${result.error ?? "unknown"}`);
             } catch (error) { if (sessionAbort.signal.aborted) return; await backoff(error, sessionAbort.signal); }
             await sleep(capabilitiesMs, sessionAbort.signal).catch(() => undefined);
           }

@@ -68,6 +68,11 @@ export const nodeSecret = () => randomBytes(32).toString('hex');
 export const nodeExpiry = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
 export const NODE_ONLINE_MS = 45_000;
 export const NODE_STALE_MS = 120_000;
+/** Pull-through matching runs at most once per node per interval. The 50ms
+ *  poll retry loop is cheap (queued-job lookup only); full dispatchToNode
+ *  matching — dozens of synchronous queries + JSON parses — is throttled.
+ *  Event-loop starvation otherwise delays /health, MCP, and lease renewals. */
+export const NODE_DISPATCH_THROTTLE_MS = 3_000;
 export const nodeHeartbeatSchema = z.object({
   session_id: z.string().min(1).max(64),
   capabilities_version: z.number().int().nonnegative().optional(),
