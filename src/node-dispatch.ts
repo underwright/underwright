@@ -110,6 +110,9 @@ export interface LaunchSpecInput {
   harness: string;
   model?: string;
   model_flag?: string;
+  /** Repo-rubric text appended after the fleet prompt — the bar the
+   *  implementer is held to on this repo (policy rubrics.<repo>.prompt). */
+  promptExtra?: string;
 }
 
 /** Build the launch-agent node spec the executor consumes. */
@@ -118,7 +121,8 @@ export function buildLaunchSpec(input: LaunchSpecInput) {
     .replaceAll("{{agent_id}}", input.agentId)
     .replaceAll("{{host}}", input.host)
     .replaceAll("{{task_id}}", input.taskId)
-    .replaceAll("{{job_id}}", input.jobId);
+    .replaceAll("{{job_id}}", input.jobId)
+    + (input.promptExtra ? ` ${input.promptExtra}` : "");
   return {
     version: 1 as const,
     kind: "launch-agent" as const,

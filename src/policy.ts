@@ -12,6 +12,44 @@ export interface DodRule {
   min_coverage?: CoverageRequirement;  // number = line %, or per-metric thresholds
 }
 
+/** A programmatic check over reported evidence: some evidence row of `kind`
+ *  must carry `pattern` (regex) in `field` (default: command or output).
+ *  severity "warn" annotates instead of blocking — for requirements that are
+ *  real but admit exceptions a machine cannot judge (e.g. script feasibility). */
+export interface EvidenceMatch {
+  kind: string;
+  pattern: string;
+  field?: "output" | "command" | "any";
+  severity?: "block" | "warn";
+  desc?: string;
+}
+
+/** Repo-scoped DoD additions. `types` limits which task types the rule applies
+ *  to (default: all). Requirements stack additively on the type-scoped dod. */
+export interface RubricDodRule extends DodRule {
+  types?: string[];
+  evidence_match?: EvidenceMatch[];
+}
+
+/** Per-repo rubric (policy `rubrics` map, keyed "owner/name", "*" fallback):
+ *  prompt — appended to the launch prompt so the implementer builds to the bar;
+ *  dod — merged over the type-scoped dod rule at completeTask;
+ *  review.auto — completion spawns a linked review task (different-harness
+ *  routed) carrying `checklist`; enforcement — overrides policy.enforcement. */
+export interface RubricRule {
+  prompt?: string;
+  dod?: RubricDodRule;
+  review?: { auto?: boolean; types?: string[]; checklist?: string };
+  enforcement?: "observe" | "warn" | "block";
+}
+
+/** Resolve the rubric for a repo slug (owner/name) — repo wins over "*". */
+export function getRubric(repo: string | null, policy: Policy = loadPolicy()): RubricRule | undefined {
+  const table = policy.rubrics;
+  if (!table || typeof table !== "object") return undefined;
+  return (repo ? table[repo] : undefined) ?? table["*"];
+}
+
 export interface AutoMergeRule {
   enabled?: boolean;
   method?: "merge" | "squash" | "rebase";
@@ -153,6 +191,9 @@ export interface Policy {
   notifications?: string | HumanNotifyRule;
   notify?: string | HumanNotifyRule;
   webhook_url?: string;
+  /** Per-repo rubrics keyed "owner/name" (resolved from task.spec_ref), "*"
+   *  fallback. Prompt injection + DoD merge + auto-review — see RubricRule. */
+  rubrics?: Record<string, RubricRule>;
   /** Per-agent preferred harness+backend for agent jobs, plus the omnigent
    *  coverage table. Exact agent_id wins over "*". */
   harness_matrix?: HarnessMatrixRule;
@@ -339,11 +380,18 @@ export function evaluateDoD(args: {
   artifacts: any[];
   claimAgent?: string | null;
   policy: Policy;
+  rubric?: RubricRule;
 }) {
-  const { task, evidence, artifacts, claimAgent, policy } = args;
+  const { task, evidence, artifacts, claimAgent, policy, rubric } = args;
   const rule = policy.dod[task.type] ?? policy.dod["default"] ?? {};
+  // Repo rubric requirements are evaluated separately: rubric.enforcement
+  // governs rubric-added requirements only — a strict repo cannot change how
+  // the shared base rules behave, and `dod.types` scopes the additions
+  // (a docs task owes no test_run).
+  const rdod = rubric?.dod && (!rubric.dod.types || rubric.dod.types.includes(task.type)) ? rubric.dod : undefined;
   const missing: string[] = [];
   const warnings: string[] = [];
+  const rubricMissing: string[] = [];
 
   const kinds = new Set(evidence.map((e) => e.kind));
   for (const k of rule.evidence ?? []) {
@@ -389,9 +437,63 @@ export function evaluateDoD(args: {
     }
   }
 
-  const ok = missing.length === 0;
+  // Rubric additions — evaluated under rubric.enforcement, stacked on the
+  // base rule's verdict. severity:"warn" checks annotate, never block.
+  if (rdod) {
+    for (const k of rdod.evidence ?? []) {
+      if (!kinds.has(k)) rubricMissing.push(`missing evidence kind: ${k} (rubric)`);
+    }
+    for (const k of rdod.artifacts ?? []) {
+      if (!artKinds.has(k)) rubricMissing.push(`missing artifact kind: ${k} (rubric)`);
+    }
+    if (rdod.tdd) {
+      const fails = evidence.filter((e) => e.kind === "test_run" && e.exit_code !== 0);
+      const passes = evidence.filter((e) => e.kind === "test_run" && e.exit_code === 0);
+      if (!fails.length || !passes.length) {
+        rubricMissing.push("tdd requires a failing and a passing test_run (rubric)");
+      } else if (Math.min(...passes.map((e: any) => Date.parse(e.created_at))) <
+                 Math.max(...fails.map((e: any) => Date.parse(e.created_at)))) {
+        rubricMissing.push("tdd ordering violated: passing test precedes a failing one (rubric)");
+      }
+    }
+    if (rdod.min_coverage !== undefined) {
+      const summaries = evidence
+        .filter((e) => e.kind === "coverage")
+        .map((e) => (e.coverage as CoverageSummary | undefined) ?? parseCoverage(String(e.output ?? "")))
+        .filter((s): s is CoverageSummary => !!s);
+      if (!summaries.length) {
+        rubricMissing.push("missing parseable coverage evidence for min_coverage (rubric)");
+      } else {
+        rubricMissing.push(...checkCoverage(summaries[summaries.length - 1], rdod.min_coverage).map(m => `${m} (rubric)`));
+      }
+    }
+    // Programmatic checks: a matching evidence row must exist in the record —
+    // proof from what was reported, not the agent's claim.
+    for (const m of rdod.evidence_match ?? []) {
+      let re: RegExp;
+      try { re = new RegExp(m.pattern); } catch {
+        warnings.push(`rubric evidence_match has invalid pattern: ${m.pattern}`);
+        continue;
+      }
+      const field = m.field ?? "any";
+      const hit = evidence.some((e) => e.kind === m.kind &&
+        ((field !== "command" && re.test(String(e.output ?? ""))) ||
+         (field !== "output" && re.test(String(e.command ?? "")))));
+      if (!hit) {
+        const msg = m.desc ?? `missing ${m.kind} evidence matching /${m.pattern}/`;
+        if (m.severity === "warn") warnings.push(msg); else rubricMissing.push(msg);
+      }
+    }
+  }
+
+  const rubricEnforcement = rubric?.enforcement ?? policy.enforcement;
+  const rubricBlocks = rubricMissing.length > 0 && rubricEnforcement === "block";
+  if (rubricMissing.length && rubricEnforcement !== "block") warnings.push(...rubricMissing);
+  const missing2 = [...missing, ...rubricMissing];
+  const ok = missing2.length === 0;
   if (!ok && policy.enforcement === "observe") warnings.push(...missing);
-  return { ok: ok || policy.enforcement !== "block", blocked: !ok && policy.enforcement === "block", missing, warnings };
+  const blocked = (missing.length > 0 && policy.enforcement === "block") || rubricBlocks;
+  return { ok: ok || !blocked, blocked, missing: missing2, warnings };
 }
 
 // Task templates: PRD/spec/scaffold prompts that seed a task's structure —

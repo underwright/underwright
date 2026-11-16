@@ -3,8 +3,8 @@ import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -531,9 +531,11 @@ export class SqliteStore implements IStore {
       // harness would be denied and burn the attempt.
       if (claim && m.agent_id !== claim.agent_id) { skip("claimed"); continue; }
       const id = `job-${randomUUID().slice(0, 8)}`;
+      const rubric = getRubric(repoFromSpecRef(task.spec_ref));
       const spec = buildLaunchSpec({
         taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
         workspace: m.workspace, harness: m.harness, model: m.model, model_flag: m.model_flag,
+        promptExtra: rubric?.prompt,
       });
       try {
         s.nodeQuery(
@@ -1250,9 +1252,10 @@ export class SqliteStore implements IStore {
     }
 
     const policy = loadPolicy();
+    const rubric = getRubric(repoFromSpecRef(task.spec_ref), policy);
     const dod = evaluateDoD({
       task, evidence: rows, artifacts: this.listArtifacts(taskId),
-      claimAgent: claim?.agent_id ?? agentId, policy,
+      claimAgent: claim?.agent_id ?? agentId, policy, rubric,
     });
     if (dod.blocked) {
       return { error: `definition of done not met (${task.type}): ${dod.missing.join("; ")}` };
@@ -1263,6 +1266,7 @@ export class SqliteStore implements IStore {
     this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     this.notifyWatchers(taskId, `task ${taskId} → done`);
     this.unblockDependents(taskId, agentId);
+    this.spawnRubricReview(task, rubric);
     const dispatched = scoped ? undefined : this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
@@ -1275,6 +1279,28 @@ export class SqliteStore implements IStore {
         agent_id: agentId,
       },
     };
+  }
+
+  /** gh-155: repo rubric review.auto — completing a task spawns a linked
+   *  code-review task so a different-harness agent checks the PR against the
+   *  repo's rubric. Guards: no review-of-review, no duplicate open review. */
+  private spawnRubricReview(task: any, rubric: RubricRule | undefined) {
+    const review = rubric?.review;
+    if (!review?.auto || task.type === "review") return;
+    if (review.types && !review.types.includes(task.type)) return;
+    if (this.db.prepare("SELECT 1 FROM tasks WHERE review_of=? AND status<>'done' LIMIT 1").get(task.id)) return;
+    const res = this.createTaskAtomic({
+      title: `Rubric review: ${String(task.title ?? task.id)}`.slice(0, 200),
+      description: review.checklist ?? `Review the work completed on ${task.id} against the repo's rubric. Post a review artifact with a per-criterion verdict and evidence.`,
+      spec_ref: task.spec_ref,
+      type: "review",
+      review_of: task.id,
+      estimate: "M",
+      ac_ids: ["ac1"],
+      created_by: "rubric",
+    }) as any;
+    if (res?.error) this.log("task", task.id, "review_spawn_failed", "rubric", { error: res.error });
+    else this.log("task", task.id, "review_spawned", "rubric", { review_id: res?.id });
   }
 
   private taskRouteMeta(id: string) {

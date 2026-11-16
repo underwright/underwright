@@ -3,8 +3,8 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -571,9 +571,11 @@ export class PgStore implements IStore {
       // the worker's claim_task only renews its own claim.
       if (claim && m.agent_id !== claim.agent_id) { skip("claimed"); continue; }
       const id = `job-${randomUUID().slice(0, 8)}`;
+      const rubric = getRubric(repoFromSpecRef(task.spec_ref));
       const spec = buildLaunchSpec({
         taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
         workspace: m.workspace, harness: m.harness, model: m.model, model_flag: m.model_flag,
+        promptExtra: rubric?.prompt,
       });
       try {
         await this.nodeQuery(
@@ -1132,10 +1134,11 @@ export class PgStore implements IStore {
     }
 
     const policy = loadPolicy();
+    const rubric = getRubric(repoFromSpecRef(task.spec_ref), policy);
     const artifacts = await this.listArtifacts(taskId);
     const dod = evaluateDoD({
       task, evidence: rows, artifacts,
-      claimAgent: claim?.agent_id ?? agentId, policy,
+      claimAgent: claim?.agent_id ?? agentId, policy, rubric,
     });
     if (dod.blocked) {
       return { error: `definition of done not met (${task.type}): ${dod.missing.join("; ")}` };
@@ -1146,6 +1149,7 @@ export class PgStore implements IStore {
     await this.log("task", taskId, "completed", agentId, { dod: dod.missing });
     await this.notifyWatchers(taskId, `task ${taskId} → done`);
     await this.unblockDependents(taskId, agentId);
+    await this.spawnRubricReview(task, rubric);
     const dispatched = scoped ? undefined : await this.dispatchNext(agentId, taskId, "complete");
     return {
       completed: taskId,
@@ -1158,6 +1162,29 @@ export class PgStore implements IStore {
         agent_id: agentId,
       },
     };
+  }
+
+  /** gh-155: repo rubric review.auto — completing a task spawns a linked
+   *  code-review task so a different-harness agent checks the PR against the
+   *  repo's rubric. Guards: no review-of-review, no duplicate open review. */
+  private async spawnRubricReview(task: any, rubric: RubricRule | undefined) {
+    const review = rubric?.review;
+    if (!review?.auto || task.type === "review") return;
+    if (review.types && !review.types.includes(task.type)) return;
+    const [open] = await this.sql`SELECT 1 FROM tasks WHERE review_of=${task.id} AND status<>'done' LIMIT 1`;
+    if (open) return;
+    const res = await this.createTaskAtomic({
+      title: `Rubric review: ${String(task.title ?? task.id)}`.slice(0, 200),
+      description: review.checklist ?? `Review the work completed on ${task.id} against the repo's rubric. Post a review artifact with a per-criterion verdict and evidence.`,
+      spec_ref: task.spec_ref,
+      type: "review",
+      review_of: task.id,
+      estimate: "M",
+      ac_ids: ["ac1"],
+      created_by: "rubric",
+    }) as any;
+    if (res?.error) await this.log("task", task.id, "review_spawn_failed", "rubric", { error: res.error });
+    else await this.log("task", task.id, "review_spawned", "rubric", { review_id: res?.id });
   }
 
   private async taskRouteMeta(id: string) {

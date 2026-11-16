@@ -277,5 +277,38 @@
       "command-code",
       "opencode"
     ]
+  },
+  "rubrics": {
+    "covasant/Aura": {
+      "enforcement": "block",
+      "prompt": "AURA RUBRIC (covasant/Aura \u2014 enforced at review against .claude/commands/review-prs.md): Follow CLAUDE.md 'Working a bug: the standard protocol' and docs/dev/ISSUE_WORKFLOW.md. (1) Verify not already fixed: check pending-deploy/deployed labels and git log origin/develop --grep='#<issue>'. (2) Write the failing test first and mutation-verify it. (3) Measure regression against a real baseline; auraa_apis tests/ and resources/ run as separate invocations. (4) Run pre-commit lint on every touched file including pre-existing errors. (5) Ship a post-deploy validation script at scripts/validate/<issue>.py: self-contained, positive and negative cases, preflight() from scripts/validate/_lib.py, exit 0 PASS / 1 FAIL / 2 INCONCLUSIVE, --selftest or --offline mode. (6) The PR references the issue and leaves it OPEN \u2014 never close your own issue; add pending-deploy only when the fix merges. (7) Work only issues owned by or assigned to alanatcovasant. If you cannot meet the bar, post a blocked artifact and release \u2014 do not report done.",
+      "dod": {
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "evidence": [
+          "test_run"
+        ],
+        "evidence_match": [
+          {
+            "kind": "test_run",
+            "pattern": "scripts/validate/",
+            "severity": "warn",
+            "desc": "no run of scripts/validate/<issue>.py cited in evidence"
+          }
+        ]
+      },
+      "review": {
+        "auto": true,
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "checklist": "Apply the covasant/Aura review rubric (repo: .claude/commands/review-prs.md) to the implementer's branch/PR on the linked task. Criteria: (1) aligned with Auraa's vision \u2014 horizontal, domain-neutral, tool-first/governed; (2) no inappropriate hardcoded values \u2014 runtime config via DABs variables, not literals; (3) tests present AND passing \u2014 run them yourself and quote the output, UNVERIFIED counts as fail; (4) no serious issues \u2014 correctness, security, tenant isolation, breaking API, data-corruption patterns, error handlers that report what failed vs what they assumed; (5) post-deploy validation script at scripts/validate/<issue>.py \u2014 one command, preflight() requirements, positive+negative cases, exit 0/1/2, --selftest or --offline \u2014 or a documented reason it is infeasible. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review citing ac1, then complete_task."
+      }
+    }
   }
 }
