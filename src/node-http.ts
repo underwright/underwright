@@ -78,6 +78,10 @@ export async function handleNodeHttp(store: IStore, req: IncomingMessage, res: S
     reply(result.error ? result.status_code ?? 400 : 200, result);
   } catch (error) {
     // Never echo schema inputs, JSON bodies, credentials or internal SQL errors.
+    if (error instanceof z.ZodError) {
+      console.warn(`[underwright] node request schema rejection: ${req.method} ${req.url}`,
+        error.issues.map(i => `${i.path.join('.')}: ${i.code} ${i.message}`.slice(0, 160)).slice(0, 8));
+    }
     reply(error instanceof z.ZodError || error instanceof SyntaxError ? 400 : 500, { error: 'node request failed' });
   } finally {
     clearTimeout(timeout);
