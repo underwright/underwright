@@ -73,6 +73,11 @@ export const NODE_STALE_MS = 120_000;
  *  matching — dozens of synchronous queries + JSON parses — is throttled.
  *  Event-loop starvation otherwise delays /health, MCP, and lease renewals. */
 export const NODE_DISPATCH_THROTTLE_MS = 3_000;
+/** Poll retry cadence inside a long-poll: how often leaseNodeJob re-checks
+ *  for work while holding a request open. 50ms × N slots × ~6 sync queries
+ *  saturated the event loop (~1.7k queries + ~280 WAL commits/sec fleet-wide).
+ *  500ms keeps pickup latency sub-second with 10× less churn. */
+export const NODE_POLL_RETRY_MS = 500;
 export const nodeHeartbeatSchema = z.object({
   session_id: z.string().min(1).max(64),
   capabilities_version: z.number().int().nonnegative().optional(),

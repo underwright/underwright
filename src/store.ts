@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -21,6 +21,7 @@ import { PgStore } from "./pstore.js";
 export class SqliteStore implements IStore {
   private db: Database.Database;
   private lastDispatchAttempt = new Map<string, number>();
+  private lastPollWrite = new Map<string, number>();
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
     return this.db.transaction(() => work(this))();
@@ -378,7 +379,13 @@ export class SqliteStore implements IStore {
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
-      s.nodeQuery("UPDATE nodes SET last_seen_at=?, last_poll_at=? WHERE id=?", [now, now, principal.node_id]);
+      // last_poll_at is liveness bookkeeping — once per second per node is
+      // plenty; the 50ms retry loop was committing a WAL write ~20×/s/slot.
+      const lastPollWrite = this.lastPollWrite.get(principal.node_id) ?? 0;
+      if (Date.now() - lastPollWrite >= 1000) {
+        this.lastPollWrite.set(principal.node_id, Date.now());
+        s.nodeQuery("UPDATE nodes SET last_seen_at=?, last_poll_at=? WHERE id=?", [now, now, principal.node_id]);
+      }
       const node = (s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1. Running
@@ -549,7 +556,7 @@ export class SqliteStore implements IStore {
         const leased = this.leaseNodeJob(token, sessionId, exclude);
         if (!leased || !("empty" in leased)) return leased;
         if (Date.now() >= deadline) return leased;
-        await sleepSignal(Math.min(50, Math.max(1, deadline - Date.now())), signal);
+        await sleepSignal(Math.min(NODE_POLL_RETRY_MS, Math.max(1, deadline - Date.now())), signal);
       }
     } catch (error) {
       if ((error as { canceled?: boolean }).canceled) return nodeError("canceled", 499);

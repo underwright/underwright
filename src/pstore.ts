@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
@@ -125,6 +125,7 @@ const EVIDENCE_KINDS = ["test_run","ci_check","review","coverage","deploy","cont
 export class PgStore implements IStore {
   private sql: postgres.Sql;
   private lastDispatchAttempt = new Map<string, number>();
+  private lastPollWrite = new Map<string, number>();
 
   private async nodeTransaction(work: (s: PgStore) => Promise<any>): Promise<any> {
     return this.sql.begin(async sql => {
@@ -440,7 +441,11 @@ export class PgStore implements IStore {
     if ("error" in principal) return principal;
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
-      await s.nodeQuery("UPDATE nodes SET last_seen_at=now(), last_poll_at=now() WHERE id=?", [principal.node_id]);
+      const lastPollWrite = this.lastPollWrite.get(principal.node_id) ?? 0;
+      if (Date.now() - lastPollWrite >= 1000) {
+        this.lastPollWrite.set(principal.node_id, Date.now());
+        await s.nodeQuery("UPDATE nodes SET last_seen_at=now(), last_poll_at=now() WHERE id=?", [principal.node_id]);
+      }
       const node = (await s.nodeQuery("SELECT name, policy_json, capabilities_json, capabilities_observed_at, state FROM nodes WHERE id=?", [principal.node_id]))[0];
       if (!node || (node.state !== "approved" && node.state !== "draining")) return nodeError();
       // gh-91: capacity is the node's attested max_concurrency, not 1.
@@ -596,7 +601,7 @@ export class PgStore implements IStore {
         const leased = await this.leaseNodeJob(token, sessionId, exclude);
         if (!leased || !("empty" in leased)) return leased;
         if (Date.now() >= deadline) return leased;
-        await sleepSignal(Math.min(50, Math.max(1, deadline - Date.now())), signal);
+        await sleepSignal(Math.min(NODE_POLL_RETRY_MS, Math.max(1, deadline - Date.now())), signal);
       }
     } catch (error) {
       if ((error as { canceled?: boolean }).canceled) return nodeError("canceled", 499);
