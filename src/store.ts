@@ -22,6 +22,7 @@ export class SqliteStore implements IStore {
   private db: Database.Database;
   private lastDispatchAttempt = new Map<string, number>();
   private lastPollWrite = new Map<string, number>();
+  private lastJobSweep = 0;
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
     return this.db.transaction(() => work(this))();
@@ -374,7 +375,11 @@ export class SqliteStore implements IStore {
   }
 
   private leaseNodeJob(token: string, sessionId: string, exclude: string[] = []) {
-    this.sweepExpiredNodeJobs();
+    // The dedicated sweeper ticks every 60s — this per-poll sweep is bonus
+    // cleanup. Cap it: the expired-lease scan ran every poll retry (~28/s
+    // fleet-wide) and cost ~15ms each before the index existed.
+    const lastSweep = this.lastJobSweep ?? 0;
+    if (Date.now() - lastSweep >= 1000) { this.lastJobSweep = Date.now(); this.sweepExpiredNodeJobs(); }
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();

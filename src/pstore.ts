@@ -126,6 +126,7 @@ export class PgStore implements IStore {
   private sql: postgres.Sql;
   private lastDispatchAttempt = new Map<string, number>();
   private lastPollWrite = new Map<string, number>();
+  private lastJobSweep = 0;
 
   private async nodeTransaction(work: (s: PgStore) => Promise<any>): Promise<any> {
     return this.sql.begin(async sql => {
@@ -436,7 +437,8 @@ export class PgStore implements IStore {
   }
 
   private async leaseNodeJob(token: string, sessionId: string, exclude: string[] = []) {
-    await this.sweepExpiredNodeJobs();
+    const lastSweep = this.lastJobSweep ?? 0;
+    if (Date.now() - lastSweep >= 1000) { this.lastJobSweep = Date.now(); await this.sweepExpiredNodeJobs(); }
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     return this.sql.begin(async sql => {

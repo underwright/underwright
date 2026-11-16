@@ -77,6 +77,7 @@ export const JOBS_INDEXES = `
 CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
   WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS jobs_expired_leases ON jobs(type, status, lease_expires);
 `;
 
 export const SCHEMA = `
