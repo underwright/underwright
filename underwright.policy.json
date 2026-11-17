@@ -139,23 +139,32 @@
     "agents": {
       "codex@laptop-2": {
         "harness": "codex",
-        "backend": "omnigent"
+        "backend": "omnigent",
+        "server": "http://100.119.119.34:8000"
       },
       "claude@minipc": {
         "harness": "claude-sdk",
-        "backend": "omnigent"
+        "backend": "omnigent",
+        "server": "http://100.119.119.34:8000"
       },
       "grok@alandesktop": {
-        "harness": "grok"
+        "harness": "grok",
+        "server": "http://100.119.119.34:8000"
       },
       "agy@alandesktop": {
-        "harness": "agy"
+        "harness": "agy",
+        "server": "http://100.119.119.34:8000"
       },
       "kimi@alandesktop": {
-        "harness": "kimi"
+        "harness": "kimi",
+        "server": "http://100.119.119.34:8000"
       },
       "cmdc@winbox": {
-        "harness": "cmdc"
+        "harness": "cmdc",
+        "server": "http://100.119.119.34:8000"
+      },
+      "*": {
+        "server": "http://100.119.119.34:8000"
       }
     },
     "coverage": {
