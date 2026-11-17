@@ -288,7 +288,7 @@ it("cooldown expires — ISO-format finished_at older than the window does not p
   expect(j2.task_id).toBe(t.id);
 });
 
-it("done job on an unclosed task parks it in_review instead of re-dispatching", async () => {
+it("done job with no board activity on an unclosed task is parked by cooldown, not credited", async () => {
   const { store } = fixture();
   const node = await enrolled(store);
   await attest(store, node);
@@ -296,15 +296,14 @@ it("done job on an unclosed task parks it in_review instead of re-dispatching", 
 
   const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(j1.task_id).toBe(t.id);
-  // Worker jobs hold no board credential, so 'done' means "exited clean", not
-  // "task closed". The task must leave the dispatch pool — in_review — rather
-  // than burn quota re-running a dead-end session every cooldown.
-  await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "done", "could not reach the board");
+  // 'done' means "exited clean", not "task closed" (task-37ab2493): with no
+  // board footprint the task stays open — never in_review — and the cooldown
+  // parks it. Full lifecycle lives in job-closure.test.ts.
+  const r = await store.finishNodeJob(node.token, node.session.session_id, j1.id, j1.lease_token, "done", "could not reach the board");
+  expect(r.closure).toBe("retry");
 
   const row = store.db.prepare("SELECT status FROM tasks WHERE id=?").get(t.id) as { status: string };
-  expect(row.status).toBe("in_review");
-
-  // and it must not come back through dispatch, even after the cooldown window
+  expect(row.status).toBe("open");
   const again = await store.pollNodeJob(node.token, node.session.session_id, 0);
   expect(again.empty).toBe(true);
 });

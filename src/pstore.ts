@@ -4,7 +4,7 @@ import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
-import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, closureVerdict, closureArtifact, NO_ACTIVITY_REASON, type DispatchTask, type DispatchMeta, type SkipReason, type ClosureVerdict, type AttemptFootprint } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -661,22 +661,13 @@ export class PgStore implements IStore {
       await s.log("job", jobId, status, principal.node_id, { attempt_id: job.attempt_id, receipt_digest: digest });
       await s.observeProviderOutcome(jobId, job.agent_id, status, bounded, principal.node_id);
       if (job.task_id) await s.notifyWatchers(job.task_id, `job ${jobId} (node) → ${status}`);
-      // A dispatch-formed job that reports done on a still-open task could not
-      // close it (worker jobs hold no control-plane credential). Leaving the
-      // task 'open' re-dispatches it after every cooldown — deterministic quota
-      // burn. Move it to in_review: out of the open pool, into the honest
-      // backlog a closer/reviewer path (task-37ab2493) will consume.
+      // task-37ab2493: exit 0 is not task progress — see closureVerdict.
+      let closure: ClosureVerdict | undefined;
       if (status === "done" && job.task_id && job.dedupe_key?.startsWith("dispatch:")) {
-        const moved = await s.nodeQuery(
-          "UPDATE tasks SET status='in_review', updated_at=now() WHERE id=? AND status='open' RETURNING id",
-          [job.task_id],
-        );
-        if (moved.length) {
-          await s.log("task", job.task_id, "in_review", principal.node_id, { reason: "dispatch job done; task not closed — queued for review", job_id: jobId });
-          taskForReview = job.task_id;
-        }
+        closure = await s.applyJobClosure(job, jobId, bounded, principal.node_id);
+        if (closure === "review") taskForReview = job.task_id;
       }
-      return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest };
+      return { id: jobId, status, attempt_id: job.attempt_id, receipt_digest: digest, ...(closure ? { closure } : {}) };
     });
     // in_review is the "work delivered, considered for review" transition —
     // the repo rubric's review gate attaches here.
@@ -685,6 +676,37 @@ export class PgStore implements IStore {
       if (task) await this.spawnRubricReview(task, getRubric(repoFromSpecRef(task.spec_ref)));
     }
     return res;
+  }
+
+  /** Runs inside finishNodeJob's transaction for a done dispatch job. */
+  private async applyJobClosure(job: any, jobId: string, result: string, actor: string): Promise<ClosureVerdict> {
+    const task = (await this.nodeQuery("SELECT status, ac_ids FROM tasks WHERE id=?", [job.task_id]))[0];
+    if (!task) return "retry";
+    const since = job.started_at ?? job.created_at;
+    const asList = (v: unknown): string[] => Array.isArray(v) ? v as string[] : (() => { try { return JSON.parse(String(v ?? "[]")); } catch { return []; } })();
+    const evidence = await this.nodeQuery("SELECT ac_ids FROM evidence WHERE task_id=? AND agent_id=? AND created_at >= ?", [job.task_id, job.agent_id, since]);
+    const fp: AttemptFootprint = {
+      ledger: Number((await this.nodeQuery("SELECT COUNT(*)::int n FROM task_ledger WHERE task_id=? AND job_id=?", [job.task_id, jobId]))[0].n),
+      evidence: evidence.length,
+      artifacts: Number((await this.nodeQuery("SELECT COUNT(*)::int n FROM artifacts WHERE task_id=? AND agent_id=? AND created_at >= ?", [job.task_id, job.agent_id, since]))[0].n),
+      proven_ac_ids: [...new Set(evidence.flatMap(r => asList(r.ac_ids)))],
+    };
+    const prior = Number((await this.nodeQuery(
+      `SELECT COUNT(*)::int n FROM jobs j WHERE j.task_id=? AND j.id<>? AND j.outcome_reason=?
+       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.entity_type='task' AND e.entity_id=j.task_id AND e.action='status:open' AND e.created_at > j.finished_at)
+       AND NOT EXISTS (SELECT 1 FROM jobs u WHERE u.task_id=j.task_id AND u.id<>? AND u.dedupe_key LIKE 'dispatch:%' AND u.status='done'
+                       AND COALESCE(u.outcome_reason,'')<>? AND u.finished_at > j.finished_at)`,
+      [job.task_id, jobId, NO_ACTIVITY_REASON, jobId, NO_ACTIVITY_REASON]))[0].n);
+    const v = closureVerdict(task.status, fp, prior);
+    if (v === "closed") { await this.log("task", job.task_id, "job_closed", actor, { job_id: jobId }); return v; }
+    await this.nodeQuery("DELETE FROM claims WHERE task_id=? AND agent_id=?", [job.task_id, job.agent_id]);
+    const next = v === "review" ? "in_review" : v === "blocked" ? "blocked" : "open";
+    await this.nodeQuery("UPDATE tasks SET status=?, updated_at=now() WHERE id=? AND status IN ('open','claimed') AND NOT EXISTS (SELECT 1 FROM claims WHERE task_id=?)", [next, job.task_id, job.task_id]);
+    if (v !== "review") await this.nodeQuery("UPDATE jobs SET outcome_reason=? WHERE id=?", [NO_ACTIVITY_REASON, jobId]);
+    await this.log("task", job.task_id, `job_closure:${v}`, actor, { job_id: jobId, footprint: fp });
+    const art = closureArtifact(v, { jobId, agentId: job.agent_id, acIds: asList(task.ac_ids), fp, noActivity: prior + 1, tail: result });
+    await this.postArtifact({ task_id: job.task_id, agent_id: DISPATCHER_AGENT, ...art });
+    return v;
   }
 
   async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {

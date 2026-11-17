@@ -198,3 +198,52 @@ export function matchTaskToNode(
   }
   return { skip: "no_harness" };
 }
+
+/** task-37ab2493: a dispatch job that exits 0 has only proven "the harness
+ *  process exited clean", not "the task progressed". Workers hold a scoped
+ *  credential (claim/report_evidence/complete_task on their own task), so a
+ *  legitimate finish closes the task itself. When it did not, the closure
+ *  verdict decides what the done job is worth, from the attempt's board
+ *  footprint (ledger rows for the job, evidence and artifacts the worker
+ *  identity wrote since the job started):
+ *  - closed:  task already done — the worker closed it.
+ *  - review:  worker left board activity but didn't close → in_review, so a
+ *             reviewer/closer (rubric review, different harness) consumes it.
+ *  - retry:   no activity → stays open; the 5-min cooldown gates re-dispatch.
+ *  - blocked: repeated no-activity exits → status blocked + blocked artifact;
+ *             re-running a session that never touches the board is pure burn. */
+export const NO_ACTIVITY_BLOCK_AFTER = 2;
+export const NO_ACTIVITY_REASON = "done/no_board_activity";
+
+export interface AttemptFootprint {
+  ledger: number;
+  evidence: number;
+  artifacts: number;
+  proven_ac_ids: string[];
+}
+
+export type ClosureVerdict = "closed" | "review" | "retry" | "blocked";
+
+export function closureVerdict(taskStatus: string, fp: AttemptFootprint, priorNoActivity: number): ClosureVerdict {
+  if (taskStatus === "done") return "closed";
+  if (fp.ledger + fp.evidence + fp.artifacts > 0) return "review";
+  return priorNoActivity + 1 >= NO_ACTIVITY_BLOCK_AFTER ? "blocked" : "retry";
+}
+
+export function closureArtifact(v: ClosureVerdict, a: { jobId: string; agentId: string; acIds: string[]; fp: AttemptFootprint; noActivity: number; tail: string }) {
+  const missing = a.acIds.filter(ac => !a.fp.proven_ac_ids.includes(ac));
+  const footprint = `ledger=${a.fp.ledger} evidence=${a.fp.evidence} artifacts=${a.fp.artifacts}; ACs proven: [${a.fp.proven_ac_ids.join(", ")}] missing: [${missing.join(", ")}]`;
+  const tail = a.tail.trim() ? `\n\nLast output:\n${a.tail.trim().slice(-600)}` : "";
+  if (v === "review") return {
+    kind: "note", title: `Job ${a.jobId} exited 0 without closing the task — queued for review`,
+    content: `${a.agentId} job ${a.jobId} finished with exit 0 but did not complete_task. Board footprint this attempt: ${footprint}. Task moved to in_review for a reviewer/closer to verify against the ACs.${tail}`,
+  };
+  if (v === "retry") return {
+    kind: "note", title: `Job ${a.jobId} exited 0 with no board activity — not counted as progress`,
+    content: `${a.agentId} job ${a.jobId} finished with exit 0 but left no ledger entry, evidence, or artifact for this task (${footprint}). The job is recorded as ${NO_ACTIVITY_REASON}; the task stays open and re-dispatches after cooldown. ${NO_ACTIVITY_BLOCK_AFTER} such exits block it.${tail}`,
+  };
+  return {
+    kind: "blocked", title: `Blocked: ${a.noActivity} dispatch jobs exited 0 with no board activity`,
+    content: `${a.noActivity} consecutive dispatch jobs (latest ${a.jobId}, ${a.agentId}) exited 0 without touching the board for this task — likely the worker cannot reach the control plane (worker MCP config / credential) or cannot do the task. Task set to blocked to stop re-dispatch quota burn. Fix the cause, then set the task open. Footprint: ${footprint}.${tail}`,
+  };
+}
