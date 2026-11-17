@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import Database from "better-sqlite3";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { SqliteStore } from "../src/store.js";
 import { getHarnessBackend, getHarnessMatrix, getOmnigentServer, routeAgentSpec, type Policy } from "../src/policy.js";
 import {
@@ -343,6 +344,18 @@ describe("omnigent backend", () => {
     const fromSpec = agentInvocation(jobWith({ ...spec, backend: "omnigent", server: "http://spec-server:8000" }), "codex@A", "A", { omniAvailable: true, policy: withMatrix });
     expect(fromSpec.args).toContain("http://spec-server:8000");
     expect(fromSpec.args).not.toContain("http://matrix-server:8000");
+  });
+
+  it("keeps the server URL out of scripts (no uw-watch.mjs-style hardcode)", () => {
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const scripts = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist") return [];
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) return scripts(path);
+      return /\.(mjs|js|cjs)$/.test(entry.name) ? [path] : [];
+    });
+    const hardcoded = scripts(root).filter(path => readFileSync(path, "utf8").includes("100.119.119.34:8000"));
+    expect(hardcoded).toEqual([]);
   });
 
   it("extracts the last omnigent session marker, or a matching transcript URL", () => {

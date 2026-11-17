@@ -25,10 +25,12 @@ without weakening the boundary? Two properties make the answer cheap:
 
 ## Decision
 
-The omnigent endpoint is **configuration, not architecture.** A `server`
-field in node-executors config (attested in capabilities so the board
-knows where sessions live) selects the topology per node; all variants
-below are the same product with different values. Session ids and usage
+The omnigent endpoint is **configuration, not architecture.** A single
+`omnigent.server` policy key (overridable by `UNDERWRIGHT_OMNIGENT_SERVER`
+or `OMNIGENT_SERVER`) is resolved once by the control plane and stamped into
+each agent job spec; all variants below are the same product with different
+values. No per-agent copies, no hardcoded literals in scripts, and no reliance
+on runner cwd policy or per-host client config. Session ids and usage
 metadata cross the plane boundary; transcripts never do.
 
 ### Variant table
