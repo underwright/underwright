@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteStore } from "../src/store.js";
-import { getHarnessBackend, getHarnessMatrix, type Policy } from "../src/policy.js";
+import { getHarnessBackend, getHarnessMatrix, getOmnigentServer, routeAgentSpec, type Policy } from "../src/policy.js";
 import {
   agentInvocation,
   executeLeasedJob,
@@ -283,6 +283,8 @@ describe("omnigent backend", () => {
   it("ships a policy matrix covering codex/claude-sdk on omni and cmdc pending", () => {
     const shipped = JSON.parse(readFileSync(new URL("../underwright.policy.json", import.meta.url), "utf8"));
     const parsed = getHarnessMatrix(shipped);
+    expect(shipped.omnigent?.server).toBe("http://100.119.119.34:8000");
+    expect(Object.values(parsed.agents).some(agent => "server" in agent)).toBe(false);
     expect(parsed.coverage).toMatchObject({ codex: true, "claude-sdk": true, cmdc: false });
     expect(parsed.agents["codex@laptop-2"]).toMatchObject({ harness: "codex", backend: "omnigent" });
     expect(parsed.agents["cmdc@winbox"]).toMatchObject({ harness: "cmdc" });
@@ -292,6 +294,55 @@ describe("omnigent backend", () => {
     const pending = agentInvocation(jobWith({ executable: "cmdc", args: ["-p", "--yolo"], prompt: "x" }), "cmdc@winbox", "winbox", { omniAvailable: true, policy: shipped });
     expect(pending.executable).toBe("cmdc");
     expect(pending.backend).toBe("raw");
+  });
+
+  it("resolves the omnigent server from one policy key with env overrides", () => {
+    const policy = { omnigent: { server: "http://policy-server:8000" } } as Policy;
+    const savedUnderwright = process.env.UNDERWRIGHT_OMNIGENT_SERVER;
+    const savedGeneric = process.env.OMNIGENT_SERVER;
+    try {
+      delete process.env.UNDERWRIGHT_OMNIGENT_SERVER;
+      delete process.env.OMNIGENT_SERVER;
+      expect(getOmnigentServer(policy)).toBe("http://policy-server:8000");
+      expect(getOmnigentServer({} as Policy)).toBeNull();
+      process.env.OMNIGENT_SERVER = " http://generic-server:8000 ";
+      expect(getOmnigentServer(policy)).toBe("http://generic-server:8000");
+      process.env.UNDERWRIGHT_OMNIGENT_SERVER = " http://namespaced-server:8000 ";
+      expect(getOmnigentServer(policy)).toBe("http://namespaced-server:8000");
+      process.env.UNDERWRIGHT_OMNIGENT_SERVER = "  ";
+      expect(getOmnigentServer(policy)).toBe("http://generic-server:8000");
+    } finally {
+      if (savedUnderwright === undefined) delete process.env.UNDERWRIGHT_OMNIGENT_SERVER;
+      else process.env.UNDERWRIGHT_OMNIGENT_SERVER = savedUnderwright;
+      if (savedGeneric === undefined) delete process.env.OMNIGENT_SERVER;
+      else process.env.OMNIGENT_SERVER = savedGeneric;
+    }
+  });
+
+  it("stamps the configured server on submitted specs without per-agent entries", () => {
+    const saved = process.env.UNDERWRIGHT_OMNIGENT_SERVER;
+    try {
+      process.env.UNDERWRIGHT_OMNIGENT_SERVER = "http://remote-server:8000";
+      expect(routeAgentSpec(spec)).toEqual({ ...spec, server: "http://remote-server:8000" });
+      const explicit = { ...spec, server: "http://explicit-server:8000" };
+      expect(routeAgentSpec(explicit)).toBe(explicit);
+      const { store } = fixture();
+      const j = store.submitJob({ agent_id: "submitter", type: "agent", agent: { ...spec, backend: "omnigent", harness: "codex" } });
+      expect(JSON.parse(store.getJob(j.id).agent_spec).server).toBe("http://remote-server:8000");
+      expect(agentInvocation(store.getJob(j.id), "unlisted@A", "A", { omniAvailable: true }).args).toContain("http://remote-server:8000");
+    } finally {
+      if (saved === undefined) delete process.env.UNDERWRIGHT_OMNIGENT_SERVER;
+      else process.env.UNDERWRIGHT_OMNIGENT_SERVER = saved;
+    }
+  });
+
+  it("keeps spec.server ahead of the policy matrix server on the runner", () => {
+    const withMatrix = { harness_matrix: { "codex@A": { harness: "codex", backend: "omnigent", server: "http://matrix-server:8000" } } } as Policy;
+    const fromMatrix = agentInvocation(jobWith({ ...spec, backend: "omnigent" }), "codex@A", "A", { omniAvailable: true, policy: withMatrix });
+    expect(fromMatrix.args).toContain("http://matrix-server:8000");
+    const fromSpec = agentInvocation(jobWith({ ...spec, backend: "omnigent", server: "http://spec-server:8000" }), "codex@A", "A", { omniAvailable: true, policy: withMatrix });
+    expect(fromSpec.args).toContain("http://spec-server:8000");
+    expect(fromSpec.args).not.toContain("http://matrix-server:8000");
   });
 
   it("extracts the last omnigent session marker, or a matching transcript URL", () => {

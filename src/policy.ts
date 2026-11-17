@@ -108,6 +108,11 @@ function reviewRoutingFrom(raw: DispatcherRule | undefined): ReviewRoutingPolicy
 
 export type HumanNotifyEventKind = "task_completed" | "claim_reclaimed";
 
+/** Fleet-wide omnigent topology. One configured server URL; no per-agent copies. */
+export interface OmnigentPolicy {
+  server?: string;
+}
+
 /** Preferred launch configuration for agent jobs, from the policy harness_matrix. */
 export interface HarnessBackend {
   harness?: string;                 // e.g. "codex", "claude-sdk"
@@ -197,6 +202,8 @@ export interface Policy {
   /** Per-agent preferred harness+backend for agent jobs, plus the omnigent
    *  coverage table. Exact agent_id wins over "*". */
   harness_matrix?: HarnessMatrixRule;
+  /** Single fleet-wide omnigent server URL (overridable by env). */
+  omnigent?: OmnigentPolicy;
 }
 
 const DEFAULT_POLICY: Policy = { dod: {}, enforcement: "observe" };
@@ -281,6 +288,26 @@ export function getHarnessMatrix(policy: Policy = loadPolicy()): HarnessMatrix {
 export function getHarnessBackend(agentId: string, policy: Policy = loadPolicy()): HarnessBackend {
   const { agents } = getHarnessMatrix(policy);
   return agents[agentId] ?? agents["*"] ?? {};
+}
+
+/** Resolve the fleet omnigent server once: the namespaced env override wins,
+ *  then the generic env override, then the single `omnigent.server` policy key.
+ *  Blank env values are ignored so an operator can unset an override. */
+export function getOmnigentServer(policy: Policy = loadPolicy()): string | null {
+  for (const key of ["UNDERWRIGHT_OMNIGENT_SERVER", "OMNIGENT_SERVER"] as const) {
+    const value = process.env[key]?.trim();
+    if (value) return value;
+  }
+  return policy.omnigent?.server?.trim() || null;
+}
+
+/** Producer-side job routing: stamp the resolved server onto an agent spec so
+ *  submitted jobs carry it explicitly and runners need no cwd policy or per-host
+ *  client config. An explicit spec.server is never overwritten. */
+export function routeAgentSpec<S extends { server?: string }>(spec: S, policy?: Policy): S {
+  if (spec.server) return spec;
+  const server = getOmnigentServer(policy ?? loadPolicy());
+  return server ? { ...spec, server } : spec;
 }
 
 const DEFAULT_NOTIFY_EVENTS: HumanNotifyEventKind[] = ["task_completed", "claim_reclaimed"];
