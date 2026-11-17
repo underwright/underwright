@@ -245,6 +245,11 @@ export interface UnblockPolicy {
   reblock_hours?: number;
   rules?: UnblockRule[];
   escalate_to?: string;
+  /** Resend throttle for repeated escalations of the same blocked task.
+   *  First send immediate; resend after base*2^(n-1), capped. Resets when
+   *  the task's updated_at changes (new block episode). Defaults 60min/24h. */
+  escalate_backoff_base_minutes?: number;
+  escalate_backoff_max_hours?: number;
 }
 
 export interface UnblockAction {
@@ -280,7 +285,7 @@ export function runUnblockWatch(store: SqliteStore, opts: { policy?: object; age
   for (const t of blocked) {
     // Oscillation guard: auto-reopened recently and re-blocked → escalate.
     if (t.last_reopen && (now - new Date(t.last_reopen).getTime()) < reblockHours * 3600e3) {
-      const r = escalate(store, t, agentId, human, `re-blocked ${((now - new Date(t.last_reopen).getTime()) / 3600e3).toFixed(1)}h after auto-reopen`);
+      const r = escalate(store, t, agentId, human, `re-blocked ${((now - new Date(t.last_reopen).getTime()) / 3600e3).toFixed(1)}h after auto-reopen`, policy);
       actions.push(r); continue;
     }
     const rule = rules.find((r) => {
@@ -295,17 +300,33 @@ export function runUnblockWatch(store: SqliteStore, opts: { policy?: object; age
       actions.push({ task_id: t.id, action: "reopened", rule: rule.note });
       continue;
     }
-    if (rule?.action === "escalate") { actions.push(escalate(store, t, agentId, human, rule.note ?? "rule: escalate")); continue; }
+    if (rule?.action === "escalate") { actions.push(escalate(store, t, agentId, human, rule.note ?? "rule: escalate", policy)); continue; }
     // No rule hit: stale blocks escalate, fresh ones defer.
     const ageH = (now - new Date(t.updated_at).getTime()) / 3600e3;
     actions.push(ageH >= staleHours
-      ? escalate(store, t, agentId, human, `blocked ${ageH.toFixed(0)}h with no matching rule`)
+      ? escalate(store, t, agentId, human, `blocked ${ageH.toFixed(0)}h with no matching rule`, policy)
       : { task_id: t.id, action: "deferred" });
   }
   return actions;
 }
 
-function escalate(store: SqliteStore, t: { id: string; title: string; content: string }, agentId: string, human: string, reason: string): UnblockAction {
+function escalate(store: SqliteStore, t: { id: string; title: string; content: string; updated_at?: string }, agentId: string, human: string, reason: string, policy: UnblockPolicy = {}): UnblockAction {
+  // Resend throttle: count prior escalations for this block episode (since
+  // t.updated_at) and defer until last + base*2^(n-1), capped — gh-48 was
+  // messaging the human every wake. gh-69.
+  const baseMin = policy.escalate_backoff_base_minutes ?? 60;
+  const maxH = policy.escalate_backoff_max_hours ?? 24;
+  const prior = (store as any).db.prepare(
+    `SELECT created_at FROM events WHERE entity_type='task' AND entity_id=? AND action='unblock_escalated' AND created_at >= ? ORDER BY created_at`
+  ).all(t.id, t.updated_at ?? "1970-01-01") as { created_at: string }[];
+  const n = prior.length;
+  if (n > 0) {
+    const intervalH = Math.min(maxH, (baseMin / 60) * 2 ** (n - 1));
+    const nextDue = new Date(prior[n - 1].created_at).getTime() + intervalH * 3600e3;
+    if (Date.now() < nextDue) {
+      return { task_id: t.id, action: "deferred", rule: `escalation backoff (${n} sent, next ${new Date(nextDue).toISOString()})` };
+    }
+  }
   store.sendMessage(human, agentId,
     `${t.id} blocked — ${reason}.
 ` +
