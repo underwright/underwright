@@ -145,6 +145,51 @@ cline mcp add underwright http://100.120.201.70:8741/mcp \
   --yes
 ```
 
+Without `--yes`, `cline mcp add` opens an interactive wizard. `--transport`
+takes `stdio`, `sse`, `http`, `streamable-http` or `streamableHttp`. The
+default is `stdio`, so you must pass `--transport`.
+
+**Auth.** Run `cline auth` once per seat. It is an interactive wizard where
+you pick Cline credits, ClinePass, a BYOK provider or a local model. For a
+BYOK provider you can skip the wizard:
+`cline auth -p <provider> -k <api-key> -m <model-id>`. The credentials are
+written to `~/.cline/data/settings/providers.json`. `lastUsedProvider` in
+that file is the provider a headless run uses unless you pass `-P`. Cline
+has no read-only auth-status command, so a node attests readiness itself:
+`underwright node config set-auth cline ready`.
+
+**Headless invocation** (cline 3.0.x, checked against `cline --help`):
+
+```bash
+cline --cwd "$WORKTREE" --json --timeout 3600 "<prompt>"
+```
+
+- The prompt is a positional argument. A bare `cline "<prompt>"` runs in
+  act mode with auto-approve on (`--auto-approve` defaults to `true`).
+  Without the `-i/--tui` flag it does not open the TUI.
+- `--json` prints messages as JSON, which suits a job runner log.
+- `-t/--timeout <seconds>` caps the run. The default is `0`, which means
+  no limit.
+- `-c/--cwd <path>` sets the working directory. Point it at the task
+  worktree.
+- `-P/--provider <id>` and `-m/--model <id>` override the stored provider
+  and model. `--thinking none|low|medium|high|xhigh` sets the reasoning
+  effort.
+- `--retries <n>` is the number of consecutive mistakes before the run
+  exits. The default is 3.
+
+**Permissions.** `--auto-approve true`, the default, approves every tool,
+including MCP calls, so the run never stops for a prompt. `-y/--yolo`
+approves only a limited tool set for unsupervised runs. Cline documents it
+as sandbox-only. Use `--auto-approve false` only in an interactive session,
+because a headless run blocks on the first approval prompt.
+
+cline 3.0.x has no `mcp list` subcommand. It only has `add`/`install`
+and `remove`/`uninstall`. To check the connection, read
+`cline_mcp_settings.json` or start a session and ask for the tool list. The underwright server should show 26 or more
+tools. If the entry has no `type: streamableHttp`, Cline falls back to
+legacy SSE and the server shows zero tools.
+
 ### OpenCode
 
 `opencode.json` (project) or `~/.config/opencode/opencode.json`. Remote
