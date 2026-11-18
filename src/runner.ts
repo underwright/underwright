@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { prepareHarnessPermissions } from "./harness-permissions.js";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentBackend, AgentJobSpec } from "./istore.js";
 import { getHarnessBackend, getHarnessMatrix, type Policy } from "./policy.js";
@@ -96,6 +97,11 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
       { executable: job.command, args: [], backend: "raw" as const };
   } catch (error) {
     return call("finish_job", { ...owner, status: "failed", result: String(error) });
+  }
+  if (options.signal?.aborted) return;
+  if (job.type === "agent") {
+    try { await prepareHarnessPermissions(invocation.harness ?? "", process.cwd()); }
+    catch (error) { return call("finish_job", { ...owner, status: "failed", result: `harness permissions: ${String(error)}` }); }
   }
   if (options.signal?.aborted) return;
   const child = spawn(invocation.executable, invocation.args, {
