@@ -110,6 +110,14 @@ export interface LaunchSpecInput {
   harness: string;
   model?: string;
   model_flag?: string;
+  /** gh-164: workspace-mandated docs the agent must read before coding. */
+  requiredReading?: readonly string[];
+}
+
+/** Render dispatch.required_reading for the prompt's {{required_reading}} slot. */
+export function requiredReadingClause(docs: readonly string[] | undefined): string {
+  const list = (docs ?? []).filter(d => typeof d === "string" && d.trim()).map(d => d.trim());
+  return list.length ? ` Required reading for this workspace (read before coding): ${list.join(", ")}.` : "";
 }
 
 /** Build the launch-agent node spec the executor consumes. */
@@ -118,7 +126,8 @@ export function buildLaunchSpec(input: LaunchSpecInput) {
     .replaceAll("{{agent_id}}", input.agentId)
     .replaceAll("{{host}}", input.host)
     .replaceAll("{{task_id}}", input.taskId)
-    .replaceAll("{{job_id}}", input.jobId);
+    .replaceAll("{{job_id}}", input.jobId)
+    .replaceAll("{{required_reading}}", requiredReadingClause(input.requiredReading));
   return {
     version: 1 as const,
     kind: "launch-agent" as const,

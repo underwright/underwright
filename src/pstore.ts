@@ -3,7 +3,7 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, requiredReadingFor, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
@@ -561,6 +561,7 @@ export class PgStore implements IStore {
       const spec = buildLaunchSpec({
         taskId: task.id, agentId: m.agent_id, host: node.name ?? nodeId, jobId: id,
         workspace: m.workspace, harness: m.harness, model: m.model, model_flag: m.model_flag,
+        requiredReading: requiredReadingFor(dispatch, m.workspace),
       });
       try {
         await this.nodeQuery(

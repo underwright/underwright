@@ -275,6 +275,16 @@
       "cmdc",
       "command-code",
       "opencode"
-    ]
+    ],
+    "required_reading": {
+      "underwright": [
+        "CONTRIBUTING.md",
+        "docs/engineering-standards.md",
+        ".github/PULL_REQUEST_TEMPLATE.md"
+      ],
+      "kraftina": [
+        "docs/design/"
+      ]
+    }
   }
 }

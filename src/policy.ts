@@ -123,6 +123,11 @@ export interface DispatchRule {
   workspaces?: Record<string, string>;
   harness_order?: string[];
   free_fallback?: string[];
+  /** gh-164: workspace_id (or "*" for every workspace) -> repo-relative docs
+   *  the launch prompt names as required reading, on top of the AGENTS.md
+   *  entry point. Mirrors each repo's AGENTS.md required-reading list so
+   *  harnesses that skim AGENTS.md still see the mandated standards/gates. */
+  required_reading?: Record<string, string[]>;
 }
 
 export interface ModelRoutingRule {
@@ -486,14 +491,33 @@ export function expandTemplate<T extends TemplateSeedArgs>(args: T, policy: Poli
 /** gh-126 pull-through dispatch policy. Disabled when the block is absent. */
 export function getDispatchPolicy(policy: Policy = loadPolicy()): Required<DispatchRule> & { workspaces: Record<string, string> } {
   const d = policy.dispatch;
-  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [], free_fallback: [] };
+  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [], free_fallback: [], required_reading: {} };
   return {
     enabled: d.enabled !== false,
     default_workspace: typeof d.default_workspace === "string" ? d.default_workspace : "",
     workspaces: d.workspaces && typeof d.workspaces === "object" ? d.workspaces : {},
     harness_order: Array.isArray(d.harness_order) ? d.harness_order.filter(h => typeof h === "string") : [],
     free_fallback: Array.isArray(d.free_fallback) ? d.free_fallback.filter(h => typeof h === "string") : ["devin", "cmdc", "command-code", "opencode"],
+    required_reading: parseRequiredReading(d.required_reading),
   };
+}
+
+function parseRequiredReading(raw: unknown): Record<string, string[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string[]> = {};
+  for (const [ws, docs] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(docs)) continue;
+    const list = docs.filter((x): x is string => typeof x === "string" && x.trim() !== "").map(x => x.trim());
+    if (list.length) out[ws] = list;
+  }
+  return out;
+}
+
+/** gh-164: docs a workspace mandates — "*" entries first, then the
+ *  workspace's own, de-duplicated. */
+export function requiredReadingFor(dispatch: { required_reading?: Record<string, string[]> }, workspace: string): string[] {
+  const rr = dispatch.required_reading ?? {};
+  return [...new Set([...(rr["*"] ?? []), ...(rr[workspace] ?? [])])];
 }
 
 export function getModelRouting(policy: Policy = loadPolicy()): Required<Omit<ModelRoutingRule, "rules" | "models" | "flags">> & Pick<ModelRoutingRule, "rules" | "models" | "flags"> {

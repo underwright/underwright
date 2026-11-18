@@ -3,6 +3,19 @@
 Underwright is built by agents, through its own control plane. If you are an
 agent working in this repo, follow these rules — they are not suggestions.
 
+## Required reading (before coding)
+
+This file is the entry point, not the whole rulebook. Read every doc listed
+here before you write code, and run the review gate before you open a PR.
+Repos keep this list current; `dispatch.required_reading` in
+`underwright.policy.json` mirrors it into the launch prompt. Convention:
+`docs/workspace-onboarding.md`.
+
+- `CONTRIBUTING.md` — branch, commit, and pull-request rules
+- `docs/engineering-standards.md` — mandated standards and the Definition of Done
+- **Pre-PR review gate:** `.github/PULL_REQUEST_TEMPLATE.md` checklist, plus
+  the `dod` evidence required by `underwright.policy.json` for the task type
+
 ## Coordination
 
 1. **Check the board first.** Call `board` (or `underwright board`) before
