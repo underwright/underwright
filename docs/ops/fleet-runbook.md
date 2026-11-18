@@ -1,5 +1,7 @@
 # Fleet runbook
 
+Setup, permissions and guardrails for the ops session: `docs/ops/ops-session.md`.
+
 The source of truth for the hosts, services and paths the fleet-ops agent
 (`ops/fleet-ops/config.yaml`) works across. The agent prompt embeds a copy of
 the **Hosts** and **Services** tables. Edit both together. The
