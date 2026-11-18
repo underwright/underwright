@@ -152,6 +152,18 @@ End your reply with exactly one line per host, in this format and nothing after 
 OPS-CHECK host=<minipc|alandesktop|yoga> reachable=<yes|no> node=<is-active output> heartbeat=<value or none>"""
 
 
+def shell_text(output: object) -> str:
+    """sys_os_shell output arrives as a JSON string ({"stdout": ..., "stderr": ...}); unwrap it to real lines."""
+    if isinstance(output, str):
+        try:
+            output = json.loads(output)
+        except ValueError:
+            return output
+    if isinstance(output, dict):
+        return "\n".join(str(output.get(k) or "") for k in ("stdout", "stderr"))
+    return str(output)
+
+
 def host_unit_ok(shell_out: str) -> tuple[bool, str]:
     """Parse the HOSTUNIT-BEGIN/END block plus the Linger line from the live run's shell output."""
     m = re.search(r"HOSTUNIT-BEGIN\s*(.*?)\s*HOSTUNIT-END", shell_out, re.S)
@@ -171,8 +183,9 @@ def check_host_unit_parser() -> None:
     on_failure = good.replace("Restart=always", "Restart=on-failure")
     no_linger = good.replace("Linger=yes", "Linger=no")
     rejected = [n for n, t in (("missing", missing), ("on-failure", on_failure), ("no-linger", no_linger)) if not host_unit_ok(t)[0]]
-    ok = host_unit_ok(good)[0] and len(rejected) == 3
-    case("live-host-unit-neg", ok, f"good accepted, rejected {rejected}")
+    wrapped = shell_text(json.dumps({"stdout": good, "stderr": "", "exit_code": 0}))
+    ok = host_unit_ok(good)[0] and host_unit_ok(wrapped)[0] and len(rejected) == 3
+    case("live-host-unit-neg", ok, f"good (raw + JSON-wrapped) accepted, rejected {rejected}")
 
 
 async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: int, unit: str) -> None:
@@ -197,7 +210,7 @@ async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: in
         _, row = http_json(f"{server}/v1/sessions/{s.id}", token)
         prompts_seen = int(row.get("pending_elicitations_count") or 0)
         items = [i if isinstance(i, dict) else getattr(i, "__dict__", {}) for i in (await c.sessions.list_items(s.id, limit=200)).data]
-        tool_out = "\n".join(str(i.get("output", "")) for i in items if i.get("type") == "function_call_output")
+        tool_out = "\n".join(shell_text(i.get("output", "")) for i in items if i.get("type") == "function_call_output")
         final = "\n".join(p.get("text", "") for i in items if i.get("type") == "message" and i.get("role") == "assistant" for p in i.get("content", []))
         checks = {m.group(1): m.group(0) for m in re.finditer(r"OPS-CHECK host=(\w+) reachable=yes\b.*", final)}
 
