@@ -16,6 +16,8 @@ export interface Span {
   end(status?: "ok" | "error", error?: unknown, attrs?: SpanAttrs): void;
 }
 
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
 export interface Telemetry {
   /** Start a span; parent links the trace when given, else a new trace starts. */
   span(name: string, attrs?: SpanAttrs, parent?: Span): Span;
@@ -23,9 +25,11 @@ export interface Telemetry {
   event(name: string, attrs?: SpanAttrs): void;
   /** Numeric observation (queue depth, running jobs, poll wait ms). */
   metric(name: string, value: number, attrs?: SpanAttrs): void;
+  /** Levelled structured log line — component loggers route through here. */
+  log(level: LogLevel, message: string, attrs?: SpanAttrs): void;
 }
 
-type Line = { ts: string; kind: "span" | "event" | "metric"; name: string } & Record<string, unknown>;
+type Line = { ts: string; kind: "span" | "event" | "metric" | "log"; name: string } & Record<string, unknown>;
 
 class NoopTelemetry implements Telemetry {
   span(name: string, _a?: SpanAttrs, _p?: Span): Span {
@@ -33,6 +37,7 @@ class NoopTelemetry implements Telemetry {
   }
   event(): void {}
   metric(): void {}
+  log(): void {}
 }
 
 /** Appends one JSON object per line — ops/debugging output, rotation is the
@@ -71,19 +76,43 @@ class JsonlTelemetry implements Telemetry {
   metric(name: string, value: number, attrs: SpanAttrs = {}) {
     this.sink.emit({ ...this.base(), kind: "metric", name, value, ...this.resource, ...attrs });
   }
+  log(level: LogLevel, message: string, attrs: SpanAttrs = {}) {
+    this.sink.emit({ ...this.base(), kind: "log", name: message, level, ...this.resource, ...attrs });
+  }
+}
+
+/** Anything that can take one metric datapoint — the stores' recordMetric. */
+export interface MetricPersister {
+  recordMetric(a: { name: string; value: number; attrs?: Record<string, unknown>; ts?: string }): unknown;
+}
+
+/** Wraps any backend so metric() calls also land in the persistent sink.
+ *  Persistence failures are swallowed — telemetry never breaks the caller. */
+class PersistingTelemetry implements Telemetry {
+  constructor(private readonly inner: Telemetry, private readonly sink: MetricPersister) {}
+  span(name: string, attrs?: SpanAttrs, parent?: Span): Span { return this.inner.span(name, attrs, parent); }
+  event(name: string, attrs?: SpanAttrs): void { this.inner.event(name, attrs); }
+  log(level: LogLevel, message: string, attrs?: SpanAttrs): void { this.inner.log(level, message, attrs); }
+  metric(name: string, value: number, attrs: SpanAttrs = {}): void {
+    this.inner.metric(name, value, attrs);
+    try { void this.sink.recordMetric({ name, value, attrs }); } catch { /* sink must not break callers */ }
+  }
 }
 
 let current: Telemetry = new NoopTelemetry();
 
 /** Backend selection: UNDERWRIGHT_TELEMETRY=file|stdout|off (default off on
- *  import so library/test callers stay silent until entry points init). */
-export function initTelemetry(opts: { backend?: string; file?: string; resource?: SpanAttrs } = {}): Telemetry {
+ *  import so library/test callers stay silent until entry points init).
+ *  `persist` additionally mirrors metric() calls into the store's metrics
+ *  table — the JSONL file stays the span/event/log record. */
+export function initTelemetry(opts: { backend?: string; file?: string; resource?: SpanAttrs; persist?: MetricPersister } = {}): Telemetry {
+  const wrap = (t: Telemetry) => opts.persist ? new PersistingTelemetry(t, opts.persist) : t;
   const backend = (opts.backend ?? process.env.UNDERWRIGHT_TELEMETRY ?? "off").toLowerCase();
-  if (backend === "off" || backend === "noop") { current = new NoopTelemetry(); return current; }
-  if (backend === "stdout") { current = new JsonlTelemetry(new Sink(l => process.stdout.write(l)), opts.resource); return current; }
+  if (backend === "off" || backend === "noop") { current = wrap(new NoopTelemetry()); return current; }
+  if (backend === "stdout") { current = wrap(new JsonlTelemetry(new Sink(l => process.stdout.write(l)), opts.resource)); return current; }
   const file = opts.file ?? process.env.UNDERWRIGHT_TELEMETRY_FILE ?? "underwright-telemetry.jsonl";
   mkdirSync(dirname(file), { recursive: true });
-  current = new JsonlTelemetry(new Sink(l => appendFileSync(file, l)), opts.resource);
+  current = wrap(new JsonlTelemetry(new Sink(l => appendFileSync(file, l)), opts.resource));
   return current;
 }
 

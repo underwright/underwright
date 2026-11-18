@@ -37,6 +37,21 @@ export type DashboardData = {
   job_counts?: Array<{ status: string; n: number }>;
   nodes?: any[];
   providers?: any[];
+  slos?: any[];
+  metrics?: any[];
+};
+
+// ---------- SLO + metrics readout ----------
+const sloObjective = (s: any): string =>
+  s.unit === "ratio" ? `${Math.round(Number(s.objective) * 100)}%` : `${s.comparator === "at_most" ? "≤" : "≥"}${s.objective}${s.unit === "ms" ? "ms" : "s"}`;
+const sloValue = (s: any): string => {
+  if (s.value === null || s.value === undefined) return "—";
+  if (s.unit === "ratio") return `${(Number(s.value) * 100).toFixed(1)}%`;
+  return s.unit === "ms" ? `${Math.round(Number(s.value))}ms` : `${Math.round(Number(s.value))}s`;
+};
+const fmtNum = (v: unknown): string => {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.round(n * 100) / 100) : String(v ?? "");
 };
 
 /** Narrow screens (phones, portrait tablets): tables collapse into labelled cards,
@@ -155,6 +170,8 @@ export function renderDashboard(data: DashboardData, opts: { refreshSeconds?: nu
   const events = data.events ?? [];
   const nodes = data.nodes ?? [];
   const providers = data.providers ?? [];
+  const slos = data.slos ?? [];
+  const metrics = data.metrics ?? [];
   const counts = data.job_counts ?? [];
   const jobSummary = counts.length ? counts.map((c) => `${c.n} ${c.status}`).join(" · ") : "no jobs";
 
@@ -189,6 +206,9 @@ tr.blocked td,tr.blocked .title{color:#f6c27a}
 .badge-blocked{display:inline-block;margin-left:6px;padding:0 6px;border:1px solid #a16207;border-radius:999px;color:#f6c27a;font-size:11px;letter-spacing:.04em;text-transform:uppercase}
 .poll-silent{color:#f87171;font-weight:600}
 .poll-ok{color:#4ade80}
+.slo-ok{color:#4ade80}
+.slo-breaching{color:#f87171;font-weight:600}
+.slo-no_data{color:#6f7a89}
 .muted{color:#6f7a89}
 .iss-billing{color:#f87171;font-weight:600}
 .iss-rate_limit{color:#f6c27a;font-weight:600}
@@ -253,6 +273,21 @@ ${section("Providers", providers, [
   { label: "Issues", render: (p) => p.issues.length
       ? p.issues.slice(0, 2).map((i: any) => `<span class="iss-${i.kind}">${i.kind}×${i.count}</span>`).join(" ") + ` <span class="muted">${escapeHtml(p.issues[0].last_msg)}</span>`
       : `<span class="poll-ok">clean</span>` },
+])}
+
+${section("SLO status", slos, [
+  { label: "SLO", render: (s) => `<code>${escapeHtml(s.id)}</code> <span class="title">${escapeHtml(s.title)}</span>` },
+  { label: "Window", render: field("window") },
+  { label: "Objective", render: (s) => escapeHtml(sloObjective(s)) },
+  { label: "Current", render: (s) => escapeHtml(sloValue(s)) },
+  { label: "Samples", render: field("samples", "0") },
+  { label: "Status", render: (s) => `<span class="slo-${escapeHtml(s.status)}">${escapeHtml(s.status)}</span>${s.detail ? ` <span class="muted">${escapeHtml(s.detail)}</span>` : ""}` },
+], (s) => s.status === "breaching" ? "blocked" : "")}
+
+${section("Latest metrics", metrics, [
+  { label: "Metric", render: (m) => `<code>${escapeHtml(m.name)}</code>` },
+  { label: "Value", render: (m) => escapeHtml(fmtNum(m.value)) },
+  { label: "Recorded", render: field("ts") },
 ])}
 
 ${section("Open jobs", jobs, [
