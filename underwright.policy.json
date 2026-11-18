@@ -324,6 +324,32 @@
         ],
         "checklist": "Apply the covasant/Aura review rubric (repo: .claude/commands/review-prs.md) to the implementer's branch/PR on the linked task. Criteria: (1) aligned with Auraa's vision \u2014 horizontal, domain-neutral, tool-first/governed; (2) no inappropriate hardcoded values \u2014 runtime config via DABs variables, not literals; (3) tests present AND passing \u2014 run them yourself and quote the output, UNVERIFIED counts as fail; (4) no serious issues \u2014 correctness, security, tenant isolation, breaking API, data-corruption patterns, error handlers that report what failed vs what they assumed; (5) post-deploy validation script at scripts/validate/<issue>.py \u2014 one command, preflight() requirements, positive+negative cases, exit 0/1/2, --selftest or --offline \u2014 or a documented reason it is infeasible. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review citing ac1, then complete_task."
       }
+    },
+    "underwright/underwright": {
+      "enforcement": "warn",
+      "prompt": "UNDERWRIGHT RUBRIC (underwright/underwright \u2014 apply docs/review-rubric.md at review): (1) architecture \u2014 mutations via Store + audit log, MCP tools are zod schemas delegating to Store, ESM .js imports, durable state in the store backend not process memory; (2) no hardcoded secrets/tokens/hosts/DB paths where policy/env config exists; (3) tests exist AND are run \u2014 npx vitest on touched area, quote output, UNVERIFIED fails approval; (4) no serious issues \u2014 correctness, security, MCP/CLI contract breaks, schema/enum drift vs CHECK constraints, data-loss or unbounded-exec patterns; (5) delivered \u2014 pushed branch + open PR linked to the issue; local commits do not count.",
+      "review": {
+        "auto": true,
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "checklist": "Apply docs/review-rubric.md to the implementer's pushed branch/PR for the linked task: (1) Store/audit + zod-delegation architecture; (2) no hardcoded config-worthy values; (3) tests run by you with quoted output \u2014 UNVERIFIED counts as fail; (4) no serious issues (contract breaks, schema drift, data-loss patterns); (5) work is actually on a pushed branch/PR, linked to its issue. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review, then complete_task."
+      }
+    },
+    "alandennis1024/kraftina": {
+      "enforcement": "warn",
+      "prompt": "KRAFTINA RUBRIC (alandennis1024/kraftina \u2014 apply docs/review-rubric.md at review): (1) R1 architecture \u2014 provider logic behind providers/ adapters, business logic in services/ not routes, Alembic migration for persisted state, events via transactional outbox, feature flags still 403 when off; (2) no hardcoded secrets/keys/workspace URLs \u2014 config via backend/config.py env or kraftina-secrets; (3) tests exist AND are run \u2014 python -m pytest backend / npm test frontend, quote output, Playwright or Databricks-dependent paths may be UNVERIFIED with reason; (4) no serious issues \u2014 auth/tenancy bypass, credit-ledger or payment integrity, breaking /v1 API, irreversible migration, lost outbox events; (5) delivered \u2014 pushed branch + open PR.",
+      "review": {
+        "auto": true,
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "checklist": "Apply docs/review-rubric.md to the implementer's pushed branch/PR for the linked task: (1) R1 architecture \u2014 adapters/services/migrations/outbox/feature-flags; (2) no hardcoded config-worthy values; (3) pytest/Vitest run by you with quoted output \u2014 UNVERIFIED counts as fail; (4) no serious issues (auth, ledger, API contract, migrations, outbox); (5) work is on a pushed branch/PR. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review, then complete_task."
+      }
     }
   }
 }
