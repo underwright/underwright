@@ -9,7 +9,8 @@ import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-he
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
-import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
+import { buildDigest, normalizeDigestArgs, sendHumanNotification, resolveSinceTimestamp } from "./digest.js";
+import { evaluateSlos, DISPATCH_SLO_SECONDS, NODE_POLL_FRESH_MS, SLO_SERIES_NAMES, type SloContext } from "./slo.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
@@ -17,6 +18,9 @@ import type { SymbolRec, RefRec } from "./codeindex.js";
 export type { TaskStatus } from "./istore.js";
 import type { TaskStatus } from "./istore.js";
 import { PgStore } from "./pstore.js";
+
+/** Metrics sink retention — collectMetrics prunes points older than this. */
+const METRICS_RETENTION_DAYS = 30;
 
 export class SqliteStore implements IStore {
   private db: Database.Database;
@@ -1605,6 +1609,7 @@ export class SqliteStore implements IStore {
 
   /** Pre-flight: what already exists? Search helpers + artifacts + indexed code symbols. */
   searchContext(query: string, kinds?: string[]) {
+    const started = Date.now();
     const wantsSymbols = !kinds?.length || kinds.includes("symbol");
     const ftsKinds = kinds?.filter((k) => k !== "symbol");
     let rows: any[] = [];
@@ -1625,6 +1630,8 @@ export class SqliteStore implements IStore {
         });
       }
     }
+    // Feeds the search-context-p95 SLO via the persistent metrics sink.
+    this.observeMetric("search.duration_ms", Date.now() - started, { results: rows.length });
     return rows;
   }
 
@@ -1811,6 +1818,122 @@ export class SqliteStore implements IStore {
     return { ...built, sent_to: recipient };
   }
 
+  // ---- observability: persistent metrics sink + SLO status ----
+
+  /** Append one datapoint. Metric points are telemetry, not coordination
+   *  state — they deliberately skip the audit event stream. */
+  recordMetric(a: { name: string; value: number; attrs?: Record<string, unknown>; ts?: string }) {
+    const name = String(a.name ?? "").trim();
+    if (!name || name.length > 128) return { error: "metric name required (≤128 chars)" };
+    if (!Number.isFinite(a.value)) return { error: "metric value must be finite" };
+    let attrs = "{}";
+    try { attrs = JSON.stringify(a.attrs ?? {}); } catch { return { error: "attrs must be JSON-serializable" }; }
+    const id = `m-${randomUUID().slice(0, 12)}`;
+    const ts = a.ts ?? new Date().toISOString();
+    this.db.prepare("INSERT INTO metrics (id,ts,name,value,attrs) VALUES (?,?,?,?,?)").run(id, ts, name, a.value, attrs);
+    return { id, name, ts, value: a.value };
+  }
+
+  /** Record an instrumentation datapoint; never breaks the instrumented path. */
+  private observeMetric(name: string, value: number, attrs?: Record<string, unknown>) {
+    try { this.recordMetric({ name, value, attrs }); } catch { /* sink must not break callers */ }
+  }
+
+  listMetrics(a: { name?: string; since?: string; limit?: number } = {}) {
+    const limit = Math.min(Math.max(1, a.limit ?? 200), 5000);
+    const where: string[] = [], params: any[] = [];
+    if (a.name) { where.push("name = ?"); params.push(a.name); }
+    if (a.since) { where.push("ts >= ?"); params.push(resolveSinceTimestamp(a.since)); }
+    const rows = this.db.prepare(
+      `SELECT * FROM metrics ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY ts DESC, rowid DESC LIMIT ?`
+    ).all(...params, limit) as any[];
+    for (const r of rows) { try { r.attrs = JSON.parse(r.attrs); } catch { /* keep raw */ } }
+    return rows;
+  }
+
+  /** Gauge snapshot → metrics rows, then prune points past retention. */
+  collectMetrics() {
+    const started = Date.now();
+    const ts = new Date().toISOString();
+    const rows: [string, number][] = [];
+    for (const r of this.db.prepare("SELECT status, COUNT(*) n FROM tasks GROUP BY status").all() as any[])
+      rows.push([`tasks.${r.status}`, r.n]);
+    for (const r of this.db.prepare("SELECT status, COUNT(*) n FROM jobs GROUP BY status").all() as any[])
+      rows.push([`jobs.${r.status}`, r.n]);
+    const nodes = this.listNodes() as any[];
+    rows.push(["nodes.total", nodes.length],
+      ["nodes.online", nodes.filter(n => n.liveness === "online").length],
+      ["nodes.poll_silent", nodes.filter(n => n.poll_liveness === "silent").length],
+      ["locks.active", (this.db.prepare("SELECT COUNT(*) n FROM locks WHERE lease_expires > ?").get(ts) as any).n],
+      ["messages.unread", (this.db.prepare("SELECT COUNT(*) n FROM messages WHERE read=0").get() as any).n],
+      ["events.total", (this.db.prepare("SELECT COUNT(*) n FROM events").get() as any).n],
+      ["providers.exhausted", this.observedExhaustedProviders().size],
+      ["metrics.collect.duration_ms", Date.now() - started]);
+    const insert = this.db.prepare("INSERT INTO metrics (id,ts,name,value,attrs) VALUES (?,?,?,?,?)");
+    const cutoff = new Date(Date.now() - METRICS_RETENTION_DAYS * 86_400_000).toISOString();
+    const pruned = this.db.transaction(() => {
+      for (const [name, value] of rows) insert.run(`m-${randomUUID().slice(0, 12)}`, ts, name, value, "{}");
+      return this.db.prepare("DELETE FROM metrics WHERE ts < ?").run(cutoff).changes;
+    })();
+    return { recorded: rows.length, pruned, ts };
+  }
+
+  /** Latest value per metric name — the dashboard's gauge readout. */
+  latestMetrics() {
+    const rows = this.db.prepare(
+      `SELECT name, value, ts FROM metrics m WHERE ts = (SELECT MAX(ts) FROM metrics WHERE name = m.name) ORDER BY name`
+    ).all() as any[];
+    return rows;
+  }
+
+  sloStatus() {
+    return evaluateSlos((_w, windowStart) => this.sloContext(windowStart));
+  }
+
+  /** Window-bounded counts + series for evaluateSlos. Stored timestamps mix
+   *  datetime('now') and ISO formats, so comparisons go through julianday. */
+  private sloContext(windowStart: string): SloContext {
+    const jobs = this.db.prepare(
+      "SELECT status, COUNT(*) n FROM jobs WHERE finished_at IS NOT NULL AND julianday(finished_at) >= julianday(?) GROUP BY status"
+    ).all(windowStart) as any[];
+    const dispatch = this.db.prepare(
+      `SELECT COUNT(*) total,
+              COALESCE(SUM(CASE WHEN (julianday(started_at)-julianday(created_at))*86400 <= ${DISPATCH_SLO_SECONDS} THEN 1 ELSE 0 END),0) within_slo
+       FROM jobs WHERE started_at IS NOT NULL AND julianday(started_at) >= julianday(?)`
+    ).get(windowStart) as any;
+    const doneTasks = this.db.prepare(
+      `SELECT COUNT(*) n,
+              COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM evidence e WHERE e.task_id=tasks.id) THEN 1 ELSE 0 END),0) with_evidence
+       FROM tasks WHERE status='done' AND julianday(updated_at) >= julianday(?)`
+    ).get(windowStart) as any;
+    const nodes = this.db.prepare(
+      `SELECT COUNT(*) n,
+              COALESCE(SUM(CASE WHEN julianday(last_poll_at) >= julianday(?) THEN 1 ELSE 0 END),0) fresh
+       FROM nodes WHERE state='approved'`
+    ).get(new Date(Date.now() - NODE_POLL_FRESH_MS).toISOString()) as any;
+    const series: Record<string, number[]> = {};
+    const names = SLO_SERIES_NAMES.map(() => "?").join(",");
+    for (const r of this.db.prepare(
+      `SELECT name, value FROM metrics WHERE ts >= ? AND name IN (${names}) ORDER BY ts LIMIT 5000`
+    ).all(windowStart, ...SLO_SERIES_NAMES) as any[])
+      (series[r.name] ??= []).push(r.value);
+    const latest = this.db.prepare("SELECT MAX(ts) ts FROM metrics").get() as any;
+    return {
+      counts: {
+        jobs_done: jobs.find(j => j.status === "done")?.n ?? 0,
+        jobs_failed: jobs.find(j => j.status === "failed")?.n ?? 0,
+        dispatch_total: dispatch?.total ?? 0,
+        dispatch_within: dispatch?.within_slo ?? 0,
+        tasks_done: doneTasks?.n ?? 0,
+        tasks_done_with_evidence: doneTasks?.with_evidence ?? 0,
+        nodes_approved: nodes?.n ?? 0,
+        nodes_poll_fresh: nodes?.fresh ?? 0,
+      },
+      series,
+      latest_metric_ts: latest?.ts ?? null,
+    };
+  }
+
   /** Everything the read-only web dashboard needs in one round trip. */
   dashboard(eventsLimit = 25) {
     const now = new Date().toISOString();
@@ -1818,7 +1941,7 @@ export class SqliteStore implements IStore {
     const jobs = this.db
       .prepare("SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at DESC")
       .all();
-    return { ...this.board(), locks, jobs, events: this.auditLog(eventsLimit) };
+    return { ...this.board(), locks, jobs, events: this.auditLog(eventsLimit), slos: this.sloStatus(), metrics: this.latestMetrics() };
   }
 
   auditLog(limit = 50) {

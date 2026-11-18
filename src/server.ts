@@ -12,7 +12,7 @@ import { indexWorkspace } from "./codeindex.js";
 import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
-import { initTelemetry } from "./telemetry.js";
+import { initTelemetry, telemetry } from "./telemetry.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -281,6 +281,16 @@ Rules of engagement:
     job_id: z.string(),
   }, async ({ job_id }) => text(await store.getJob(job_id) ?? { error: "not found" }));
 
+  server.tool("record_metric", "Append a datapoint to the persistent metrics sink (gauges, counters, timings). Points are telemetry, not audit events.", {
+    name: z.string().min(1).max(128),
+    value: z.number().finite(),
+    attrs: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).optional(),
+    ts: z.string().optional().describe("ISO timestamp; defaults to now"),
+  }, async (a) => text(await store.recordMetric({ name: a.name, value: a.value, attrs: a.attrs, ts: a.ts })));
+
+  server.tool("slo_status", "Evaluate the control plane's SLOs (job success, dispatch latency, search p95, evidence coverage, node freshness, sink freshness) against the persistent metrics sink and live tables.", {},
+    async () => text(await store.sloStatus()));
+
   server.tool("audit_log", "Recent control-plane events (who did what, when).", {
     limit: z.number().int().optional(),
   }, async ({ limit }) => text(await store.auditLog(limit)));
@@ -315,7 +325,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   const store = await openStore(dbPath);
   // gh-136: control-plane telemetry — UNDERWRIGHT_TELEMETRY=file|stdout|off,
   // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
-  initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
+  initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl", persist: store });
   const stopSweeper = startLeaseSweeper(store);
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
@@ -349,6 +359,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
         await handleGithubWebhookHttp(store, req, res, webhookSecretFromEnv());
       } catch (error) {
         console.error("[underwright] webhook failed:", error);
+        telemetry().log("error", "webhook.failed", { error: error instanceof Error ? error.message : String(error) });
         if (!res.headersSent) {
           res.writeHead(500, { "content-type": "application/json" }).end('{"error":"webhook handler failed"}');
         }
@@ -416,6 +427,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
         result = await handleDashboardRequest(store, req.method ?? "GET", url, body, token ? url.searchParams.get("token") ?? undefined : undefined);
       } catch (error) {
         console.error("[underwright] dashboard request failed:", error);
+        telemetry().log("error", "dashboard.request_failed", { path: url.pathname, error: error instanceof Error ? error.message : String(error) });
         res.writeHead(500, { "content-type": "application/json" }).end(JSON.stringify({ error: "dashboard error" }));
         return;
       }
@@ -436,7 +448,10 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   http.headersTimeout = 10000;
   http.maxConnections = 128;
   http.once("close", () => {
-    void stopSweeper().then(() => store.close()).catch(error => console.error("[underwright] shutdown failed:", error));
+    void stopSweeper().then(() => store.close()).catch(error => {
+      console.error("[underwright] shutdown failed:", error);
+      telemetry().log("error", "server.shutdown_failed", { error: error instanceof Error ? error.message : String(error) });
+    });
   });
   try {
     await new Promise<void>((resolve, reject) => {

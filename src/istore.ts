@@ -153,6 +153,15 @@ export interface IStore {
   getJob(id: string): Awaitable<any>;
   board(): Awaitable<any>;
   digest(args?: string | DigestArgs): Awaitable<DigestResult>;
+  /** Persistent metrics sink: append one datapoint. Points are telemetry —
+   *  intentionally not mirrored into the audit event stream. */
+  recordMetric(a: { name: string; value: number; attrs?: Record<string, unknown>; ts?: string }): Awaitable<any>;
+  listMetrics(a?: { name?: string; since?: string; limit?: number }): Awaitable<any[]>;
+  /** Snapshot current gauges (task/job/node counts, etc.) into the metrics
+   *  table and prune points past retention. Called by the lease sweeper. */
+  collectMetrics(): Awaitable<any>;
+  /** Evaluate the SLO set (src/slo.ts) against metrics + live tables. */
+  sloStatus(): Awaitable<any>;
   dashboard(eventsLimit?: number): Awaitable<any>;
   auditLog(limit?: number): Awaitable<any[]>;
   close(): Awaitable<void>;

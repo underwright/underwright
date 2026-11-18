@@ -203,7 +203,7 @@ describe("omnigent backend", () => {
   } as Policy;
 
   it("templates `omni run --harness H -p PROMPT` when the spec requests omnigent", () => {
-    const inv = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: true });
+    const inv = agentInvocation(jobWith({ ...spec, backend: "omnigent", harness: "codex" }), "codex@A", "A", { omniAvailable: true, policy: {} as Policy });
     expect(inv.executable).toBe("omni");
     expect(inv.args).toEqual(["run", "--harness", "codex", "-p", "do the thing"]);
     expect(inv.backend).toBe("omnigent");
@@ -223,7 +223,7 @@ describe("omnigent backend", () => {
 
   it("derives the harness from the executable basename when unspecified", () => {
     const inv = agentInvocation(jobWith({ executable: "/usr/local/bin/codex", args: [], prompt: "x", backend: "omnigent" }),
-      "a@A", "A", { omniAvailable: true });
+      "a@A", "A", { omniAvailable: true, policy: {} as Policy });
     expect(inv.args).toEqual(["run", "--harness", "codex", "-p", "x"]);
   });
 

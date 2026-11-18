@@ -31,6 +31,22 @@ CREATE TABLE IF NOT EXISTS task_ledger (
 CREATE INDEX IF NOT EXISTS task_ledger_task ON task_ledger(task_id, created_at);
 `;
 
+/** Persistent metrics sink (observability): every datapoint is one row —
+ *  ts/name/value plus a JSON attrs object. Portable DDL shared by SQLite and
+ *  Postgres: no AUTOINCREMENT, no function defaults — callers supply ts/id.
+ *  Points are telemetry, not coordination state, so writes skip the audit
+ *  log deliberately (a per-minute collector would flood the event stream). */
+export const METRICS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS metrics (
+  id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  name TEXT NOT NULL,
+  value REAL NOT NULL,
+  attrs TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS metrics_name_ts ON metrics(name, ts);
+`;
+
 export const TASK_DEPENDENCIES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS task_dependencies (
   task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -157,6 +173,8 @@ CREATE TABLE IF NOT EXISTS locks (
 );
 
 ${LEDGER_SCHEMA}
+
+${METRICS_SCHEMA}
 
 CREATE TABLE IF NOT EXISTS messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,

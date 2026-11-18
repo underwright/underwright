@@ -1,7 +1,7 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
-import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
+import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA, METRICS_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
@@ -9,7 +9,8 @@ import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-he
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
-import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
+import { buildDigest, normalizeDigestArgs, sendHumanNotification, resolveSinceTimestamp } from "./digest.js";
+import { evaluateSlos, SLOS, DISPATCH_SLO_SECONDS, NODE_POLL_FRESH_MS, SLO_SERIES_NAMES, type SloContext } from "./slo.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 
@@ -119,6 +120,9 @@ CREATE INDEX IF NOT EXISTS artifacts_search ON artifacts USING gin(to_tsvector('
 `;
 
 const EVIDENCE_KINDS = ["test_run","ci_check","review","coverage","deploy","contract_test","security_scan","smoke_test","mutation"];
+
+/** Metrics sink retention — collectMetrics prunes points older than this. */
+const METRICS_RETENTION_DAYS = 30;
 
 /** Postgres control-plane store — also works against Databricks Lakebase
  *  (managed Postgres) unchanged: point DATABASE_URL at the instance. */
@@ -745,6 +749,7 @@ export class PgStore implements IStore {
     await sql.unsafe(PG_JOBS_MIGRATION);
     await sql.unsafe(PG_ARTIFACTS_MIGRATION);
     await sql.unsafe(LEDGER_SCHEMA);
+    await sql.unsafe(METRICS_SCHEMA);
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS type TEXT NOT NULL DEFAULT 'feature'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS severity TEXT NOT NULL DEFAULT 'normal'`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS estimate TEXT NOT NULL DEFAULT ''`;
@@ -1502,6 +1507,7 @@ export class PgStore implements IStore {
   }
 
   async searchContext(query: string, kinds?: string[]) {
+    const started = Date.now();
     const want = new Set(kinds?.length ? kinds : ["helper", "artifact"]);
     const q = query.trim().split(/\s+/).map((w) => w.replace(/[^\w]/g, "")).filter(Boolean).join(" & ");
     if (!q) return [];
@@ -1527,6 +1533,8 @@ export class PgStore implements IStore {
         WHERE to_tsvector('english', kind || ' ' || output) @@ to_tsquery('english', ${q})
         LIMIT 15`);
     }
+    // Feeds the search-context-p95 SLO via the persistent metrics sink.
+    await this.observeMetric("search.duration_ms", Date.now() - started, { results: out.length });
     return out;
   }
 
@@ -1647,11 +1655,128 @@ export class PgStore implements IStore {
     }
   }
 
+  // ---- observability: persistent metrics sink + SLO status ----
+
+  /** Append one datapoint. Metric points are telemetry, not coordination
+   *  state — they deliberately skip the audit event stream. */
+  async recordMetric(a: { name: string; value: number; attrs?: Record<string, unknown>; ts?: string }) {
+    const name = String(a.name ?? "").trim();
+    if (!name || name.length > 128) return { error: "metric name required (≤128 chars)" };
+    if (!Number.isFinite(a.value)) return { error: "metric value must be finite" };
+    let attrs = "{}";
+    try { attrs = JSON.stringify(a.attrs ?? {}); } catch { return { error: "attrs must be JSON-serializable" }; }
+    const id = `m-${randomUUID().slice(0, 12)}`;
+    const ts = a.ts ?? new Date().toISOString();
+    await this.sql`INSERT INTO metrics (id,ts,name,value,attrs) VALUES (${id},${ts},${name},${a.value},${attrs})`;
+    return { id, name, ts, value: a.value };
+  }
+
+  /** Record an instrumentation datapoint; never breaks the instrumented path. */
+  private async observeMetric(name: string, value: number, attrs?: Record<string, unknown>) {
+    try { await this.recordMetric({ name, value, attrs }); } catch { /* sink must not break callers */ }
+  }
+
+  async listMetrics(a: { name?: string; since?: string; limit?: number } = {}) {
+    const limit = Math.min(Math.max(1, a.limit ?? 200), 5000);
+    const since = a.since ? resolveSinceTimestamp(a.since) : null;
+    const rows = await this.sql<any[]>`
+      SELECT * FROM metrics
+      WHERE (${a.name ?? null}::text IS NULL OR name = ${a.name ?? null})
+        AND (${since}::text IS NULL OR ts >= ${since})
+      ORDER BY ts DESC, id DESC LIMIT ${limit}`;
+    for (const r of rows) { try { if (typeof r.attrs === "string") r.attrs = JSON.parse(r.attrs); } catch { /* keep raw */ } }
+    return rows;
+  }
+
+  /** Gauge snapshot → metrics rows, then prune points past retention. */
+  async collectMetrics() {
+    const started = Date.now();
+    const ts = new Date().toISOString();
+    const rows: [string, number][] = [];
+    for (const r of await this.sql<any[]>`SELECT status, COUNT(*)::int n FROM tasks GROUP BY status`)
+      rows.push([`tasks.${r.status}`, r.n]);
+    for (const r of await this.sql<any[]>`SELECT status, COUNT(*)::int n FROM jobs GROUP BY status`)
+      rows.push([`jobs.${r.status}`, r.n]);
+    const nodes = await this.listNodes() as any[];
+    const [locks] = await this.sql<any[]>`SELECT COUNT(*)::int n FROM locks WHERE lease_expires > now()`;
+    const [unread] = await this.sql<any[]>`SELECT COUNT(*)::int n FROM messages WHERE NOT read`;
+    const [events] = await this.sql<any[]>`SELECT COUNT(*)::int n FROM events`;
+    rows.push(["nodes.total", nodes.length],
+      ["nodes.online", nodes.filter(n => n.liveness === "online").length],
+      ["nodes.poll_silent", nodes.filter(n => n.poll_liveness === "silent").length],
+      ["locks.active", locks?.n ?? 0],
+      ["messages.unread", unread?.n ?? 0],
+      ["events.total", events?.n ?? 0],
+      ["providers.exhausted", (await this.observedExhaustedProviders()).size],
+      ["metrics.collect.duration_ms", Date.now() - started]);
+    await this.sql`INSERT INTO metrics ${this.sql(rows.map(([name, value]) => ({
+      id: `m-${randomUUID().slice(0, 12)}`, ts, name, value, attrs: "{}",
+    })))}`;
+    const cutoff = new Date(Date.now() - METRICS_RETENTION_DAYS * 86_400_000).toISOString();
+    const pruned = await this.sql`DELETE FROM metrics WHERE ts < ${cutoff}`;
+    return { recorded: rows.length, pruned: pruned.count, ts };
+  }
+
+  /** Latest value per metric name — the dashboard's gauge readout. */
+  async latestMetrics() {
+    return this.sql<any[]>`
+      SELECT name, value, ts FROM metrics m
+      WHERE ts = (SELECT MAX(ts) FROM metrics WHERE name = m.name) ORDER BY name`;
+  }
+
+  async sloStatus() {
+    // evaluateSlos is synchronous — build the per-window contexts eagerly.
+    const windows = [...new Set(SLOS.map(d => d.window))];
+    const ctxs = new Map<string, SloContext>();
+    for (const w of windows) ctxs.set(w, await this.sloContext(resolveSinceTimestamp(w)));
+    return evaluateSlos((w) => ctxs.get(w)!);
+  }
+
+  /** Window-bounded counts + series for evaluateSlos. */
+  private async sloContext(windowStart: string): Promise<SloContext> {
+    const jobs = await this.sql<any[]>`
+      SELECT status, COUNT(*)::int n FROM jobs
+      WHERE finished_at IS NOT NULL AND finished_at >= ${windowStart}::timestamptz GROUP BY status`;
+    const [dispatch] = await this.sql<any[]>`
+      SELECT COUNT(*)::int total,
+             COALESCE(SUM(CASE WHEN EXTRACT(EPOCH FROM (started_at - created_at)) <= ${DISPATCH_SLO_SECONDS} THEN 1 ELSE 0 END),0)::int within_slo
+      FROM jobs WHERE started_at IS NOT NULL AND started_at >= ${windowStart}::timestamptz`;
+    const [doneTasks] = await this.sql<any[]>`
+      SELECT COUNT(*)::int n,
+             COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM evidence e WHERE e.task_id=tasks.id) THEN 1 ELSE 0 END),0)::int with_evidence
+      FROM tasks WHERE status='done' AND updated_at >= ${windowStart}::timestamptz`;
+    const [nodes] = await this.sql<any[]>`
+      SELECT COUNT(*)::int n,
+             COALESCE(SUM(CASE WHEN last_poll_at >= ${new Date(Date.now() - NODE_POLL_FRESH_MS).toISOString()}::timestamptz THEN 1 ELSE 0 END),0)::int fresh
+      FROM nodes WHERE state='approved'`;
+    const series: Record<string, number[]> = {};
+    for (const r of await this.sql<any[]>`
+      SELECT name, value FROM metrics
+      WHERE ts >= ${windowStart} AND name IN ${this.sql(SLO_SERIES_NAMES as unknown as string[])}
+      ORDER BY ts LIMIT 5000`)
+      (series[r.name] ??= []).push(r.value);
+    const [latest] = await this.sql<any[]>`SELECT MAX(ts) ts FROM metrics`;
+    return {
+      counts: {
+        jobs_done: jobs.find(j => j.status === "done")?.n ?? 0,
+        jobs_failed: jobs.find(j => j.status === "failed")?.n ?? 0,
+        dispatch_total: dispatch?.total ?? 0,
+        dispatch_within: dispatch?.within_slo ?? 0,
+        tasks_done: doneTasks?.n ?? 0,
+        tasks_done_with_evidence: doneTasks?.with_evidence ?? 0,
+        nodes_approved: nodes?.n ?? 0,
+        nodes_poll_fresh: nodes?.fresh ?? 0,
+      },
+      series,
+      latest_metric_ts: latest?.ts ?? null,
+    };
+  }
+
   /** Everything the read-only web dashboard needs in one round trip. */
   async dashboard(eventsLimit = 25) {
     const locks = await this.sql`SELECT * FROM locks WHERE lease_expires > now() ORDER BY resource`;
     const jobs = await this.sql`SELECT * FROM jobs WHERE status IN ('queued','running') ORDER BY created_at DESC`;
-    return { ...await this.board(), locks, jobs, events: await this.auditLog(eventsLimit) };
+    return { ...await this.board(), locks, jobs, events: await this.auditLog(eventsLimit), slos: await this.sloStatus(), metrics: await this.latestMetrics() };
   }
 
   async auditLog(limit = 50) {
