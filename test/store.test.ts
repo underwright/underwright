@@ -62,6 +62,19 @@ describe("evidence gate", () => {
   });
 });
 
+describe("update priority", () => {
+  it("updateTask persists priority and reorders the board", () => {
+    const a = store.createTask({ title: "low" });
+    const b = store.createTask({ title: "high" });
+    store.updateTask(b.id, { priority: 0 }, "triage-bot");
+    expect(store.getTask(b.id).priority).toBe(0);
+    expect(store.getTask(a.id).priority).toBe(2);
+    const ordered = store.listTasks();
+    expect(ordered[0].id).toBe(b.id);
+    expect(ordered[1].id).toBe(a.id);
+  });
+});
+
 describe("helper index", () => {
   it("registers helpers discoverable via search", () => {
     store.registerHelper({ agent_id: "a", path: "src/u/log.ts", symbol: "log", kind: "util", summary: "structured logger" });

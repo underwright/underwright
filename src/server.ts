@@ -103,6 +103,7 @@ Rules of engagement:
     spec_ref: z.string().optional(),
     blocked_by: z.array(z.string()).optional().describe("task ids that must be done before claiming; update replaces the list, [] clears it"),
     ac_ids: z.array(z.string()).optional(),
+    priority: z.number().int().min(0).max(4).optional(),
     type: z.enum(["feature", "bug", "deploy", "architecture", "docs", "tdd", "triage", "review"]).optional(),
     severity: z.enum(["low", "normal", "high", "critical"]).optional(),
     estimate: z.enum(["S", "M", "L"]).optional(),

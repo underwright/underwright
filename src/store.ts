@@ -926,7 +926,7 @@ export class SqliteStore implements IStore {
     if (!t) return { error: `task ${id} not found` };
     const sets: string[] = [];
     const vals: any[] = [];
-    for (const k of ["title", "description", "spec_ref", "type", "severity", "estimate"] as const) {
+    for (const k of ["title", "description", "spec_ref", "type", "severity", "estimate", "priority"] as const) {
       if (patch[k] !== undefined) { sets.push(`${k}=?`); vals.push(patch[k]); }
     }
     if (patch.ac_ids !== undefined) { sets.push("ac_ids=?"); vals.push(JSON.stringify(patch.ac_ids)); }
