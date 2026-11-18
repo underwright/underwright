@@ -232,3 +232,61 @@ it("attests operation kinds and workspaces derived from config, not a partial in
   shutdown.abort();
   await running.catch(() => undefined);
 });
+
+it.each(["network", "json", "denied"])("backs off and recovers when session establishment fails with a %s error", async (failure) => {
+  const { dir } = fixture();
+  const credential = { version: 1 as const, url: "http://localhost:8741", node_id: "node-retry", token: `uw_node_${"a".repeat(64)}`, expires_at: new Date(Date.now() + 86400000).toISOString(), insecure_transport: true };
+  saveNodeCredential(credential, dir);
+  const shutdown = new AbortController();
+  const waits: number[] = [];
+  let sessions = 0;
+  const requests: string[] = [];
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    requests.push(url);
+    expect((init?.headers as Record<string, string>).authorization).toBe(`Bearer ${credential.token}`);
+    if (url.endsWith("/session")) {
+      sessions++;
+      if (sessions <= 2) {
+        if (failure === "network") throw new TypeError("fetch failed");
+        if (failure === "denied") return Response.json({ error: "session denied" }, { status: 429, headers: { "retry-after": sessions === 1 ? "60" : "2" } });
+        return new Response("temporary upstream failure", { status: 502, headers: { "retry-after": sessions === 1 ? "60" : "2" } });
+      }
+      return Response.json({ session_id: "recovered", policy: {} });
+    }
+    if (url.endsWith("/poll")) {
+      expect(JSON.parse(init?.body as string).session_id).toBe("recovered");
+      shutdown.abort();
+      return new Response(null, { status: 204 });
+    }
+    return Response.json({ ok: true });
+  });
+  try {
+    await runNode({ dir, signal: shutdown.signal, sleep: async (ms, signal) => {
+      if (sessions <= 2) { waits.push(ms); return; }
+      const { sleepSignal } = await import("../src/node-protocol.js");
+      return sleepSignal(ms, signal);
+    } });
+    expect(sessions).toBe(3);
+    expect(waits).toHaveLength(2);
+    if (failure !== "network") expect(waits).toEqual([30000, 2000]);
+    expect(waits.every(ms => ms >= 1000 && ms <= 30000)).toBe(true);
+    expect(requests.some(url => url.endsWith("/poll"))).toBe(true);
+    expect(requests.every(url => !url.includes("enroll"))).toBe(true);
+  } finally { shutdown.abort(); fetchMock.mockRestore(); }
+});
+
+it("shuts down cleanly during a failed session request and releases the daemon lock", async () => {
+  const { dir } = fixture();
+  saveNodeCredential({ version: 1, url: "http://localhost:8741", node_id: "node-retry", token: `uw_node_${"a".repeat(64)}`, expires_at: new Date(Date.now() + 86400000).toISOString(), insecure_transport: true }, dir);
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("fetch failed"));
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const shutdown = new AbortController();
+      const sleep = vi.fn(async () => { shutdown.abort(); throw new Error("aborted"); });
+      await expect(runNode({ dir, signal: shutdown.signal, sleep })).resolves.toBeUndefined();
+      expect(sleep).toHaveBeenCalledTimes(1);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  } finally { fetchMock.mockRestore(); }
+});
