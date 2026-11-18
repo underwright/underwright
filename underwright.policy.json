@@ -152,7 +152,7 @@
         "server": "http://100.119.119.34:8000"
       },
       "agy@alandesktop": {
-        "harness": "agy",
+        "harness": "antigravity-native",
         "server": "http://100.119.119.34:8000"
       },
       "kimi@alandesktop": {
@@ -252,11 +252,17 @@
         "light": "gpt-5.4-nano",
         "standard": "composer-2.5",
         "heavy": "claude-opus-5"
+      },
+      "devin": {
+        "light": "swe-2-medium",
+        "standard": "swe-2-high",
+        "heavy": "adaptive"
       }
     },
     "flags": {
       "grok": "-m",
-      "cursor": "--model"
+      "cursor": "--model",
+      "devin": "--model"
     }
   },
   "dispatch": {
