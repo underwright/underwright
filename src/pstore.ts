@@ -993,7 +993,8 @@ export class PgStore implements IStore {
     if (!claim) return { error: `task ${taskId} is not claimed` };
     if (claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     await this.sql`DELETE FROM claims WHERE task_id=${taskId}`;
-    await this.sql`UPDATE tasks SET status='open', updated_at=now() WHERE id=${taskId}`;
+    // Release the lease without undoing an explicit blocked/review transition.
+    await this.sql`UPDATE tasks SET status='open', updated_at=now() WHERE id=${taskId} AND status='claimed'`;
     await this.log("task", taskId, "released", agentId);
     const dispatched = scoped ? undefined : await this.dispatchNext(agentId, taskId, "release");
     return { released: taskId, ...(dispatched ? { dispatched } : {}) };
