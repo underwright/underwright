@@ -8,10 +8,11 @@ import { getAutoMergePolicy, loadPolicy, type Policy } from "./policy.js";
 export type GhRunner = (cmd: string, input?: string) => any;
 
 const defaultGhRunner: GhRunner = (args: string, input?: string) => {
+  const opts = { encoding: "utf8" as const, maxBuffer: 64 * 1024 * 1024 };
   if (input !== undefined) {
-    return execSync(`gh ${args}`, { encoding: "utf8", input });
+    return execSync(`gh ${args}`, { ...opts, input });
   }
-  const out = execSync(`gh ${args}`, { encoding: "utf8" });
+  const out = execSync(`gh ${args}`, opts);
   return args.includes("--json") ? JSON.parse(out) : out;
 };
 
@@ -75,7 +76,7 @@ export async function syncIssues(
 ) {
   const runner = options.runner ?? defaultGhRunner;
   const issues = (await runner(
-    `issue list --repo ${repo} --state all --limit 200 --json number,title,body,url,state,labels`
+    `issue list --repo ${repo} --state all --limit 1000 --json number,title,body,url,state,labels`
   )) as Issue[];
   const out = { imported: 0, closed_tasks: [] as string[], closed_issues: [] as number[], skipped: 0 };
 
@@ -141,7 +142,7 @@ export async function syncPRs(
   const policy = options.policy ?? loadPolicy();
   const amPolicy = getAutoMergePolicy(repo, policy);
   const prs = (await runner(
-    `pr list --repo ${repo} --state all --limit 200 --json number,title,body,url,state,labels,headRefName,baseRefName,mergedAt`
+    `pr list --repo ${repo} --state all --limit 1000 --json number,title,body,url,state,labels,headRefName,baseRefName,mergedAt`
   )) as PullRequest[];
 
   const out = {
