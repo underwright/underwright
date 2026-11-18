@@ -20,7 +20,8 @@ Cases (ac_id in brackets):
   policy-gate-neg    [permissions]  git push asks, force-push and rm -rf / are denied (negative)
   auth-neg           [guardrails]   session listing without a bearer token is rejected (negative)
   host-online        [host-daemon]  the ops host is registered and online
-  live-host-unit     [host-daemon]  omnigent-host.service is active and enabled, Restart=always, linger on (--live)
+  live-host-unit     [host-daemon]  the host unit (--host-unit, default omnigent.service) is active and enabled, Restart=always, linger on (--live)
+  live-host-unit-neg [host-daemon]  a stopped/disabled/on-failure unit state is rejected by the same parser (negative, offline)
   live-cross-host    [verified]     the session reaches minipc, alandesktop and yoga with no approval prompts (--live)
   live-guardrails    [guardrails]   the session is owner-only and not shared, and carries the ops@minipc identity (--live)
 """
@@ -104,7 +105,7 @@ def check_policy(spec: dict) -> None:
         return str(d.get("decision") or d.get("action") or d.get("result") or d).upper()
 
     allow = ["ssh yoga systemctl --user is-active underwright-node.service", "docker ps",
-             "systemctl --user restart underwright-node", "journalctl --user -u omnigent-host -n 50",
+             "systemctl --user restart underwright-node", "journalctl --user -u omnigent -n 50",
              "git -C ~/code/underwright status"]
     got = {c: verdict(c) for c in allow}
     bad = {c: v for c, v in got.items() if "ALLOW" not in v}
@@ -140,9 +141,8 @@ def check_server(server: str, token: str, host_name: str) -> dict | None:
 
 
 # ---------------------------------------------------------------- live checks
-LIVE_PROMPT = f"""Fleet health check (validation run). Use sys_os_shell for everything.
-1. On minipc (local): hostname; systemctl --user is-active omnigent-host.service;
-   systemctl --user show omnigent-host.service -p Restart -p UnitFileState;
+LIVE_PROMPT = """Fleet health check (validation run). Use sys_os_shell for everything.
+1. On minipc (local): hostname; echo HOSTUNIT-BEGIN; systemctl --user show {unit} -p ActiveState -p UnitFileState -p Restart; echo HOSTUNIT-END;
    loginctl show-user $USER -p Linger; systemctl --user is-active underwright-node.service;
    curl -s http://100.120.201.70:8741/health
 2. For alandesktop and yoga, via ssh -o BatchMode=yes -o ConnectTimeout=8 <host>:
@@ -152,7 +152,30 @@ End your reply with exactly one line per host, in this format and nothing after 
 OPS-CHECK host=<minipc|alandesktop|yoga> reachable=<yes|no> node=<is-active output> heartbeat=<value or none>"""
 
 
-async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: int) -> None:
+def host_unit_ok(shell_out: str) -> tuple[bool, str]:
+    """Parse the HOSTUNIT-BEGIN/END block plus the Linger line from the live run's shell output."""
+    m = re.search(r"HOSTUNIT-BEGIN\s*(.*?)\s*HOSTUNIT-END", shell_out, re.S)
+    props = dict(re.findall(r"^(\w+)=(.*)$", m.group(1), re.M)) if m else {}
+    linger = re.search(r"^Linger=(\w+)", shell_out, re.M)
+    want = {"ActiveState": "active", "UnitFileState": "enabled", "Restart": "always"}
+    bad = {k: props.get(k, "?") for k, v in want.items() if props.get(k) != v}
+    if not linger or linger.group(1) != "yes":
+        bad["Linger"] = linger.group(1) if linger else "?"
+    return not bad, ("active+enabled, Restart=always, Linger=yes" if not bad else f"unexpected {bad}")
+
+
+def check_host_unit_parser() -> None:
+    good = "HOSTUNIT-BEGIN\nActiveState=active\nUnitFileState=enabled\nRestart=always\nHOSTUNIT-END\nLinger=yes\n"
+    # The failure seen before the fix: the named unit did not exist (systemd reports inactive/empty/no).
+    missing = "HOSTUNIT-BEGIN\nActiveState=inactive\nUnitFileState=\nRestart=no\nHOSTUNIT-END\nLinger=yes\n"
+    on_failure = good.replace("Restart=always", "Restart=on-failure")
+    no_linger = good.replace("Linger=yes", "Linger=no")
+    rejected = [n for n, t in (("missing", missing), ("on-failure", on_failure), ("no-linger", no_linger)) if not host_unit_ok(t)[0]]
+    ok = host_unit_ok(good)[0] and len(rejected) == 3
+    case("live-host-unit-neg", ok, f"good accepted, rejected {rejected}")
+
+
+async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: int, unit: str) -> None:
     from omnigent_client import OmnigentClient
 
     async with OmnigentClient(server, headers={"Authorization": f"Bearer {token}"}, timeout=60) as c:
@@ -161,7 +184,7 @@ async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: in
             agent.id, title="fleet-ops: validation", workspace="/home/alan", host_id=host["host_id"],
             labels={"underwright.agent_id": OPS_IDENTITY, "underwright.role": "ops"})
         print(f"      session {s.id}  ({server}/sessions/{s.id})", flush=True)
-        await c.sessions.post_event(s.id, {"type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": LIVE_PROMPT}]}})
+        await c.sessions.post_event(s.id, {"type": "message", "data": {"role": "user", "content": [{"type": "input_text", "text": LIVE_PROMPT.format(unit=unit)}]}})
         deadline, prompts_seen, status = time.time() + timeout_s, 0, "?"
         await asyncio.sleep(15)
         while time.time() < deadline:
@@ -178,8 +201,8 @@ async def live(server: str, token: str, host: dict, cleanup: bool, timeout_s: in
         final = "\n".join(p.get("text", "") for i in items if i.get("type") == "message" and i.get("role") == "assistant" for p in i.get("content", []))
         checks = {m.group(1): m.group(0) for m in re.finditer(r"OPS-CHECK host=(\w+) reachable=yes\b.*", final)}
 
-        unit_ok = all(x in tool_out for x in ("Restart=always", "UnitFileState=enabled", "Linger=yes")) and re.search(r"\bactive\b", tool_out)
-        case("live-host-unit", bool(unit_ok), "omnigent-host.service active+enabled, Restart=always, Linger=yes" if unit_ok else "see session transcript")
+        unit_ok, unit_detail = host_unit_ok(tool_out)
+        case("live-host-unit", unit_ok, f"{unit}: {unit_detail}")
         missing = [h for h in FLEET if h not in checks]
         # The shell output proves the commands ran; the agent's summary line alone is not enough.
         proof = all(re.search(h, tool_out, re.I) for h in FLEET)
@@ -210,10 +233,13 @@ def main() -> int:
     ap.add_argument("--live", action="store_true", help="run a real ops session on the host")
     ap.add_argument("--cleanup", action="store_true", help="delete the live session afterwards")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument("--host-unit", default="omnigent.service",
+                    help="systemd user unit running the host daemon (omnigent-host.service if installed via `omnigent host enable`)")
     a = ap.parse_args()
 
     spec = check_spec()
     check_policy(spec)
+    check_host_unit_parser()
     from omnigent.cli_auth import load_token
 
     token = load_token(a.server)
@@ -223,7 +249,7 @@ def main() -> int:
         host = check_server(a.server, token, a.host)
         if a.live:
             if host and host.get("status") == "online":
-                asyncio.run(live(a.server, token, host, a.cleanup, a.timeout))
+                asyncio.run(live(a.server, token, host, a.cleanup, a.timeout, a.host_unit))
             else:
                 case("live-cross-host", False, f"host {a.host} not online")
 

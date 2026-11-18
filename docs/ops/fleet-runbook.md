@@ -24,7 +24,7 @@ publicly.
 | Host | Unit / process | Scope | Health check |
 |---|---|---|---|
 | minipc | `underwright.service` (`underwright serve`, :8741) | user | `curl -s http://100.120.201.70:8741/health` → `{"ok":true}` |
-| minipc | `omnigent-host.service` | user | `systemctl --user is-active omnigent-host.service` |
+| minipc | `omnigent.service` (omnigent host daemon, `_daemon_entry --local`) | user | `systemctl --user is-active omnigent.service` |
 | every node | `underwright-node.service` | user | `systemctl --user is-active underwright-node.service` |
 | alandesktop | omnigent server (:8000) | — | `curl -s http://100.119.119.34:8000/health` |
 
@@ -41,7 +41,7 @@ interval is down. Check its `underwright-node.service` with
 | Node executor config | `~/.config/underwright/node-executors.json` |
 | Node unit + drop-ins | `~/.config/systemd/user/underwright-node.service{,.d/}` |
 | Omnigent state | `~/.omnigent/` (`config.yaml`, `auth_tokens.json`, `logs/host/`) |
-| Omnigent host unit | `~/.config/systemd/user/omnigent-host.service` (written by `omnigent host enable`) |
+| Omnigent host unit | `~/.config/systemd/user/omnigent.service` + `omnigent.service.d/10-always-on.conf` (`ops/install-ops-host.sh`). Do not also run `omnigent host enable` on minipc: it would add a second host daemon (`omnigent-host.service`). |
 
 ## Routine ops
 

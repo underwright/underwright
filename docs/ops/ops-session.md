@@ -10,7 +10,7 @@ runs the `fleet-ops` agent on an always-on omnigent host on minipc.
 | Agent spec (prompt embeds the runbook) | `ops/fleet-ops/config.yaml` |
 | Fleet runbook (source of truth) | `docs/ops/fleet-runbook.md` |
 | Always-on host installer | `ops/install-ops-host.sh` |
-| Restart policy drop-in | `ops/systemd/omnigent-host.service.d/10-always-on.conf` |
+| Restart policy drop-in | `ops/systemd/10-always-on.conf` |
 | Post-deploy validator | `scripts/validate-ops-session.py` |
 
 ## Install (on minipc, once)
@@ -22,11 +22,17 @@ omnigent agent add ops/fleet-ops/config.yaml                          # register
 ```
 
 `install-ops-host.sh` is safe to re-run. It turns on user lingering, so the unit
-runs with no login session. It runs `omnigent host enable`, which writes
-`~/.config/systemd/user/omnigent-host.service`. Then it installs the
-`10-always-on.conf` drop-in. The generated unit uses `Restart=on-failure` with
-`RestartPreventExitStatus=78 143`, so a clean exit or a stray SIGTERM would
-leave the host down. The drop-in sets `Restart=always`, `RestartSec=10s` and
+runs with no login session. On minipc the host daemon is the existing user unit
+`omnigent.service`, which runs `omnigent.host._daemon_entry --local` against
+the server in `~/.omnigent/config.yaml`. The script adopts that unit and
+does not run `omnigent host enable`, because that command would add a second
+daemon (`omnigent-host.service`) registering under the same host name. On a
+machine with no `omnigent.service`, the script runs `omnigent host enable`
+instead and uses the `omnigent-host.service` that it writes. Either way it
+installs the `10-always-on.conf` drop-in on the host unit. The
+`omnigent-host.service` that `host enable` generates uses
+`Restart=on-failure` with `RestartPreventExitStatus=78 143`, so a clean exit
+or a stray SIGTERM would leave the host down. The drop-in sets `Restart=always`, `RestartSec=10s` and
 `StartLimitIntervalSec=0`. Only exit 78 (EX_CONFIG) stops the restarts, so a
 broken config does not loop. An explicit `systemctl --user stop` still stops
 the unit.
