@@ -349,7 +349,7 @@ describe("omnigent backend", () => {
   it("keeps the server URL out of scripts (no uw-watch.mjs-style hardcode)", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const scripts = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
-      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist") return [];
+      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist" || entry.name === ".uw") return [];
       const path = join(dir, entry.name);
       if (entry.isDirectory()) return scripts(path);
       return /\.(mjs|js|cjs)$/.test(entry.name) ? [path] : [];
