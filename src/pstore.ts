@@ -3,7 +3,7 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
-import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
+import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, routeAgentSpec, type DispatcherPolicy, type RubricRule } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
@@ -1535,10 +1535,11 @@ export class PgStore implements IStore {
     if (a.type === "agent" ? !a.agent?.executable || !a.agent.prompt : !a.command)
       return { error: "command required, or executable and prompt for agent jobs" };
     const id = `job-${randomUUID().slice(0, 8)}`;
+    const agent = a.agent ? routeAgentSpec(a.agent) : undefined;
     await this.sql`INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec)
       VALUES (${id},${a.task_id ?? null},${a.agent_id},${a.type},${a.command ?? ""},${a.host ?? null},
-      ${a.target_agent_id ?? null},${a.agent ? JSON.stringify(a.agent) : null})`;
-    await this.log("job", id, "submitted", a.agent_id, a);
+      ${a.target_agent_id ?? null},${agent ? JSON.stringify(agent) : null})`;
+    await this.log("job", id, "submitted", a.agent_id, agent ? { ...a, agent } : a);
     return { id, status: "queued" };
   }
 

@@ -135,6 +135,9 @@
       "max_attempts": 2
     }
   },
+  "omnigent": {
+    "server": "http://100.119.119.34:8000"
+  },
   "harness_matrix": {
     "agents": {
       "codex@laptop-2": {

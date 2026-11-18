@@ -387,10 +387,15 @@ control it:
 | `harness` | Harness name for the omnigent backend; defaults to the policy matrix, then the executable basename |
 | `server` | Remote omnigent server, passed as `omni run --server <server>` (use `"remote"` for the managed control plane) |
 
+The control plane resolves the server once from `omnigent.server` in
+`underwright.policy.json`, overridden by `UNDERWRIGHT_OMNIGENT_SERVER` or
+`OMNIGENT_SERVER`, and stamps it into `agent_spec.server` on submission —
+so job specs carry it explicitly and runners do not need cwd policy or per-host
+`~/.omnigent/config.yaml`. An explicit `spec.server` is never overwritten.
 The policy `harness_matrix` maps `agent_id` (or `"*"`) to a preferred
-`harness`/`backend`/`server`; the per-job spec fields win over the policy.
-When the resolved backend is omnigent and the `omni` CLI is on the runner's
-PATH, the runner templates:
+`harness`/`backend`; per-job spec fields win over the matrix. When the resolved
+backend is omnigent and the `omni` CLI is on the runner's PATH, the runner
+templates:
 
 ```text
 omni run --harness H [--server S] -p PROMPT
