@@ -1,0 +1,8 @@
+[Unit]
+Description=Propose Underwright model catalog updates
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/underwright
+EnvironmentFile=%h/.config/underwright/model-catalog.env
+ExecStart=/usr/bin/env node dist/cli.js models refresh --publish
