@@ -176,7 +176,8 @@
       "opencode": true,
       "pi": true,
       "grok": true,
-      "cursor": true
+      "cursor": true,
+      "cline": true
     }
   },
   "github_status": {
@@ -256,7 +257,7 @@
       "devin": {
         "light": "swe-2-medium",
         "standard": "swe-2-high",
-        "heavy": "adaptive"
+        "heavy": "swe-2-high"
       }
     },
     "flags": {
@@ -274,13 +275,14 @@
       "covasant/Aura": "auraa_0"
     },
     "harness_order": [
+      "kimi",
       "claude",
       "codex",
       "grok",
       "cursor",
       "opencode",
       "agy",
-      "kimi",
+      "cline",
       "devin",
       "command-code",
       "copilot",
@@ -290,7 +292,8 @@
       "devin",
       "cmdc",
       "command-code",
-      "opencode"
+      "opencode",
+      "cline"
     ]
   },
   "rubrics": {
