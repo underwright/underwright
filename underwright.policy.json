@@ -112,7 +112,11 @@
           "note": "quota \u2014 needs seat failover or human"
         }
       ]
-    }
+    },
+    "max_agent_jobs_per_minute": 10,
+    "failure_window_minutes": 30,
+    "failure_min_samples": 5,
+    "failure_max_pct": 70
   },
   "dor": {
     "require_type": true,
