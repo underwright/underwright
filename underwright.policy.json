@@ -75,7 +75,7 @@
   },
   "watch": {
     "max_inflight": 14,
-    "max_agent_jobs_per_day": 80,
+    "max_agent_jobs_per_day": 1000,
     "codex_seats": [
       "/home/alan/.codex-seat-gmail",
       "/home/alan/.codex-seat-covasant"
