@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError, type UsageSample } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
+import { paceByHarness, mergeUsageQuota, paceWeights, sampleRow, USAGE_LOOKBACK_MS, type ProviderPace, type UsageRow } from "./quota-usage.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -536,10 +537,14 @@ export class PgStore implements IStore {
     meta.eligible = candidates.length;
     const skip = (r: SkipReason) => { meta.skipped[r] = (meta.skipped[r] ?? 0) + 1; };
     const policy = typeof node.policy_json === "string" ? JSON.parse(node.policy_json || "{}") : node.policy_json;
-    const capsJson = mergeObservedQuota(
+    const capsJsonObserved = mergeObservedQuota(
       typeof node.capabilities_json === "string" ? node.capabilities_json : JSON.stringify(node.capabilities_json ?? {}),
       await this.observedExhaustedProviders(),
     );
+    // gh-149: usage-derived quota + pace weights (see store.ts).
+    const pace = await this.usagePace();
+    const capsJson = mergeUsageQuota(capsJsonObserved, pace);
+    const weights = paceWeights(pace);
     const now = new Date().toISOString();
     const avoid = new Set(
       ((await this.nodeQuery(
@@ -564,7 +569,7 @@ export class PgStore implements IStore {
         policy,
         capabilitiesJson: capsJson,
         capabilitiesObservedAt: node.capabilities_observed_at,
-      }, matchDispatch, routing, Date.parse(now), avoid);
+      }, matchDispatch, routing, Date.parse(now), avoid, weights);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
       // A task claimed to one of this node's agents must run AS that agent —
@@ -672,7 +677,7 @@ export class PgStore implements IStore {
     });
   }
 
-  async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
+  async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string; usage?: UsageSample[] } = {}) {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
@@ -686,6 +691,7 @@ export class PgStore implements IStore {
         [now, principal.node_id, body.capabilities_version],
       );
     await this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
+    if (body.usage?.length) await this.recordUsageSamples(principal.node_id, body.usage);
     const [row] = await this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
   }
@@ -1317,6 +1323,54 @@ export class PgStore implements IStore {
     );
   }
 
+  /** gh-149: append heartbeat usage samples. Idempotent per
+   *  (node, harness, sampled_at) — daemons resend the latest reading until a
+   *  new one lands. Future-dated readings are dropped (clock skew would pin
+   *  the "latest" sample). Each stored sample emits a harness.usage metric. */
+  private async recordUsageSamples(nodeId: string, samples: UsageSample[]) {
+    const received = new Date().toISOString();
+    let stored = 0;
+    for (const s of samples) {
+      if (Date.parse(s.sampled_at) > Date.now() + 5 * 60_000) continue;
+      const r = sampleRow(nodeId, s);
+      const inserted = await this.nodeQuery(
+        `INSERT INTO usage_samples(node_id,harness,sampled_at,tokens_in,tokens_out,cost,window_used_pct,window_kind,resets_at,vendor_state,received_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id,harness,sampled_at) DO NOTHING RETURNING harness`,
+        [r.node_id, r.harness, r.sampled_at, r.tokens_in, r.tokens_out, r.cost, r.window_used_pct, r.window_kind, r.resets_at, r.vendor_state, received],
+      );
+      if (!inserted.length) continue;
+      stored++;
+      telemetry().metric("harness.usage", s.window_used_pct ?? 0, {
+        node_id: nodeId, harness: s.harness, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost,
+        window_kind: s.window_kind, resets_at: s.resets_at, vendor_state: s.vendor_state, sampled_at: r.sampled_at,
+      });
+    }
+    if (stored) this.usageCache = null;
+  }
+
+  private usageCache: { at: number; pace: Map<string, ProviderPace> } | null = null;
+
+  /** gh-149: per-provider pace from usage_samples history. Cached briefly —
+   *  dispatch asks on every throttled match pass. */
+  private async usagePace(now = Date.now()): Promise<Map<string, ProviderPace>> {
+    if (this.usageCache && now - this.usageCache.at < 15_000) return this.usageCache.pace;
+    const since = new Date(now - USAGE_LOOKBACK_MS).toISOString();
+    const rows = await this.nodeQuery(
+      "SELECT node_id,harness,sampled_at,tokens_in,tokens_out,cost,window_used_pct,window_kind,resets_at,vendor_state FROM usage_samples WHERE sampled_at >= ? ORDER BY sampled_at",
+      [since],
+    ) as UsageRow[];
+    const pace = paceByHarness(rows, now);
+    this.usageCache = { at: now, pace };
+    return pace;
+  }
+
+  /** gh-149: "grok burn rate this week" / "projected % at reset" — pace per
+   *  provider from sampled history, optionally filtered to one harness. */
+  async providerUsage(harness?: string) {
+    const pace = [...(await this.usagePace()).values()];
+    return { providers: harness ? pace.filter(p => p.harness === harness) : pace, generated_at: new Date().toISOString() };
+  }
+
   /** Providers currently observed-exhausted (reset window not yet passed). */
   private async observedExhaustedProviders(now = Date.now()): Promise<Map<string, { state: string; resets_at: string | null }>> {
     const rows = await this.nodeQuery("SELECT provider, resets_at FROM provider_quota WHERE state='exhausted'", []) as { provider: string; resets_at: string | null }[];
@@ -1528,7 +1582,7 @@ export class PgStore implements IStore {
       job_counts,
       helpers_registered: n,
       nodes,
-      providers: aggregateProviders(nodes, failures as any, counts as any),
+      providers: aggregateProviders(nodes, failures as any, counts as any, Date.now(), await this.usagePace()),
       unread_messages: Object.fromEntries(unread.map(r => [r.to_agent, r.n])),
       agent_activity: Object.fromEntries(activity.map(r => [r.actor, r.last_at])),
     };

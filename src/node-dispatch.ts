@@ -75,11 +75,12 @@ export function mergeObservedQuota(
 }
 
 /** Node's launchable harnesses: attested, installed, auth ready, quota open,
- *  ordered by dispatch.harness_order then attestation order. When the node
+ *  ordered by window pace (gh-149), then dispatch.harness_order, then
+ *  attestation order. When the node
  *  has an installed+ready harness blocked by quota and freeFallback names
  *  cheaper harnesses, those are promoted first — spend free capacity before
  *  draining another paid provider while quota is scarce. */
-export function launchableHarnesses(capabilitiesJson: string, harnessOrder: string[], now = Date.now(), freeFallback: readonly string[] = []): string[] {
+export function launchableHarnesses(capabilitiesJson: string, harnessOrder: string[], now = Date.now(), freeFallback: readonly string[] = [], paceWeights: Readonly<Record<string, number>> = {}): string[] {
   let caps: { harnesses?: Array<{ id?: string; installed?: boolean; auth_status?: string; quota?: { state?: string; resets_at?: string } }> };
   try {
     caps = JSON.parse(capabilitiesJson || "{}");
@@ -95,7 +96,14 @@ export function launchableHarnesses(capabilitiesJson: string, harnessOrder: stri
     })
     .map(h => h.id as string);
   const ranked = harnessOrder.filter(h => ready.includes(h));
-  const ordered = [...ranked, ...ready.filter(h => !ranked.includes(h))];
+  // gh-149 pace-aware routing: stable sort by window pace — a harness behind
+  // its linear-to-100% curve (unused prepaid budget) goes first, one ahead of
+  // pace goes later. Unsampled harnesses sit at 0 (on pace); harness_order
+  // breaks ties.
+  const ordered = [...ranked, ...ready.filter(h => !ranked.includes(h))]
+    .map((h, i) => ({ h, i, w: paceWeights[h] ?? 0 }))
+    .sort((a, b) => a.w - b.w || a.i - b.i)
+    .map(x => x.h);
   if (quotaBlocked && freeFallback.length && ordered.some(h => freeFallback.includes(h)))
     return [...ordered.filter(h => freeFallback.includes(h)), ...ordered.filter(h => !freeFallback.includes(h))];
   return ordered;
@@ -156,12 +164,13 @@ export function matchTaskToNode(
   routing = getModelRouting(loadPolicy()),
   now = Date.now(),
   avoidHarnesses: ReadonlySet<string> = new Set(),
+  paceWeights: Readonly<Record<string, number>> = {},
 ): { match: DispatchMatch } | { skip: SkipReason } {
   const workspace = workspaceForTask(task, dispatch.workspaces, dispatch.default_workspace);
   if (!workspace || !((node.policy as { workspace_ids?: string[] })?.workspace_ids ?? []).includes(workspace)) {
     return { skip: "no_workspace" };
   }
-  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now, dispatch.free_fallback)
+  const ready = launchableHarnesses(node.capabilitiesJson, dispatch.harness_order, now, dispatch.free_fallback, paceWeights)
     .filter(h => !avoidHarnesses.has(h));
   // Model args only ship to daemons that attest launch-model-flag — older
   // strict payload schemas reject unknown keys ("invalid task parameters").

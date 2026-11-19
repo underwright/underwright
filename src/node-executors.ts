@@ -36,6 +36,11 @@ export interface ExecutorConfig {
   /** Pinned worker slots for this node (gh-91). Clamped to the protocol max
    *  (8). Overrides the inventory probe's max_concurrency recommendation. */
   concurrency?: number;
+  /** gh-149: per-harness usage sources sampled onto the heartbeat. Each file
+   *  holds one JSON usage reading ({tokens_in, tokens_out, cost,
+   *  window_used_pct, window_kind, resets_at, vendor_state, sampled_at}) —
+   *  written by omnigent session metrics or a vendor usage scraper. */
+  usage?: Record<string, { file: string }>;
   timeoutMs?: number;
   onSpawn?: (pid: number) => void;
   maxOutput?: number;

@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError, type UsageSample } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -6,6 +6,7 @@ import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, L
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, type DispatcherPolicy } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
+import { paceByHarness, mergeUsageQuota, paceWeights, sampleRow, USAGE_LOOKBACK_MS, type ProviderPace, type UsageRow } from "./quota-usage.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
@@ -62,6 +63,54 @@ export class SqliteStore implements IStore {
          observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
       [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
     );
+  }
+
+  /** gh-149: append heartbeat usage samples. Idempotent per
+   *  (node, harness, sampled_at) — daemons resend the latest reading until a
+   *  new one lands. Future-dated readings are dropped (clock skew would pin
+   *  the "latest" sample). Each stored sample emits a harness.usage metric. */
+  private recordUsageSamples(nodeId: string, samples: UsageSample[]) {
+    const received = new Date().toISOString();
+    let stored = 0;
+    for (const s of samples) {
+      if (Date.parse(s.sampled_at) > Date.now() + 5 * 60_000) continue;
+      const r = sampleRow(nodeId, s);
+      const inserted = this.nodeQuery(
+        `INSERT INTO usage_samples(node_id,harness,sampled_at,tokens_in,tokens_out,cost,window_used_pct,window_kind,resets_at,vendor_state,received_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id,harness,sampled_at) DO NOTHING RETURNING harness`,
+        [r.node_id, r.harness, r.sampled_at, r.tokens_in, r.tokens_out, r.cost, r.window_used_pct, r.window_kind, r.resets_at, r.vendor_state, received],
+      );
+      if (!inserted.length) continue;
+      stored++;
+      telemetry().metric("harness.usage", s.window_used_pct ?? 0, {
+        node_id: nodeId, harness: s.harness, tokens_in: s.tokens_in, tokens_out: s.tokens_out, cost: s.cost,
+        window_kind: s.window_kind, resets_at: s.resets_at, vendor_state: s.vendor_state, sampled_at: r.sampled_at,
+      });
+    }
+    if (stored) this.usageCache = null;
+  }
+
+  private usageCache: { at: number; pace: Map<string, ProviderPace> } | null = null;
+
+  /** gh-149: per-provider pace from usage_samples history. Cached briefly —
+   *  dispatch asks on every throttled match pass. */
+  private usagePace(now = Date.now()): Map<string, ProviderPace> {
+    if (this.usageCache && now - this.usageCache.at < 15_000) return this.usageCache.pace;
+    const since = new Date(now - USAGE_LOOKBACK_MS).toISOString();
+    const rows = this.nodeQuery(
+      "SELECT node_id,harness,sampled_at,tokens_in,tokens_out,cost,window_used_pct,window_kind,resets_at,vendor_state FROM usage_samples WHERE sampled_at >= ? ORDER BY sampled_at",
+      [since],
+    ) as UsageRow[];
+    const pace = paceByHarness(rows, now);
+    this.usageCache = { at: now, pace };
+    return pace;
+  }
+
+  /** gh-149: "grok burn rate this week" / "projected % at reset" — pace per
+   *  provider from sampled history, optionally filtered to one harness. */
+  providerUsage(harness?: string) {
+    const pace = [...(this.usagePace()).values()];
+    return { providers: harness ? pace.filter(p => p.harness === harness) : pace, generated_at: new Date().toISOString() };
   }
 
   /** Providers currently observed-exhausted (reset window not yet passed). */
@@ -490,7 +539,11 @@ export class SqliteStore implements IStore {
     // Provider-level exhaustion observed from job results folds into the
     // node's attested caps — quotaAllows then blocks it on every node, and
     // dispatch.free_fallback promotes zero-cost harnesses while quota is scarce.
-    const capabilitiesJson = mergeObservedQuota(node.capabilities_json, this.observedExhaustedProviders());
+    // gh-149: usage-derived quota (vendor exhausted/rate_limited, window ~full)
+    // folds in the same way; pace weights rank harnesses by unused budget.
+    const pace = this.usagePace();
+    const capabilitiesJson = mergeUsageQuota(mergeObservedQuota(node.capabilities_json, this.observedExhaustedProviders()), pace);
+    const weights = paceWeights(pace);
     // Per-(node,harness) backoff: dispatch-formed failures in the last 15 min
     // park that harness — attested quota/readiness can lie (out-of-credits,
     // bad node-local config) and only execution reveals it.
@@ -523,7 +576,7 @@ export class SqliteStore implements IStore {
         policy,
         capabilitiesJson,
         capabilitiesObservedAt: node.capabilities_observed_at,
-      }, matchDispatch, routing, Date.parse(now), avoid);
+      }, matchDispatch, routing, Date.parse(now), avoid, weights);
       if ("skip" in result) { skip(result.skip); continue; }
       const m = result.match;
       // A task claimed to one of this node's agents must run AS that agent —
@@ -632,7 +685,7 @@ export class SqliteStore implements IStore {
     });
   }
 
-  nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
+  nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string; usage?: UsageSample[] } = {}) {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
@@ -648,6 +701,7 @@ export class SqliteStore implements IStore {
         [now, principal.node_id, body.capabilities_version],
       );
     this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
+    if (body.usage?.length) this.recordUsageSamples(principal.node_id, body.usage);
     const [row] = this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
   }
@@ -1706,6 +1760,8 @@ export class SqliteStore implements IStore {
       nodes,
       this.db.prepare("SELECT agent_id,substr(result,-800) result,finished_at FROM jobs WHERE type='node' AND status='failed' AND datetime(finished_at) > datetime('now','-6 hours')").all() as any[],
       this.db.prepare("SELECT agent_id,status,COUNT(*) n FROM jobs WHERE type='node' AND datetime(created_at) > datetime('now','-6 hours') GROUP BY agent_id,status").all() as any[],
+      Date.now(),
+      this.usagePace(),
     );
     return {
       tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })),

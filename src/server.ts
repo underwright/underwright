@@ -64,6 +64,10 @@ Rules of engagement:
   server.tool("board", "Show the task board: all tasks, who holds each claim, job counts.", {},
     async () => text(await store.board()));
 
+  server.tool("provider_usage", "Per-provider quota pace from usage samples (gh-149): window %, burn rate (tokens/hr, %/hr), pace vs the linear-to-100% curve, and projected % consumed at reset.", {
+    harness: z.string().max(64).optional().describe("limit to one provider/harness id, e.g. grok"),
+  }, async (a) => text(await store.providerUsage(a.harness)));
+
   server.tool("digest", "Summarize board delta since a timestamp (standup digest) and optionally send the summary to an agent's mailbox.", {
     since: z.string().optional().describe("ISO8601 timestamp or relative window like 24h, 30m (default: 24h ago)"),
     to_agent: z.string().optional().describe("if set, send the formatted digest summary to this agent's mailbox"),

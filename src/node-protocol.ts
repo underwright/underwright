@@ -78,11 +78,31 @@ export const NODE_DISPATCH_THROTTLE_MS = 3_000;
  *  saturated the event loop (~1.7k queries + ~280 WAL commits/sec fleet-wide).
  *  500ms keeps pickup latency sub-second with 10× less churn. */
 export const NODE_POLL_RETRY_MS = 500;
+/** gh-149: subscription window shapes a harness's quota can follow. */
+export const USAGE_WINDOW_KINDS = ['5h', 'daily', 'weekly', 'monthly'] as const;
+/** gh-149: one per-harness usage reading carried on the heartbeat. Token and
+ *  cost counters are cumulative for the node's current window/session (a drop
+ *  means the counter reset); window_used_pct is the vendor's account-level
+ *  position in the subscription window. vendor_state lets a vendor surface
+ *  say "rate limited" / "exhausted" outright. */
+export const usageSampleSchema = z.object({
+  harness: z.string().min(1).max(64),
+  tokens_in: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  tokens_out: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+  cost: z.number().nonnegative().max(1e9).optional(),
+  window_used_pct: z.number().min(0).max(1000).optional(),
+  window_kind: z.enum(USAGE_WINDOW_KINDS).optional(),
+  resets_at: z.string().datetime({ offset: true }).optional(),
+  vendor_state: z.enum(['available', 'rate_limited', 'exhausted']).optional(),
+  sampled_at: z.string().datetime({ offset: true }),
+}).strict();
+export type UsageSample = z.output<typeof usageSampleSchema>;
 export const nodeHeartbeatSchema = z.object({
   session_id: z.string().min(1).max(64),
   capabilities_version: z.number().int().nonnegative().optional(),
   active_job_id: z.string().max(64).optional(),
   phase: z.enum(['idle', 'polling', 'running']).optional(),
+  usage: z.array(usageSampleSchema).max(16).optional(),
 }).strict();
 export const nodeHarnessSchema = z.object({
   id: z.string().min(1).max(64),
@@ -90,11 +110,16 @@ export const nodeHarnessSchema = z.object({
   installed: z.boolean().default(false),
   auth_status: z.enum(['ready', 'missing', 'unknown']).default('unknown'),
   quota: z.object({
-    state: z.enum(['available', 'unknown', 'stale', 'exhausted']).default('unknown'),
+    /** rate_limited (gh-149) is a short vendor throttle distinct from
+     *  subscription exhaustion; both block until resets_at. */
+    state: z.enum(['available', 'unknown', 'stale', 'exhausted', 'rate_limited']).default('unknown'),
     observed_at: z.string().optional(),
     /** When the operator says the quota window resets; exhausted entries with
      *  a past resets_at are eligible again (the next attest clears the state). */
     resets_at: z.string().optional(),
+    /** gh-149: a manual declaration with override=true beats usage-derived
+     *  state; without it the more restrictive of attested/derived wins. */
+    override: z.boolean().optional(),
   }).strict().default({ state: 'unknown' }),
 }).strict();
 export const nodeInventorySchema = z.object({
@@ -159,11 +184,12 @@ export function projectNode(node: any, now = Date.now()) {
   };
 }
 /** Quota gate shared by routing and job submission: available/unknown always
- *  pass; exhausted blocks until its resets_at window has passed. */
+ *  pass; exhausted/rate_limited block until their resets_at has passed — the
+ *  harness then re-enters on its own without a fresh attestation. */
 export function quotaAllows(quota: { state?: string; resets_at?: string } | undefined, now = Date.now()): boolean {
   const state = quota?.state ?? 'unknown';
   if (state === 'available' || state === 'unknown') return true;
-  if (state === 'exhausted' && quota?.resets_at) {
+  if ((state === 'exhausted' || state === 'rate_limited') && quota?.resets_at) {
     const resets = Date.parse(quota.resets_at);
     return Number.isFinite(resets) && resets <= now;
   }

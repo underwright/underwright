@@ -246,9 +246,28 @@ ${section("Nodes", nodes, [
 ${section("Providers", providers, [
   { label: "Provider", render: field("id") },
   { label: "Nodes", render: (p) => `${p.ready}/${p.nodes} ready` },
-  { label: "Quota", render: (p) => p.exhausted
-      ? `<span class="iss-billing">exhausted×${p.exhausted}</span>${p.resets_at ? ` <span class="muted">→ ${escapeHtml(p.resets_at.slice(0, 16))}</span>` : ""}`
+  { label: "Quota", render: (p) => (p.exhausted || p.rate_limited)
+      ? [p.exhausted ? `<span class="iss-billing">exhausted×${p.exhausted}</span>` : "", p.rate_limited ? `<span class="iss-rate_limit">rate_limited×${p.rate_limited}</span>` : ""].filter(Boolean).join(" ")
+        + (p.resets_at ? ` <span class="muted">→ ${escapeHtml(p.resets_at.slice(0, 16))}</span>` : "")
       : `<span class="muted">ok/unknown</span>` },
+  { label: "Window", render: (p) => {
+    const u = p.usage;
+    if (!u || u.window_used_pct == null) return `<span class="muted">—</span>`;
+    const pace = u.pace_delta == null ? "" : u.pace_delta > 5 ? ` <span class="iss-rate_limit">ahead ${u.pace_delta}</span>` : u.pace_delta < -5 ? ` <span class="poll-silent">behind ${-u.pace_delta}</span>` : ` <span class="poll-ok">on pace</span>`;
+    return `${u.window_used_pct}% ${escapeHtml(u.window_kind ?? "")}${pace}${u.resets_at ? ` <span class="muted">resets ${escapeHtml(u.resets_at.slice(0, 16))}</span>` : ""}`;
+  } },
+  { label: "Burn", render: (p) => {
+    const u = p.usage;
+    const parts = [u?.tokens_per_hr != null ? `${u.tokens_per_hr} tok/h` : "", u?.pct_per_hr != null ? `${u.pct_per_hr}%/h` : "", `${p.jobs_per_hr ?? 0} jobs/h`].filter(Boolean);
+    return escapeHtml(parts.join(" · "));
+  } },
+  { label: "Projected at reset", render: (p) => {
+    const v = p.usage?.projected_pct_at_reset;
+    if (v == null) return `<span class="muted">—</span>`;
+    // Use it or lose it: under ~90% is prepaid quota going to waste; over 100% exhausts early.
+    const cls = v > 100 ? "iss-rate_limit" : v < 90 ? "iss-billing" : "poll-ok";
+    return `<span class="${cls}">${v}%</span>`;
+  } },
   { label: "Jobs 6h", render: (p) => `${p.jobs_6h.done} done · ${p.jobs_6h.failed} failed` },
   { label: "Issues", render: (p) => p.issues.length
       ? p.issues.slice(0, 2).map((i: any) => `<span class="iss-${i.kind}">${i.kind}×${i.count}</span>`).join(" ") + ` <span class="muted">${escapeHtml(p.issues[0].last_msg)}</span>`

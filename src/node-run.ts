@@ -1,6 +1,6 @@
 /** Outbound daemon with independent liveness and lease loops, typed execution and durable receipts. */
 import { createExecutorRegistry, redact, type ExecutorConfig } from './node-executors.js';
-import { NODE_MAX_CONCURRENCY } from './node-protocol.js';
+import { NODE_MAX_CONCURRENCY, usageSampleSchema, type UsageSample } from './node-protocol.js';
 import { AttemptJournal, processStart } from './node-journal.js';
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { arch, platform } from "node:os";
@@ -64,6 +64,27 @@ export function defaultInventoryProbe(): Record<string, unknown> {
   };
 }
 
+export type UsageProbe = () => Promise<UsageSample[]> | UsageSample[];
+
+/** gh-149: read each configured usage source file. Unreadable or invalid
+ *  sources are skipped — sampling must never wedge the heartbeat. */
+export function readUsageSources(sources: Record<string, { file: string }> = {}): UsageSample[] {
+  const out: UsageSample[] = [];
+  for (const [harness, src] of Object.entries(sources)) {
+    try {
+      const raw = JSON.parse(readFileSync(src.file, "utf8"));
+      const parsed = usageSampleSchema.safeParse({ ...raw, harness });
+      if (parsed.success) out.push(parsed.data);
+    } catch { /* missing/unparseable source — skip this beat */ }
+  }
+  return out.slice(0, 16);
+}
+
+/** Only readings the server hasn't acknowledged ride the heartbeat. */
+export function pendingUsage(samples: UsageSample[], acked: Map<string, string>): UsageSample[] {
+  return samples.filter(s => acked.get(s.harness) !== s.sampled_at);
+}
+
 function configSupportedKinds(config: ExecutorConfig): string[] {
   const kinds: string[] = [];
   if (Object.keys(config.scripts ?? {}).length) kinds.push('run-script');
@@ -83,6 +104,7 @@ export async function runNode(opts: {
   heartbeatMs?: number;
   capabilitiesMs?: number;
   sleep?: typeof sleepSignal;
+  usageProbe?: UsageProbe;
 } = {}) {
   const dir = opts.dir ?? nodeStateDirectory();
   const cred = readNodeCredential(dir);
@@ -97,6 +119,8 @@ export async function runNode(opts: {
   // config.inventory attests harness readiness; the operational arrays are
   // derived from what the executor registry can actually run.
   const probe = opts.probe ?? (() => ({ ...defaultInventoryProbe(), ...(opts.config?.inventory as object | undefined) }));
+  const usageProbe: UsageProbe = opts.usageProbe ?? (() => readUsageSources(opts.config?.usage));
+  const usageAcked = new Map<string, string>();
   const heartbeatMs = opts.heartbeatMs ?? 15_000;
   const capabilitiesMs = opts.capabilitiesMs ?? 60_000;
   const abort = new AbortController();
@@ -155,8 +179,14 @@ export async function runNode(opts: {
             try {
               const active_job_id = [...activeJobs][0];
               const phase = activeJobs.size ? "running" : "idle";
-              const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase }, "POST", sessionAbort.signal);
+              let usage: UsageSample[] = [];
+              try { usage = pendingUsage(await usageProbe(), usageAcked); } catch { usage = []; }
+              const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase, ...(usage.length ? { usage } : {}) }, "POST", sessionAbort.signal);
               if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
+              if (usage.length && !result.error && (result.status ?? 200) < 400) {
+                for (const u of usage) usageAcked.set(u.harness, u.sampled_at);
+                tel.event("node.usage_sampled", { harnesses: usage.map(u => u.harness).join(",") });
+              }
             } catch (error) { if (sessionAbort.signal.aborted) return; await backoff(error, sessionAbort.signal); }
             await sleep(heartbeatMs, sessionAbort.signal).catch(() => undefined);
           }

@@ -101,7 +101,9 @@ export interface IStore {
   renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
   finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
   sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;
-  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
+  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string; usage?: import("./node-protocol.js").UsageSample[] }): Awaitable<any>;
+  /** gh-149: per-provider window pace from usage_samples history. */
+  providerUsage(harness?: string): Awaitable<{ providers: import("./quota-usage.js").ProviderPace[]; generated_at: string }>;
   putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
 
   issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string): Awaitable<any>;

@@ -39,7 +39,7 @@ const OMNI_HARNESSES: Record<string, string> = {
 
 const KNOWN_SECTIONS = new Set([
   "workspaces", "repositories", "harnesses", "installers", "scripts",
-  "inventory", "concurrency", "timeoutMs", "envAllow", "maxOutput",
+  "inventory", "concurrency", "timeoutMs", "envAllow", "maxOutput", "usage",
   "prepareHarnesses",
 ]);
 

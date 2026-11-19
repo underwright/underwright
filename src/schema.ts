@@ -303,4 +303,21 @@ CREATE TABLE IF NOT EXISTS provider_quota (
   source_job_id TEXT,
   reason TEXT
 );
+/** gh-149: append-only per-(node,harness) usage history fed by heartbeat
+ *  sampling. Answers burn rate and projected %-at-reset per provider. */
+CREATE TABLE IF NOT EXISTS usage_samples (
+  node_id TEXT NOT NULL,
+  harness TEXT NOT NULL,
+  sampled_at TEXT NOT NULL,
+  tokens_in BIGINT,
+  tokens_out BIGINT,
+  cost DOUBLE PRECISION,
+  window_used_pct DOUBLE PRECISION,
+  window_kind TEXT,
+  resets_at TEXT,
+  vendor_state TEXT,
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (node_id, harness, sampled_at)
+);
+CREATE INDEX IF NOT EXISTS usage_samples_harness_ts ON usage_samples(harness, sampled_at);
 `;

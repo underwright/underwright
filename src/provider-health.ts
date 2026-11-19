@@ -1,7 +1,11 @@
 /** Per-provider health rollup for the board/dashboard: attested quota state
  *  aggregated across nodes plus execution-detected issues from recent job
- *  results. Token-level burn arrives with usage sampling (gh-149); until then
- *  job counts are the activity signal. */
+ *  results, plus window pace from usage sampling (gh-149): burn rate and the
+ *  projected % consumed at reset — the number that says whether prepaid
+ *  quota is being wasted. Job counts remain the activity signal for
+ *  unsampled providers. */
+
+import { mergeQuota, type ProviderPace } from "./quota-usage.js";
 
 export type IssueKind = "billing" | "rate_limit" | "auth" | "config" | "aborted" | "other";
 
@@ -17,9 +21,13 @@ export interface ProviderRow {
   nodes: number;           // nodes attesting it installed
   ready: number;           // installed + auth ready + quota allows
   exhausted: number;       // nodes declaring quota exhausted
-  resets_at: string | null; // nearest future reset among exhausted entries
+  rate_limited: number;    // nodes in a vendor rate-limit window (gh-149)
+  resets_at: string | null; // nearest future reset among exhausted/rate-limited entries
   jobs_6h: { done: number; failed: number; other: number };
+  jobs_per_hr: number;     // finished jobs/hr over the 6h window
   issues: ProviderIssue[];
+  /** gh-149 window pace; null until the provider has usage samples. */
+  usage: Pick<ProviderPace, "window_kind" | "window_used_pct" | "resets_at" | "sampled_at" | "tokens_per_hr" | "cost_per_hr" | "pct_per_hr" | "expected_pct" | "pace_delta" | "projected_pct_at_reset" | "derived_state"> | null;
 }
 
 /** Classify a finished job's result tail into the failure bucket that matters
@@ -77,11 +85,12 @@ export function aggregateProviders(
   failures: Array<{ agent_id: string; result?: string; finished_at?: string }>,
   jobCounts: Array<{ agent_id: string; status: string; n: number }>,
   now = Date.now(),
+  pace: ReadonlyMap<string, ProviderPace> = new Map(),
 ): ProviderRow[] {
   const map = new Map<string, ProviderRow>();
   const row = (id: string) => {
     let r = map.get(id);
-    if (!r) { r = { id, nodes: 0, ready: 0, exhausted: 0, resets_at: null, jobs_6h: { done: 0, failed: 0, other: 0 }, issues: [] }; map.set(id, r); }
+    if (!r) { r = { id, nodes: 0, ready: 0, exhausted: 0, rate_limited: 0, resets_at: null, jobs_6h: { done: 0, failed: 0, other: 0 }, jobs_per_hr: 0, issues: [], usage: null }; map.set(id, r); }
     return r;
   };
 
@@ -90,12 +99,15 @@ export function aggregateProviders(
       if (!h.installed) continue;
       const r = row(h.id);
       r.nodes++;
-      const quotaState = h.quota?.state ?? "unknown";
-      const resets = h.quota?.resets_at ? Date.parse(h.quota.resets_at) : NaN;
-      const quotaOk = quotaState !== "exhausted" || (Number.isFinite(resets) && resets <= now);
-      if (quotaState === "exhausted") {
-        r.exhausted++;
-        if (Number.isFinite(resets) && resets > now && (!r.resets_at || resets < Date.parse(r.resets_at))) r.resets_at = h.quota!.resets_at!;
+      const quota = mergeQuota(h.quota, pace.get(h.id));
+      const quotaState = quota.state ?? "unknown";
+      const resets = quota.resets_at ? Date.parse(quota.resets_at) : NaN;
+      const blocking = quotaState === "exhausted" || quotaState === "rate_limited";
+      const quotaOk = !blocking || (Number.isFinite(resets) && resets <= now);
+      if (blocking) {
+        // Counted while declared; resets_at only surfaces while still ahead.
+        if (quotaState === "exhausted") r.exhausted++; else r.rate_limited++;
+        if (!quotaOk && Number.isFinite(resets) && (!r.resets_at || resets < Date.parse(r.resets_at))) r.resets_at = quota.resets_at!;
       }
       if (h.auth_status === "ready" && quotaOk) r.ready++;
     }
@@ -106,6 +118,12 @@ export function aggregateProviders(
     if (j.status === "done") r.jobs_6h.done += j.n;
     else if (j.status === "failed") r.jobs_6h.failed += j.n;
     else r.jobs_6h.other += j.n;
+  }
+
+  for (const r of map.values()) r.jobs_per_hr = Math.round(((r.jobs_6h.done + r.jobs_6h.failed) / 6) * 10) / 10;
+  for (const [id, p] of pace) {
+    const { harness: _h, nodes: _n, ...usage } = p;
+    row(id).usage = usage;
   }
 
   const issueByProvider = new Map<string, Map<IssueKind, ProviderIssue>>();
