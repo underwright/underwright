@@ -542,7 +542,11 @@ export class SqliteStore implements IStore {
       meta.considered++;
       const claim = (s.nodeQuery("SELECT agent_id FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]) as any[])[0];
       if (claim && !myAgents.has(claim.agent_id)) { skip("claimed"); continue; }
-      if ((s.nodeQuery("SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status<>'done' LIMIT 1", [task.id]))[0]) { skip("blocked_deps"); continue; }
+      // Review tasks depend on their subject to prevent reviewing unfinished
+      // work — 'in_review' IS the delivered-awaiting-review state, so it
+      // satisfies the dep. Otherwise review ↔ subject deadlock (gh-179).
+      const depSatisfied = task.type === "review" ? "('done','in_review')" : "('done')";
+      if ((s.nodeQuery(`SELECT 1 FROM task_dependencies d JOIN tasks b ON b.id=d.blocker_id WHERE d.task_id=? AND b.status NOT IN ${depSatisfied} LIMIT 1`, [task.id]))[0]) { skip("blocked_deps"); continue; }
       if ((s.nodeQuery("SELECT 1 FROM jobs WHERE type='node' AND task_id=? AND status IN ('queued','running') LIMIT 1", [task.id]))[0]) { skip("live_job"); continue; }
       // Cooldown: any dispatch-formed job that finished in the last 5 min
       // parks the task. Failure is the obvious case; a 'done' job on a task

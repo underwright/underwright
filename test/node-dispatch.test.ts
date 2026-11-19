@@ -139,6 +139,24 @@ it("skips ineligible tasks and explains starvation in match metadata", async () 
   expect(res.match.skipped.blocked_deps).toBe(1);
 });
 
+it("in_review subject satisfies the dep for review tasks only (gh-179)", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const subj = await store.createTask(task({ title: "subject" }));
+  await store.setTaskStatus(subj.id, "in_review", "agent-A");
+  const review = await store.createTask(task({ title: "review it", type: "review", review_of: subj.id, review_kind: "code" }));
+  const normal = await store.createTask(task({ title: "normal blocked" }));
+  store.updateTask(normal.id, { blocked_by: [subj.id] }, "test");
+
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(leased.empty).toBeUndefined();                    // the review task dispatched
+  expect(leased.task_id).toBe(review.id);
+  const res2 = await store.pollNodeJob(node.token, node.session.session_id, 0, undefined, [leased.id]);
+  expect(res2.empty).toBe(true);
+  expect(res2.match.skipped.blocked_deps).toBe(1);         // the normal task stays dep-blocked
+});
+
 it("skips tasks whose workspace the node policy does not allow", async () => {
   const { store } = fixture();
   const node = await enrolled(store, "node", { ...LAUNCH_POLICY, workspace_ids: ["underwright"] });
