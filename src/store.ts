@@ -8,6 +8,7 @@ import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, type 
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
+import { telemetryColumns, summarizeTaskUsage, type JobTelemetry, type TaskUsage } from "./usage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
@@ -805,6 +806,16 @@ export class SqliteStore implements IStore {
       );
       if (!cols.has("last_poll_at")) this.db.exec("ALTER TABLE nodes ADD COLUMN last_poll_at TEXT;");
       this.db.exec("PRAGMA user_version = 11;");
+    }
+    if (v < 12) {
+      // v12 (gh-168): omnigent session id + cost/usage telemetry on jobs.
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('jobs')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("omni_session_id")) this.db.exec("ALTER TABLE jobs ADD COLUMN omni_session_id TEXT;");
+      if (!cols.has("cost_usd")) this.db.exec("ALTER TABLE jobs ADD COLUMN cost_usd REAL;");
+      if (!cols.has("usage_json")) this.db.exec("ALTER TABLE jobs ADD COLUMN usage_json TEXT;");
+      this.db.exec("PRAGMA user_version = 12;");
     }
   }
 
@@ -1662,23 +1673,29 @@ export class SqliteStore implements IStore {
     })();
   }
 
-  renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string, telemetry?: JobTelemetry) {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000).toISOString();
-    const updated = this.db.prepare(`UPDATE jobs SET lease_expires=?, result=COALESCE(?,result)
+    const t = telemetryColumns(telemetry);
+    const updated = this.db.prepare(`UPDATE jobs SET lease_expires=?, result=COALESCE(?,result),
+      omni_session_id=COALESCE(?,omni_session_id), cost_usd=COALESCE(?,cost_usd), usage_json=COALESCE(?,usage_json)
       WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
-      .run(expires, result?.slice(-64000) ?? null, jobId, agentId, token, new Date().toISOString());
+      .run(expires, result?.slice(-64000) ?? null, t.omni_session_id, t.cost_usd, t.usage_json,
+        jobId, agentId, token, new Date().toISOString());
     if (!updated.changes) return { error: "job lease not owned or expired" };
-    this.log("job", jobId, "renewed", agentId);
+    this.log("job", jobId, "renewed", agentId, telemetry ? { telemetry: t } : {});
     return { id: jobId, lease_expires: expires };
   }
 
-  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, telemetry?: JobTelemetry) {
+    const t = telemetryColumns(telemetry);
     return this.db.transaction(() => {
-      const updated = this.db.prepare(`UPDATE jobs SET status=?, result=?, finished_at=datetime('now'), lease_expires=NULL
+      const updated = this.db.prepare(`UPDATE jobs SET status=?, result=?, finished_at=datetime('now'), lease_expires=NULL,
+        omni_session_id=COALESCE(?,omni_session_id), cost_usd=COALESCE(?,cost_usd), usage_json=COALESCE(?,usage_json)
         WHERE id=? AND status='running' AND runner_id=? AND lease_token=? AND lease_expires>?`)
-        .run(status, result.slice(-64000), jobId, agentId, token, new Date().toISOString());
+        .run(status, result.slice(-64000), t.omni_session_id, t.cost_usd, t.usage_json,
+          jobId, agentId, token, new Date().toISOString());
       if (!updated.changes) return { error: "job lease not owned or expired" };
-      this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
+      this.log("job", jobId, status, agentId, { result: result.slice(0, 500), ...(telemetry ? { telemetry: t } : {}) });
       const job = this.getJob(jobId) as any;
       if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
       return { id: jobId, status };
@@ -1689,11 +1706,18 @@ export class SqliteStore implements IStore {
     return this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id) ?? null;
   }
 
+  taskUsage(taskId: string): TaskUsage {
+    const rows = this.db.prepare(`SELECT id AS job_id, status, omni_session_id, cost_usd, usage_json, created_at
+      FROM jobs WHERE task_id=? AND (omni_session_id IS NOT NULL OR cost_usd IS NOT NULL) ORDER BY created_at, id`).all(taskId) as any[];
+    return summarizeTaskUsage(taskId, rows);
+  }
+
   board() {
     const tasks = this.db
       .prepare(
         `SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
-                (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
+                (SELECT COUNT(*) FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts,
+                (SELECT SUM(j.cost_usd) FROM jobs j WHERE j.task_id = t.id) AS cost_usd
          FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`
       )
       .all();

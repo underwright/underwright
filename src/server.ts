@@ -270,12 +270,26 @@ Rules of engagement:
   server.tool("renew_job", "Renew an owned job lease and upload a bounded live output snapshot.", {
     job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
     ttl_seconds: z.number().int().min(5).max(3600).optional(), result: z.string().optional(),
-  }, async (a) => text(await store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result)));
+    telemetry: z.object({
+      omni_session_id: z.string().min(1).max(512).optional(),
+      cost_usd: z.number().nonnegative().optional(),
+      usage_by_model: z.record(z.string(), z.unknown()).optional(),
+    }).optional().describe("omnigent session id + cumulative cost/usage (gh-168); absent fields keep prior values"),
+  }, async (a) => text(await store.renewJob(a.job_id, a.agent_id, a.lease_token, a.ttl_seconds, a.result, a.telemetry)));
 
   server.tool("finish_job", "Finish a job only while holding its current lease. Stale or foreign runners are rejected.", {
     job_id: z.string(), agent_id: z.string(), lease_token: z.string(),
     status: z.enum(["done", "failed"]), result: z.string(),
-  }, async (a) => text(await store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token)));
+    telemetry: z.object({
+      omni_session_id: z.string().min(1).max(512).optional(),
+      cost_usd: z.number().nonnegative().optional(),
+      usage_by_model: z.record(z.string(), z.unknown()).optional(),
+    }).optional().describe("omnigent session id + cumulative cost/usage (gh-168); absent fields keep prior values"),
+  }, async (a) => text(await store.finishJob(a.job_id, a.status, a.result, a.agent_id, a.lease_token, a.telemetry)));
+
+  server.tool("task_usage", "Omnigent sessions and cumulative cost (USD) across a task's jobs.", {
+    task_id: z.string(),
+  }, async ({ task_id }) => text(await store.taskUsage(task_id)));
 
   server.tool("job_status", "Check a submitted job's status and result.", {
     job_id: z.string(),
