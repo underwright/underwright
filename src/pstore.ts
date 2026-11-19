@@ -1,6 +1,7 @@
 import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
+import { telemetryColumns, summarizeTaskUsage, type JobTelemetry, type TaskUsage } from "./usage.js";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
@@ -1556,22 +1557,28 @@ export class PgStore implements IStore {
     return job;
   }
 
-  async renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string) {
+  async renewJob(jobId: string, agentId: string, token: string, ttlSeconds = 60, result?: string, telemetry?: JobTelemetry) {
     const expires = new Date(Date.now() + Math.max(1, ttlSeconds) * 1000);
-    const [job] = await this.sql`UPDATE jobs SET lease_expires=${expires}, result=COALESCE(${result?.slice(-64000) ?? null},result)
+    const t = telemetryColumns(telemetry);
+    const [job] = await this.sql`UPDATE jobs SET lease_expires=${expires}, result=COALESCE(${result?.slice(-64000) ?? null},result),
+      omni_session_id=COALESCE(${t.omni_session_id},omni_session_id), cost_usd=COALESCE(${t.cost_usd},cost_usd),
+      usage_json=COALESCE(${t.usage_json},usage_json)
       WHERE id=${jobId} AND status='running' AND runner_id=${agentId} AND lease_token=${token}
       AND lease_expires>now() RETURNING id`;
     if (!job) return { error: "job lease not owned or expired" };
-    await this.log("job", jobId, "renewed", agentId);
+    await this.log("job", jobId, "renewed", agentId, telemetry ? { telemetry: t } : {});
     return { id: jobId, lease_expires: expires.toISOString() };
   }
 
-  async finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string) {
+  async finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, telemetry?: JobTelemetry) {
+    const t = telemetryColumns(telemetry);
     const [job] = await this.sql`UPDATE jobs SET status=${status}, result=${result.slice(-64000)},
+      omni_session_id=COALESCE(${t.omni_session_id},omni_session_id), cost_usd=COALESCE(${t.cost_usd},cost_usd),
+      usage_json=COALESCE(${t.usage_json},usage_json),
       finished_at=now(), lease_expires=NULL WHERE id=${jobId} AND status='running'
       AND runner_id=${agentId} AND lease_token=${token} AND lease_expires>now() RETURNING *`;
     if (!job) return { error: "job lease not owned or expired" };
-    await this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
+    await this.log("job", jobId, status, agentId, { result: result.slice(0, 500), ...(telemetry ? { telemetry: t } : {}) });
     if (job.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
   }
@@ -1581,10 +1588,17 @@ export class PgStore implements IStore {
     return job ?? null;
   }
 
+  async taskUsage(taskId: string): Promise<TaskUsage> {
+    const rows = await this.sql<any[]>`SELECT id AS job_id, status, omni_session_id, cost_usd, usage_json, created_at
+      FROM jobs WHERE task_id=${taskId} AND (omni_session_id IS NOT NULL OR cost_usd IS NOT NULL) ORDER BY created_at, id`;
+    return summarizeTaskUsage(taskId, rows);
+  }
+
   async board() {
     const tasks = await this.sql`
       SELECT t.id, t.title, t.status, t.priority, c.agent_id AS claimed_by, c.lease_expires,
-             (SELECT COUNT(*)::int FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts
+             (SELECT COUNT(*)::int FROM artifacts a WHERE a.task_id = t.id AND a.kind = 'blocked') AS blocked_artifacts,
+             (SELECT SUM(j.cost_usd) FROM jobs j WHERE j.task_id = t.id) AS cost_usd
       FROM tasks t LEFT JOIN claims c ON c.task_id = t.id ORDER BY t.priority, t.created_at`;
     const job_counts = await this.sql`SELECT status, COUNT(*)::int AS n FROM jobs GROUP BY status`;
     const [{ n }] = await this.sql<[{ n: number }]>`SELECT COUNT(*)::int AS n FROM helpers`;

@@ -413,6 +413,36 @@ When omnigent drives the job, the runner captures the session it prints
 (`omnigent session: <url-or-id>`, or an omnigent transcript URL) into the
 job result, so `job_status` links the task to the session transcript.
 
+### Session + cost telemetry (gh-168)
+
+For omnigent jobs the runner also records spend on the job record:
+
+| Column | Source |
+|---|---|
+| `omni_session_id` | Session id parsed from output at launch (a URL yields its last path segment); sent on the next `renew_job` |
+| `cost_usd` | Cumulative USD from `GET {server}/v1/sessions/{id}`, polled every ~60s and once more at exit |
+| `usage_json` | `usage_by_model` from the same snapshot |
+
+The snapshot server is the job's `server` (else `OMNIGENT_SERVER_URL`); a
+bearer is sent from `OMNIGENT_TOKEN` when set. Because the server
+accumulates usage per session, a job killed mid-run keeps its last
+heartbeat value. At exit the runner also appends
+`omnigent usage: {"omni_session_id":…,"cost_usd":…,"usage_by_model":…}` to
+`jobs.result`. `renew_job`/`finish_job` take an optional `telemetry`
+object; absent fields never clear recorded values.
+
+Surfaces: `job_status` (columns above), `board` (`cost_usd` summed per
+task), `task_usage <task_id>` (sessions + total), the evidence pack, and the
+completion comment posted before a done task's GitHub issue is closed
+(`omni session <id>` + cost).
+
+**Post-deploy validation:**
+`UNDERWRIGHT_URL=… UNDERWRIGHT_TOKEN=… node scripts/validate-gh-168.mjs`
+(add `TASK_ID=gh-<n>` for the aggregate/board check, and
+`OMNIGENT_SERVER_URL` + `OMNI_SESSION_ID` for a live snapshot read).
+`--local` runs it against a scratch server. It creates one `test` job pinned
+to a unique host, so no real runner leases it.
+
 ## Don't run a local stdio database on a remote machine
 
 This is the failure that looks like a working control plane.

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AgentBackend, AgentJobSpec } from "./istore.js";
 import { getHarnessBackend, getHarnessMatrix, type Policy } from "./policy.js";
+import { parseSessionSnapshot, sessionIdFromLocator, type JobTelemetry } from "./usage.js";
 
 export type JobCall = (name: string, args: Record<string, unknown>) => Promise<any>;
 
@@ -81,22 +82,63 @@ export function extractOmnigentSession(output: string): string | null {
   return urls.length ? urls[urls.length - 1] : null;
 }
 
+export type SessionSnapshotFetch = (server: string, sessionId: string) => Promise<any>;
+
+/** `GET {server}/v1/sessions/{id}` — the omnigent session snapshot carrying
+ *  cumulative cost + usage_by_model. Bearer from OMNIGENT_TOKEN when set. */
+export const fetchSessionSnapshot: SessionSnapshotFetch = async (server, sessionId) => {
+  const url = `${server.replace(/\/+$/, "")}/v1/sessions/${encodeURIComponent(sessionId)}`;
+  const token = process.env.OMNIGENT_TOKEN;
+  const res = await fetch(url, { headers: token ? { authorization: `Bearer ${token}` } : {}, signal: AbortSignal.timeout(10000) });
+  if (!res.ok) throw new Error(`session snapshot ${res.status}`);
+  return res.json();
+};
+
 /** Execute one lease, publish stdout/stderr snapshots, and stop the process group on lease loss. */
 export async function executeLeasedJob(job: any, call: JobCall, options: {
   agentId: string; host: string; ttlSeconds?: number; timeoutMs?: number; signal?: AbortSignal;
   output?: (chunk: string) => void;
+  /** gh-168: omnigent session snapshot reader + poll cadence (default 60s). */
+  sessionSnapshot?: SessionSnapshotFetch; usagePollMs?: number;
 }) {
   const ttl = options.ttlSeconds ?? 60;
   const owner = { job_id: job.id, agent_id: options.agentId, lease_token: job.lease_token };
   let result = "";
-  const append = (chunk: string) => { result = (result + chunk).slice(-64000); options.output?.(chunk); };
-  let invocation;
+  let invocation: AgentInvocation;
   try {
     invocation = job.type === "agent" ? agentInvocation(job, options.agentId, options.host) :
       { executable: job.command, args: [], backend: "raw" as const };
   } catch (error) {
     return call("finish_job", { ...owner, status: "failed", result: String(error) });
   }
+  // gh-168 telemetry: session id captured from output at launch, usage from
+  // the server-side session snapshot (mid-job polls + one read at exit).
+  const omni = invocation.backend === "omnigent";
+  const usageServer = invocation.server ?? process.env.OMNIGENT_SERVER_URL ?? null;
+  const readSnapshot = options.sessionSnapshot ?? fetchSessionSnapshot;
+  const telemetry: JobTelemetry = {};
+  let telemetryDirty = false;
+  const captureSession = () => {
+    if (!omni || telemetry.omni_session_id) return;
+    const locator = extractOmnigentSession(result);
+    if (locator) { telemetry.omni_session_id = sessionIdFromLocator(locator); telemetryDirty = true; }
+  };
+  let polling: Promise<void> | null = null;
+  const pollUsage = () => {
+    if (!omni || !usageServer || !telemetry.omni_session_id) return Promise.resolve();
+    if (polling) return polling;
+    polling = (async () => {
+      try {
+        const usage = parseSessionSnapshot(await readSnapshot(usageServer, telemetry.omni_session_id!));
+        if (usage.cost_usd !== undefined) telemetry.cost_usd = usage.cost_usd;
+        if (usage.usage_by_model) telemetry.usage_by_model = usage.usage_by_model;
+        if (usage.cost_usd !== undefined || usage.usage_by_model) telemetryDirty = true;
+      } catch { /* best effort: keep last-known usage */ }
+      finally { polling = null; }
+    })();
+    return polling;
+  };
+  const append = (chunk: string) => { result = (result + chunk).slice(-64000); options.output?.(chunk); captureSession(); };
   if (options.signal?.aborted) return;
   const child = spawn(invocation.executable, invocation.args, {
     shell: job.type !== "agent", detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
@@ -133,13 +175,16 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     renewing = true;
     heartbeat = (async () => {
       try {
-        const renewal = await call("renew_job", { ...owner, ttl_seconds: ttl, result });
+        const sendTelemetry = telemetryDirty;
+        const renewal = await call("renew_job", { ...owner, ttl_seconds: ttl, result, ...(sendTelemetry ? { telemetry: { ...telemetry } } : {}) });
         if (renewal.error) { leaseLost = true; stop(); }
-        else leaseDeadline = Date.parse(renewal.lease_expires);
+        else { leaseDeadline = Date.parse(renewal.lease_expires); if (sendTelemetry) telemetryDirty = false; }
       } catch { if (Date.now() >= leaseDeadline) { leaseLost = true; stop(); } }
       finally { renewing = false; }
     })();
   }, Math.min(1000, ttl * 1000 / 3));
+  // Mid-job heartbeat: server-side accumulation means the last read survives a killed job.
+  const usageTicker = omni ? setInterval(() => { void pollUsage(); }, options.usagePollMs ?? 60000) : undefined;
   try {
     const code = await new Promise<number | null>(resolve => {
       child.once("error", error => append(`\n${error.message}\n`));
@@ -153,11 +198,22 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
       if (session && !new RegExp(`omnigent session: ?${session.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`).test(result)) {
         result = (result + `\nomnigent session: ${session}`).slice(-64000);
       }
+      // End-of-job usage: one final snapshot read, recorded as a JSON trailer and as telemetry.
+      captureSession();
+      if (usageTicker) clearInterval(usageTicker);
+      await polling;
+      await pollUsage();
+      if (telemetry.omni_session_id) {
+        let trailer = JSON.stringify({ omni_session_id: telemetry.omni_session_id, cost_usd: telemetry.cost_usd ?? null, usage_by_model: telemetry.usage_by_model ?? null });
+        if (trailer.length > 8000) trailer = JSON.stringify({ omni_session_id: telemetry.omni_session_id, cost_usd: telemetry.cost_usd ?? null, usage_by_model: "truncated" });
+        result = (result.slice(-(64000 - trailer.length - 20)) + `\nomnigent usage: ${trailer}`);
+      }
     }
+    const finalTelemetry = omni && (telemetry.omni_session_id || telemetry.cost_usd !== undefined) ? { telemetry: { ...telemetry } } : {};
     // Retry completion while heartbeats keep ownership alive during transient outages.
     while (Date.now() < leaseDeadline && !leaseLost) {
       try {
-        const finished = await call("finish_job", { ...owner, status: code === 0 && !stopped ? "done" : "failed", result });
+        const finished = await call("finish_job", { ...owner, status: code === 0 && !stopped ? "done" : "failed", result, ...finalTelemetry });
         if (finished.error) throw new Error(finished.error);
         return finished;
       } catch (error) {
@@ -168,6 +224,7 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
     throw new Error(`lost lease for ${job.id}`);
   } finally {
     clearInterval(ticker);
+    if (usageTicker) clearInterval(usageTicker);
     clearTimeout(timeout);
     if (killTimer) { kill("SIGKILL"); clearTimeout(killTimer); }
     options.signal?.removeEventListener("abort", abort);

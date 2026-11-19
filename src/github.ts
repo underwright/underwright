@@ -1,3 +1,4 @@
+import { usageCitation } from "./usage.js";
 import { execSync } from "node:child_process";
 import type { IStore, TaskStatus } from "./istore.js";
 import { getAutoMergePolicy, loadPolicy, type Policy } from "./policy.js";
@@ -92,7 +93,7 @@ export async function syncIssues(
           await store.setTaskStatus(marker, "done", actor);
           out.closed_tasks.push(marker);
         } else if (task.status === "done" && issue.state === "OPEN") {
-          await runner(`issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`);
+          await closeCompletedIssue(store, runner, repo, issue.number, marker);
           out.closed_issues.push(issue.number);
         }
         out.skipped++;
@@ -122,7 +123,7 @@ export async function syncIssues(
       await store.setTaskStatus(id, "done", actor);
       out.closed_tasks.push(id);
     } else if (task.status === "done" && issue.state === "OPEN") {
-      await runner(`issue close ${issue.number} --repo ${repo} --comment "Completed via underwright evidence gate."`);
+      await closeCompletedIssue(store, runner, repo, issue.number, id);
       out.closed_issues.push(issue.number);
     }
   }
@@ -431,6 +432,19 @@ export async function checkPRGate(
   };
 }
 
+/** Close a completed task's issue. When omnigent jobs ran for the task, first
+ *  post a completion comment citing each `omni session <id>` + cost (gh-168);
+ *  posted via stdin so session ids never reach a shell string. */
+async function closeCompletedIssue(store: IStore, runner: GhRunner, repo: string, number: number, taskId: string) {
+  const usage = typeof store.taskUsage === "function" ? await store.taskUsage(taskId) : null;
+  const citation = usageCitation(usage);
+  if (citation.length) {
+    await runner(`issue comment ${number} --repo ${repo} --body-file -`,
+      [`Completed via underwright evidence gate (task \`${taskId}\`).`, ...citation].join("\n"));
+  }
+  await runner(`issue close ${number} --repo ${repo} --comment "Completed via underwright evidence gate."`);
+}
+
 /** Render a task's evidence pack as markdown (for PR/issue comments or review gates). */
 export async function evidencePack(store: IStore, taskId: string) {
   const task = await store.getTask(taskId);
@@ -446,6 +460,8 @@ export async function evidencePack(store: IStore, taskId: string) {
         (e.ac_ids !== "[]" ? ` (proves: ${e.ac_ids})` : "") +
         (e.output ? `\n  \`\`\`\n  ${String(e.output).slice(0, 500)}\n  \`\`\`` : "")
     ),
+    // gh-168: cite each omni session + cost so the issue records spend.
+    ...usageCitation(typeof store.taskUsage === "function" ? await store.taskUsage(taskId) : null),
   ];
   return lines.join("\n");
 }

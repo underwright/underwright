@@ -69,7 +69,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   receipt_digest TEXT,
   receipt_status TEXT,
   outcome_reason TEXT,
-  result_metadata TEXT
+  result_metadata TEXT,
+  omni_session_id TEXT,
+  cost_usd REAL,
+  usage_json TEXT
 );
 `;
 
@@ -78,6 +81,7 @@ CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, crea
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
   WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS jobs_expired_leases ON jobs(type, status, lease_expires);
+CREATE INDEX IF NOT EXISTS jobs_task ON jobs(task_id);
 CREATE INDEX IF NOT EXISTS events_entity_action ON events(entity_type, entity_id, action);
 CREATE INDEX IF NOT EXISTS messages_from_created ON messages(from_agent, created_at);
 `;
@@ -239,6 +243,10 @@ ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_digest TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS receipt_status TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS outcome_reason TEXT;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS result_metadata TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS omni_session_id TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cost_usd DOUBLE PRECISION;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS usage_json TEXT;
+CREATE INDEX IF NOT EXISTS jobs_task ON jobs(task_id);
 CREATE INDEX IF NOT EXISTS jobs_target_node ON jobs(target_node_id, status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(target_node_id, dedupe_key)
   WHERE status IN ('queued','running') AND dedupe_key IS NOT NULL AND target_node_id IS NOT NULL;

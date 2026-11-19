@@ -1,6 +1,7 @@
 // The control-plane store contract. Call sites always `await` results;
 // implementations may be sync (SQLite) or async (Postgres/Lakebase).
 
+import type { JobTelemetry, TaskUsage } from "./usage.js";
 import type { NodeEnrollmentInput, NodePolicy, NodePrincipal, NodeError, NodeEnrollment, NodeSpec } from "./node-protocol.js";
 
 type Awaitable<T> = T | Promise<T>;
@@ -148,9 +149,11 @@ export interface IStore {
   searchContext(query: string, kinds?: string[]): Awaitable<any[]>;
   submitJob(a: SubmitJobArgs): Awaitable<any>;
   nextJob(agentId: string, host?: string, ttlSeconds?: number): Awaitable<any>;
-  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string): Awaitable<any>;
-  renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string): Awaitable<any>;
+  finishJob(jobId: string, status: "done" | "failed", result: string, agentId: string, token: string, telemetry?: JobTelemetry): Awaitable<any>;
+  renewJob(jobId: string, agentId: string, token: string, ttlSeconds?: number, result?: string, telemetry?: JobTelemetry): Awaitable<any>;
   getJob(id: string): Awaitable<any>;
+  /** gh-168: omni sessions + cumulative cost across a task's jobs. */
+  taskUsage(taskId: string): Awaitable<TaskUsage>;
   board(): Awaitable<any>;
   digest(args?: string | DigestArgs): Awaitable<DigestResult>;
   dashboard(eventsLimit?: number): Awaitable<any>;
