@@ -87,3 +87,46 @@ user unit once the manual run is healthy (`underwright service install`).
 Node row shows `approved`, a live `session_expires_at`, fresh
 `capabilities_observed_at`, `current_slots` vs `max_concurrency`, and the
 expected harness list with `auth_status`/`quota` per seat.
+
+### Quota telemetry (gh-149)
+
+Prepaid subscription windows are use-it-or-lose-it, so the target is about
+100% consumed at reset. "Exhausted" means the window was burned too fast. To
+feed pacing, point the node config's `usage` section at one JSON reading per
+harness. Omnigent session metrics or a vendor usage scraper writes the file:
+
+```json
+{ "usage": { "grok": { "file": "~/.local/state/usage/grok.json" } } }
+```
+
+```json
+{ "tokens_in": 120000, "tokens_out": 30000, "cost": 4.2,
+  "window_used_pct": 38, "window_kind": "weekly",
+  "resets_at": "2026-11-22T00:00:00Z", "vendor_state": "available",
+  "sampled_at": "2026-11-18T12:00:00Z" }
+```
+
+- `window_kind` is one of `5h`, `daily`, `weekly` or `monthly`. `vendor_state`
+  is one of `available`, `rate_limited` or `exhausted`. Token and cost counters
+  are cumulative. A counter that drops is read as a reset.
+- The daemon sends each new reading on the heartbeat. The server appends it to
+  `usage_samples` and emits a `harness.usage` metric. Samples dated more than
+  5 minutes in the future are dropped.
+- Derived quota: a harness is `exhausted` when the vendor reports it or
+  `window_used_pct` is 99.5 or higher. It is `rate_limited` when the vendor
+  throttles it. Both states block the harness until `resets_at`. A manual
+  `quota` declaration with `"override": true` replaces the derived state.
+  Without the override, the more restrictive of the two states applies.
+- Routing: ready harnesses are ordered by pace. The harness furthest behind
+  its linear-to-100% curve runs first. Differences within ±5 points are
+  ignored, and `harness_order` breaks ties.
+- To read pace, call the MCP tool `provider_usage` (optionally with
+  `{harness}`) or open the board's Providers panel. Both show the Window,
+  Burn and **Projected at reset** columns. A value under 90% is highlighted
+  as wasted quota.
+
+Post-deploy check (exit 0 = pass):
+
+```
+UW_URL=http://<board-host>:8741 UW_ADMIN_TOKEN=<server token> node scripts/validate-gh-149.mjs [--expect-harness grok]
+```

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { SqliteStore } from "../src/store.js";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -449,4 +449,67 @@ it("heartbeat refreshes capabilities_observed_at for a quiet node", async () => 
   expect(hb.error).toBeUndefined();
   const row = store.db.prepare("SELECT capabilities_observed_at FROM nodes WHERE id=?").get(node.node_id ?? hb.node_id) as { capabilities_observed_at: string };
   expect(Date.parse(row.capabilities_observed_at)).toBeGreaterThan(Date.now() - 60_000);
+});
+
+// gh-149: heartbeat usage sampling feeds usage_samples, provider pace, and routing.
+describe("quota telemetry (gh-149)", () => {
+  const H = 3_600_000;
+  const weekReset = () => new Date(Date.now() + 3.5 * 24 * H).toISOString();
+  const sample = (harness: string, ageMs: number, extra: object) =>
+    ({ harness, sampled_at: new Date(Date.now() - ageMs).toISOString(), ...extra });
+
+  it("heartbeat usage lands in usage_samples idempotently and answers burn rate / projection", async () => {
+    const { store } = fixture();
+    const node = await enrolled(store, "box");
+    await attest(store, node, READY_CAPS([{ id: "grok" }]));
+    const reset = weekReset();
+    const s1 = sample("grok", 24 * H, { window_used_pct: 20, window_kind: "weekly", resets_at: reset, tokens_in: 0, tokens_out: 0 });
+    const s2 = sample("grok", 0, { window_used_pct: 26, window_kind: "weekly", resets_at: reset, tokens_in: 24_000, tokens_out: 0 });
+    expect((await store.nodeHeartbeat(node.token, node.session.session_id, { usage: [s1] })).error).toBeUndefined();
+    await store.nodeHeartbeat(node.token, node.session.session_id, { usage: [s1, s2] }); // s1 resent
+    const n = store.db.prepare("SELECT COUNT(*) n FROM usage_samples WHERE harness='grok'").get().n;
+    expect(n).toBe(2);
+    // future-dated (clock skew) readings are dropped
+    await store.nodeHeartbeat(node.token, node.session.session_id, { usage: [sample("grok", -3600_000, { window_used_pct: 99 })] });
+    expect(store.db.prepare("SELECT COUNT(*) n FROM usage_samples").get().n).toBe(2);
+
+    const { providers } = await store.providerUsage("grok");
+    expect(providers).toHaveLength(1);
+    const p = providers[0];
+    expect(p.tokens_per_hr).toBe(1000);
+    expect(p.pct_per_hr).toBe(0.25);
+    expect(p.pace_delta).toBe(-24);
+    expect(p.projected_pct_at_reset).toBe(47);
+    expect((await store.providerUsage("claude")).providers).toHaveLength(0);
+    const board = await store.board();
+    expect(board.providers.find((r: any) => r.id === "grok").usage.projected_pct_at_reset).toBe(47);
+  });
+
+  it("dispatch prefers the ready harness behind its window-pace curve over harness_order", async () => {
+    const { store } = fixture();
+    const node = await enrolled(store, "box");
+    await attest(store, node); // claude, codex — harness_order says claude first
+    const reset = weekReset();
+    await store.nodeHeartbeat(node.token, node.session.session_id, { usage: [
+      sample("claude", 0, { window_used_pct: 85, window_kind: "weekly", resets_at: reset }), // ahead of pace
+      sample("codex", 0, { window_used_pct: 15, window_kind: "weekly", resets_at: reset }),  // behind pace
+    ] });
+    const t = await store.createTask(task());
+    const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+    expect(j.task_id).toBe(t.id);
+    expect(j.agent_id).toBe("codex@box");
+  });
+
+  it("a vendor rate_limited sample parks the harness until resets_at", async () => {
+    const { store } = fixture();
+    const node = await enrolled(store, "box");
+    await attest(store, node);
+    await store.nodeHeartbeat(node.token, node.session.session_id, { usage: [
+      sample("claude", 0, { vendor_state: "rate_limited", resets_at: new Date(Date.now() + H).toISOString() }),
+    ] });
+    await store.createTask(task());
+    const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+    expect(j.agent_id).toBe("codex@box");
+    expect(store.board().providers.find((r: any) => r.id === "claude").rate_limited).toBe(1);
+  });
 });

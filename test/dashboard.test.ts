@@ -141,6 +141,23 @@ describe("dashboard rendering", () => {
     expect(html).toContain("npm test");
   });
 
+  it("providers panel shows window position, pace, burn and projected % at reset (gh-149)", () => {
+    const html = renderDashboard({
+      tasks: [],
+      providers: [
+        { id: "grok", nodes: 1, ready: 1, exhausted: 0, rate_limited: 0, resets_at: null, jobs_6h: { done: 12, failed: 0, other: 0 }, jobs_per_hr: 2, issues: [],
+          usage: { window_kind: "weekly", window_used_pct: 26, resets_at: "2026-11-22T00:00:00.000Z", sampled_at: "2026-11-18T12:00:00.000Z", tokens_per_hr: 1000, cost_per_hr: null, pct_per_hr: 0.25, expected_pct: 50, pace_delta: -24, projected_pct_at_reset: 47, derived_state: "available" } },
+        { id: "claude", nodes: 1, ready: 0, exhausted: 0, rate_limited: 1, resets_at: "2026-11-18T13:00:00.000Z", jobs_6h: { done: 0, failed: 0, other: 0 }, jobs_per_hr: 0, issues: [], usage: null },
+      ],
+    } as any);
+    expect(html).toContain("Projected at reset");
+    expect(html).toContain("26% weekly");
+    expect(html).toContain("behind 24");
+    expect(html).toContain("1000 tok/h");
+    expect(html).toContain('<span class="iss-billing">47%</span>'); // under 90% = wasted prepaid quota
+    expect(html).toContain("rate_limited×1");
+  });
+
   it("escapes untrusted values and exposes no mutation form", () => {
     const html = renderDashboard({
       tasks: [{ id: "task-1", title: "<script>alert(1)</script>", status: "open", priority: 1 }],
