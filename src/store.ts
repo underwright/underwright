@@ -1719,6 +1719,18 @@ export class SqliteStore implements IStore {
     return { ...row, halts_notified: halts.map((r) => r.h).filter(Boolean) };
   }
 
+  /** Agent-job counts inside a rolling window for the rate/failure brake:
+   *  jobs created in the last `minutes`, jobs finished in the window, and how
+   *  many of those finished failed. */
+  watchRateStats(minutes: number): { jobs: number; finished: number; failed: number } {
+    const w = `-${Math.max(1, Math.floor(minutes))} minutes`;
+    return this.db.prepare(`SELECT
+        (SELECT COUNT(*) FROM jobs WHERE type='agent' AND created_at > datetime('now', ?)) AS jobs,
+        (SELECT COUNT(*) FROM jobs WHERE type='agent' AND finished_at > datetime('now', ?) AND status IN ('done','failed')) AS finished,
+        (SELECT COUNT(*) FROM jobs WHERE type='agent' AND finished_at > datetime('now', ?) AND status='failed') AS failed`)
+      .get(w, w, w) as { jobs: number; finished: number; failed: number };
+  }
+
   getJob(id: string) {
     return this.db.prepare("SELECT * FROM jobs WHERE id=?").get(id) ?? null;
   }

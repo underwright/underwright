@@ -218,6 +218,43 @@ describe("budgetGate (watch producer spend control)", () => {
     expect(store.inbox("human")).toHaveLength(1);
   });
 
+  const finishN = (store: SqliteStore, n: number, outcome: "done" | "failed") => {
+    for (let i = 0; i < n; i++) {
+      const j = store.nextJob("runner", undefined, 60) as any;
+      store.finishJob(j.id, outcome, outcome === "failed" ? "boom" : "ok", "runner", j.lease_token);
+    }
+  };
+
+  it("throttles submission rate per rolling minute, silently", () => {
+    const store = fixture();
+    const rule = { max_inflight: 10, max_agent_jobs_per_minute: 3 };
+    agentJob(store, 2);
+    expect(budgetGate(store, rule)).toMatchObject({ allowed: 1 });
+    agentJob(store, 1);
+    const g = budgetGate(store, rule);
+    expect(g).toMatchObject({ allowed: 0, halted: "rate" });
+    expect(g.notified).toBeUndefined();
+    expect(store.inbox("human")).toHaveLength(0); // transient — self-resolves
+  });
+
+  it("halts on a failure storm only once min samples are in the window", () => {
+    const store = fixture();
+    const rule = { max_inflight: 10, failure_window_minutes: 15, failure_min_samples: 4, failure_max_pct: 50 };
+    agentJob(store, 3);
+    finishN(store, 2, "failed");
+    finishN(store, 1, "done"); // 2/3 failed = 66% but below min_samples 4
+    expect(budgetGate(store, rule).allowed).toBeGreaterThan(0);
+    agentJob(store, 1);
+    finishN(store, 1, "failed"); // 3/4 failed = 75% with 4 samples
+    const g = budgetGate(store, rule);
+    expect(g).toMatchObject({ allowed: 0, halted: "failure_storm", notified: true });
+    const inbox = store.inbox("human");
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0].body).toContain("failure_max_pct 50");
+    expect(inbox[0].body).toContain("3/4");
+    expect(budgetGate(store, rule).notified).toBeUndefined(); // once per day
+  });
+
   it("ignores non-agent jobs and nonsense caps", () => {
     const store = fixture();
     store.submitJob({ agent_id: "x", type: "test", command: "npm test" });

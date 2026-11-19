@@ -43,6 +43,17 @@ export interface WatchBudgetRule {
   max_inflight?: number;
   /** Agent jobs allowed per UTC day (the cheap spend proxy). 0/unset = no cap. */
   max_agent_jobs_per_day?: number;
+  /** Agent jobs allowed to be submitted in a rolling 1-minute window — throttles
+   *  bursts regardless of the daily total. 0/unset = no rate cap. */
+  max_agent_jobs_per_minute?: number;
+  /** Failure-storm brake: window size in minutes (default 15). */
+  failure_window_minutes?: number;
+  /** Failure-storm brake: minimum finished jobs in the window before judging
+   *  (default 3) — avoids tripping on a single unlucky failure. */
+  failure_min_samples?: number;
+  /** Failure-storm brake: halt when failed share of finished jobs in the window
+   *  reaches this percent (0/unset = brake disabled). */
+  failure_max_pct?: number;
   /** Daily USD budget. Needs usd_per_agent_job until real cost evidence (gh-44) lands. */
   budget_usd_per_day?: number;
   /** Estimated USD per agent job, used to price the day's jobs against budget_usd_per_day. */
@@ -59,7 +70,7 @@ export interface BudgetGate {
   jobs_today: number;
   spent_usd_today?: number;
   /** Why submission is halted, when allowed is 0 because of a cap. */
-  halted?: "inflight" | "daily_jobs" | "daily_budget";
+  halted?: "inflight" | "rate" | "failure_storm" | "daily_jobs" | "daily_budget";
   /** True when this call messaged the human (once per UTC day per halt reason). */
   notified?: boolean;
 }
@@ -95,30 +106,48 @@ export function budgetGate(
 
   const maxInflight = posInt(rule.max_inflight) ?? 3;
   const maxDaily = posInt(rule.max_agent_jobs_per_day);
+  const maxPerMin = posInt(rule.max_agent_jobs_per_minute);
+  const failMaxPct = posInt(rule.failure_max_pct);
+  const failWindow = posInt(rule.failure_window_minutes) ?? 15;
+  const failMin = posInt(rule.failure_min_samples) ?? 3;
   const budget = posInt(rule.budget_usd_per_day);
   const perJob = posInt(rule.usd_per_agent_job);
   const spent = budget && perJob ? Math.round(jobsToday * perJob * 100) / 100 : undefined;
 
+  const rate = maxPerMin || failMaxPct ? store.watchRateStats(Math.max(1, maxPerMin ? 1 : failWindow)) : undefined;
+  const failStats = failMaxPct ? (failWindow === 1 && rate ? rate : store.watchRateStats(failWindow)) : undefined;
+  const jobsLastMin = maxPerMin ? (rate?.jobs ?? 0) : 0;
+  const storm = failStats !== undefined && failStats.finished >= failMin && (100 * failStats.failed) / failStats.finished >= (failMaxPct ?? 100);
+
   let allowed = Math.max(0, maxInflight - inflight);
   if (maxDaily) allowed = Math.min(allowed, Math.max(0, maxDaily - jobsToday));
+  if (maxPerMin) allowed = Math.min(allowed, Math.max(0, maxPerMin - jobsLastMin));
   if (budget && perJob) allowed = Math.min(allowed, Math.max(0, Math.floor((budget - jobsToday * perJob) / perJob + 1e-9)));
+  if (storm) allowed = 0;
 
   const out: BudgetGate = { allowed, inflight, jobs_today: jobsToday, ...(spent !== undefined ? { spent_usd_today: spent } : {}) };
   if (allowed > 0) return out;
 
   const halted: BudgetGate["halted"] =
-    budget && perJob && budget - jobsToday * perJob < perJob - 1e-9 ? "daily_budget"
-      : maxDaily && jobsToday >= maxDaily ? "daily_jobs"
-        : "inflight";
+    storm ? "failure_storm"
+      : budget && perJob && budget - jobsToday * perJob < perJob - 1e-9 ? "daily_budget"
+        : maxDaily && jobsToday >= maxDaily ? "daily_jobs"
+          : maxPerMin && jobsLastMin >= maxPerMin ? "rate"
+            : "inflight";
   out.halted = halted;
-  if (halted === "inflight") return out;
+  if (halted === "inflight" || halted === "rate") return out; // transient back-pressure — self-resolves, no message
 
   if (halts_notified.includes(halted)) return out;
-  const detail = halted === "daily_budget"
+  const detail = halted === "failure_storm"
+    ? `${failStats!.failed}/${failStats!.finished} agent jobs failed (${Math.round(100 * failStats!.failed / failStats!.finished)}%) in the last ${failWindow}m reaching failure_max_pct ${failMaxPct}`
+    : halted === "daily_budget"
     ? `estimated spend $${spent} (${jobsToday} agent jobs × $${perJob}) leaves less than one job of budget_usd_per_day $${budget}`
     : `${jobsToday} agent jobs today reached max_agent_jobs_per_day ${maxDaily}`;
+  const until = halted === "failure_storm"
+    ? `the rolling ${failWindow}m failure share drops below failure_max_pct ${failMaxPct} or the policy \`watch\` block is relaxed`
+    : `tomorrow (UTC) or the policy \`watch\` cap is raised`;
   store.sendMessage(human, agentId,
-    `watch halted for ${day}: ${detail}. No agent jobs will be submitted until tomorrow (UTC) or the policy \`watch\` cap is raised.`);
+    `watch halted for ${day}: ${detail}. No agent jobs will be submitted until ${until}.`);
   store.log("watch", `${day}:${halted}`, "watch_budget_halt", agentId, { day, halted, jobs_today: jobsToday, inflight, spent_usd_today: spent });
   out.notified = true;
   return out;
