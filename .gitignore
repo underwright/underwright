@@ -5,3 +5,4 @@ underwright.db*
 *.tgz
 .claude/
 underwright-telemetry.jsonl
+.partyline/
