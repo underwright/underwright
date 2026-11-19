@@ -75,9 +75,15 @@ export async function syncIssues(
   options: { runner?: GhRunner } = {}
 ) {
   const runner = options.runner ?? defaultGhRunner;
-  const issues = (await runner(
-    `issue list --repo ${repo} --state all --limit 1000 --json number,title,body,url,state,labels`
-  )) as Issue[];
+  // --state all is capped newest-first, so on repos where open+closed exceed
+  // the limit older opens never import (3586 issues on covasant/Aura vs cap
+  // 1000 → ~500 open missed). Fetch opens (bounded at 2000) and recent closes
+  // (bounded at 1000 — reconciliation only needs recent ones) separately.
+  const fields = "number,title,body,url,state,labels";
+  const issues = [
+    ...(await runner(`issue list --repo ${repo} --state open --limit 2000 --json ${fields}`) as Issue[]),
+    ...(await runner(`issue list --repo ${repo} --state closed --limit 1000 --json ${fields}`) as Issue[]),
+  ];
   const out = { imported: 0, closed_tasks: [] as string[], closed_issues: [] as number[], skipped: 0 };
 
   for (const issue of issues) {
