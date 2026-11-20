@@ -1342,7 +1342,10 @@ export class PgStore implements IStore {
    *  exhausted fleet-wide until resets_at (parsed or a class default);
    *  a successful job clears the mark — the provider proved itself alive. */
   private async observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null, nodeId?: string) {
-    const provider = agentId?.split("@")[0];
+    const specRaw = ((await this.nodeQuery("SELECT agent_spec FROM jobs WHERE id=?", [jobId])) as { agent_spec?: string }[])[0]?.agent_spec;
+    let specHarness: string | undefined;
+    try { specHarness = specRaw ? JSON.parse(specRaw)?.harness : undefined; } catch { /* non-JSON spec */ }
+    const provider = specHarness ?? agentId?.split("@")[0];
     if (!provider) return;
     if (status === "done") {
       await this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
@@ -1576,6 +1579,7 @@ export class PgStore implements IStore {
       AND runner_id=${agentId} AND lease_token=${token} AND lease_expires>now() RETURNING *`;
     if (!job) return { error: "job lease not owned or expired" };
     await this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
+    await this.observeProviderOutcome(jobId, job.agent_id ?? agentId, status, result.slice(-64000));
     if (job.task_id) await this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
     return { id: jobId, status };
   }

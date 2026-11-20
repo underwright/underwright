@@ -49,7 +49,13 @@ export class SqliteStore implements IStore {
    *  session emits UW-RESULT, so its absence marks infra failure, not a
    *  task-level loss that happens to carry trigger words. */
   private observeProviderOutcome(jobId: string, agentId: string | null | undefined, status: string, result: string | null, nodeId?: string) {
-    const provider = agentId?.split("@")[0];
+    // The spec's harness id is the provider identity — agent_id is whoever
+    // claimed the job (a dispatcher id like `uw-watch` for legacy-runner jobs),
+    // which is not a provider.
+    const specRaw = (this.nodeQuery("SELECT agent_spec FROM jobs WHERE id=?", [jobId]) as { agent_spec?: string }[])[0]?.agent_spec;
+    let specHarness: string | undefined;
+    try { specHarness = specRaw ? JSON.parse(specRaw)?.harness : undefined; } catch { /* non-JSON spec */ }
+    const provider = specHarness ?? agentId?.split("@")[0];
     if (!provider) return;
     if (status === "done") {
       this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
@@ -1760,6 +1766,7 @@ export class SqliteStore implements IStore {
       if (!updated.changes) return { error: "job lease not owned or expired" };
       this.log("job", jobId, status, agentId, { result: result.slice(0, 500) });
       const job = this.getJob(jobId) as any;
+      this.observeProviderOutcome(jobId, job?.agent_id ?? agentId, status, result.slice(-64000));
       if (job?.task_id) this.notifyWatchers(job.task_id, `job ${jobId} (${job.type}) → ${status}`);
       return { id: jobId, status };
     })();

@@ -79,6 +79,16 @@ describe("jobs", () => {
     store.finishJob(j.id, "done", "hi", "runner", started.lease_token);
     expect(store.getJob(j.id).status).toBe("done");
   });
+
+  it("marks provider_quota from the spec harness on legacy-runner finishes, not the claimer id", () => {
+    const j = store.submitJob({ agent_id: "uw-watch", type: "agent",
+      agent: { harness: "claude-sdk", executable: "claude", args: [], prompt: "x" } } as any);
+    const started = store.nextJob("uw-runner");
+    store.finishJob(j.id, "failed",
+      "You've hit your weekly limit · resets Nov 21, 4am (America/New_York)", "uw-runner", started.lease_token);
+    const marked = (store as any).db.prepare("SELECT provider, state, reason FROM provider_quota").all();
+    expect(marked).toEqual([{ provider: "claude-sdk", state: "exhausted", reason: "rate_limit" }]);
+  });
 });
 
 describe.skipIf(!process.env.DATABASE_URL)("pg backend", () => {
