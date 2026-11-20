@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import { SCHEMA, JOBS_SCHEMA, JOBS_INDEXES, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
+import { failoverEnv, nextUntriedSeat, quotaRowKey, seatKeyOfEnv, seatNameOf, seatRosterFor, seatRowsLike, triedSeatsOfEnv } from "./seats.js";
 import { aggregateProviders, classifyFailure, parseResetAt } from "./provider-health.js";
 import { telemetry } from "./telemetry.js";
 import { parseCoverage } from "./coverage.js";
@@ -40,10 +41,54 @@ export class SqliteStore implements IStore {
     this.log('node', id, action, actor);
   }
 
+  /** Write (or refresh) one provider_quota exhaustion row. */
+  private markQuotaExhausted(key: string, resetsAt: string, jobId: string, kind: string) {
+    this.nodeQuery(
+      `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
+       ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
+         observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
+      [key, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
+    );
+  }
+
+  /** Resubmit a quota-failed job on the next untried seat (gh-191). The copy
+   *  carries the seat env (CODEX_HOME + tried list) and is deduped per source
+   *  job so a finish can never fan out. Node jobs keep their target node —
+   *  pre-queued delivery bypasses the formation-time quota gate, which is
+   *  exactly why failover can engage while a provider-level mark stands. */
+  private quotaFailover(jobId: string, job: any, spec: any, env: Record<string, unknown>, deadSeat: string | null, nextSeat: string): boolean {
+    if (job?.type === "node" && spec?.kind !== "launch-agent") return false;
+    if (job?.type !== "node" && !(spec?.executable && typeof spec?.prompt === "string")) return false;
+    const dedupe = `failover:${jobId}`;
+    const existing = (this.nodeQuery("SELECT id FROM jobs WHERE dedupe_key=? AND status IN ('queued','running')", [dedupe]) as { id: string }[])[0];
+    if (existing) return true; // already failovered — still suppress the provider mark
+    const nextSpec = JSON.stringify({ ...spec, env: failoverEnv(env, deadSeat, nextSeat) });
+    const id = `job-${randomUUID().slice(0, 8)}`;
+    if (job?.type === "node") {
+      this.nodeQuery(
+        `INSERT INTO jobs (id,task_id,agent_id,type,command,target_node_id,node_spec,agent_spec,dedupe_key,retry_of)
+         VALUES (?,?,?,'node','',?,?,?,?,?)`,
+        [id, job.task_id ?? null, job.agent_id ?? null, job.target_node_id ?? null, nextSpec, nextSpec, dedupe, jobId],
+      );
+    } else {
+      this.nodeQuery(
+        `INSERT INTO jobs (id,task_id,agent_id,type,command,host,target_agent_id,agent_spec,dedupe_key,retry_of)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [id, job?.task_id ?? null, job?.agent_id ?? null, "agent", job?.command ?? "", job?.host ?? null, job?.target_agent_id ?? null, nextSpec, dedupe, jobId],
+      );
+    }
+    this.log("job", id, "quota_failover", "health-monitor", { source_job_id: jobId, seat: seatNameOf(nextSeat), harness: spec?.harness ?? spec?.payload?.harness ?? null });
+    return true;
+  }
+
   /** Provider-level quota exhaustion observed from a finished job's result.
    *  Quota is per-account: a rate-limit or billing failure marks the provider
    *  exhausted fleet-wide until resets_at (parsed or a class default);
    *  a successful job clears the mark — the provider proved itself alive.
+   *  gh-191: with a seat roster in policy, the dead seat is marked alone
+   *  ('provider:seat') and the job is failovered onto the next untried seat;
+   *  the provider-level mark lands only when the whole roster is spent — a
+   *  dead seat must not read as a dead provider.
    *  Node-local breakage (auth/config: the harness never ran) quarantines
    *  the harness on THIS node with escalating retry_at backoff — a real
    *  session emits UW-RESULT, so its absence marks infra failure, not a
@@ -52,13 +97,13 @@ export class SqliteStore implements IStore {
     // The spec's harness id is the provider identity — agent_id is whoever
     // claimed the job (a dispatcher id like `uw-watch` for legacy-runner jobs),
     // which is not a provider.
-    const specRaw = (this.nodeQuery("SELECT agent_spec FROM jobs WHERE id=?", [jobId]) as { agent_spec?: string }[])[0]?.agent_spec;
-    let specHarness: string | undefined;
-    try { specHarness = specRaw ? JSON.parse(specRaw)?.harness : undefined; } catch { /* non-JSON spec */ }
-    const provider = specHarness ?? agentId?.split("@")[0];
+    const job = (this.nodeQuery("SELECT agent_spec,node_spec,type,task_id,agent_id,target_node_id,host,target_agent_id,command FROM jobs WHERE id=?", [jobId]) as any[])[0];
+    let spec: any = null;
+    try { spec = JSON.parse(job?.agent_spec || job?.node_spec || "null"); } catch { /* non-JSON spec */ }
+    const provider = spec?.harness ?? spec?.payload?.harness ?? agentId?.split("@")[0];
     if (!provider) return;
     if (status === "done") {
-      this.nodeQuery("DELETE FROM provider_quota WHERE provider=?", [provider]);
+      this.nodeQuery("DELETE FROM provider_quota WHERE provider=? OR provider LIKE ?", [provider, seatRowsLike(provider)]);
       if (nodeId) this.nodeQuery("DELETE FROM harness_health WHERE node_id=? AND harness=?", [nodeId, provider]);
       return;
     }
@@ -67,12 +112,18 @@ export class SqliteStore implements IStore {
     if (kind === "rate_limit" || kind === "billing") {
       const resetsAt = parseResetAt(result ?? "")
         ?? new Date(Date.now() + (kind === "billing" ? 24 : 1.5) * 3_600_000).toISOString();
-      this.nodeQuery(
-        `INSERT INTO provider_quota(provider,state,resets_at,observed_at,source_job_id,reason) VALUES (?,?,?,?,?,?)
-         ON CONFLICT(provider) DO UPDATE SET state=excluded.state, resets_at=excluded.resets_at,
-           observed_at=excluded.observed_at, source_job_id=excluded.source_job_id, reason=excluded.reason`,
-        [provider, "exhausted", resetsAt, new Date().toISOString(), jobId, kind],
-      );
+      const roster = seatRosterFor(provider, loadPolicy());
+      const env = (spec?.env ?? {}) as Record<string, unknown>;
+      const deadSeat = seatKeyOfEnv(env);
+      if (roster.length) {
+        if (deadSeat) this.markQuotaExhausted(quotaRowKey(provider, deadSeat), resetsAt, jobId, kind);
+        // The dead seat counts as tried for choosing the next one, even though
+        // the failing job's env could not know it yet.
+        const withDead = deadSeat ? { ...env, UW_SEATS_TRIED: [...triedSeatsOfEnv(env), deadSeat].join(",") } : env;
+        const next = nextUntriedSeat(withDead, roster);
+        if (next && this.quotaFailover(jobId, job, spec, withDead, deadSeat, next)) return;
+      }
+      this.markQuotaExhausted(provider, resetsAt, jobId, kind);
       return;
     }
     if (kind !== "auth" && kind !== "config") return;
@@ -90,13 +141,28 @@ export class SqliteStore implements IStore {
     this.log("harness", provider, "broken", "health-monitor", { node_id: nodeId, strikes, retry_at: retryAt, kind, job_id: jobId });
   }
 
-  /** Providers currently observed-exhausted (reset window not yet passed). */
+  /** Providers currently observed-exhausted (reset window not yet passed).
+   *  gh-191: a provider whose whole seat roster is marked dead reads as
+   *  provider-exhausted even without a provider-level row. */
   private observedExhaustedProviders(now = Date.now()): Map<string, { state: string; resets_at: string | null }> {
     const rows = this.nodeQuery("SELECT provider, resets_at FROM provider_quota WHERE state='exhausted'", []) as { provider: string; resets_at: string | null }[];
     const m = new Map<string, { state: string; resets_at: string | null }>();
+    const seatMarks = new Map<string, Array<{ state: string; resets_at: string | null }>>();
     for (const r of rows) {
       if (r.resets_at && Date.parse(r.resets_at) <= now) continue;
       m.set(r.provider, { state: "exhausted", resets_at: r.resets_at });
+      const seat = r.provider.match(/^(.+):([^:]+)$/);
+      if (seat && !m.has(seat[1])) {
+        const list = seatMarks.get(seat[1]) ?? [];
+        list.push({ state: "exhausted", resets_at: r.resets_at });
+        seatMarks.set(seat[1], list);
+      }
+    }
+    for (const [provider, marks] of seatMarks) {
+      const roster = seatRosterFor(provider, loadPolicy());
+      if (!roster.length || marks.length < roster.length) continue;
+      const resets = marks.map(x => x.resets_at).filter((x): x is string => !!x).sort();
+      m.set(provider, { state: "exhausted", resets_at: resets[0] ?? null });
     }
     return m;
   }
@@ -285,7 +351,7 @@ export class SqliteStore implements IStore {
         if (!args.task_id || !args.agent_id || !spec.workspace_id || spec.payload.workspace_id !== spec.workspace_id ||
             !node.capabilities_observed_at || Date.now() - Date.parse(String(node.capabilities_observed_at)) > 120000 ||
             !harness?.installed || harness.auth_status !== 'ready' || !quotaAllows(harness.quota)) return nodeError('launch requires task, agent and fresh ready harness capability', 403);
-        const reserved = (s.nodeQuery("SELECT * FROM jobs WHERE type='node' AND task_id=? AND agent_id=? AND status IN ('queued','running') AND dedupe_key LIKE 'launch:%'", [args.task_id, args.agent_id]))[0];
+        const reserved = (s.nodeQuery("SELECT * FROM jobs WHERE type='node' AND task_id=? AND agent_id=? AND status IN ('queued','running') AND (dedupe_key LIKE 'launch:%' OR dedupe_key LIKE 'failover:%')", [args.task_id, args.agent_id]))[0];
         if (reserved) return { ...publicNodeJob(reserved), deduped: true };
       }
       if (args.retry_of) {
@@ -334,10 +400,26 @@ export class SqliteStore implements IStore {
       const job = s.nodeQuery("SELECT * FROM jobs WHERE id=? AND target_node_id=? AND status='running' AND session_id=? AND lease_token=? AND lease_expires>?", [jobId, principal.node_id, sessionId, leaseToken, new Date().toISOString()])[0];
       if (!job || !job.task_id || JSON.parse(job.node_spec).kind !== 'launch-agent') return nodeError('worker requires a live task launch', 403);
       const worker = 'uw_worker_' + nodeSecret();
+      // gh-191: a failovered launch carries its next seat in the spec env
+      // (CODEX_HOME + tried list). Surface it as worker env so the executor's
+      // child process actually rotates accounts. Names/values are bounded —
+      // this crosses from the job record into a spawned process env.
+      let env: Record<string, string> | undefined;
+      try {
+        const specEnv = JSON.parse(job.node_spec || '{}').env;
+        if (specEnv && typeof specEnv === 'object') {
+          const clean: Record<string, string> = {};
+          for (const [k, v] of Object.entries(specEnv)) {
+            if (Object.keys(clean).length >= 16) break;
+            if (/^[A-Z0-9_]{1,64}$/.test(k) && typeof v === 'string' && v.length <= 512) clean[k] = v;
+          }
+          if (Object.keys(clean).length) env = clean;
+        }
+      } catch { /* no env on the spec */ }
       s.nodeQuery('DELETE FROM node_workers WHERE job_id=?', [jobId]);
       s.nodeQuery('INSERT INTO node_workers(secret_hash,node_id,token_id,session_id,task_id,agent_id,job_id,attempt_id) VALUES (?,?,?,?,?,?,?,?)', [nodeHash(worker), principal.node_id, principal.token_id, sessionId, job.task_id, job.agent_id, jobId, job.attempt_id]);
       s.log('job', jobId, 'worker_issued', principal.node_id, { attempt_id: job.attempt_id });
-      return { token: worker, task_id: job.task_id, agent_id: job.agent_id, job_id: jobId, attempt_id: job.attempt_id };
+      return { token: worker, task_id: job.task_id, agent_id: job.agent_id, job_id: jobId, attempt_id: job.attempt_id, ...(env ? { env } : {}) };
     });
   }
 

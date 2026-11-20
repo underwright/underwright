@@ -146,7 +146,9 @@ export async function runNode(opts: {
           if (job.node_spec.kind === 'launch-agent') {
             const issued = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/worker`, { session_id, lease_token: job.lease_token });
             if (issued.error || !issued.token) return { status: 'failed' as const, result: 'worker credential denied' };
-            worker = { UNDERWRIGHT_TOKEN: issued.token, UNDERWRIGHT_MCP_URL: cred.url + '/worker/mcp', UNDERWRIGHT_TASK_ID: issued.task_id, UNDERWRIGHT_AGENT_ID: issued.agent_id, UNDERWRIGHT_JOB_ID: issued.job_id, UNDERWRIGHT_ATTEMPT_ID: issued.attempt_id };
+            // gh-191: a failovered launch returns its seat env (CODEX_HOME +
+            // tried list) — merge it in so the child rotates accounts.
+            worker = { UNDERWRIGHT_TOKEN: issued.token, UNDERWRIGHT_MCP_URL: cred.url + '/worker/mcp', UNDERWRIGHT_TASK_ID: issued.task_id, UNDERWRIGHT_AGENT_ID: issued.agent_id, UNDERWRIGHT_JOB_ID: issued.job_id, UNDERWRIGHT_ATTEMPT_ID: issued.attempt_id, ...(issued.env && typeof issued.env === 'object' ? issued.env : {}) };
           }
           return registry.execute({ id: job.id, type: job.node_spec.kind, params: job.node_spec.payload, worker }, childSignal);
         });

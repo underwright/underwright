@@ -63,8 +63,12 @@ review rules) assigns tasks to agents on completion/release. Model-complexity
 routing (`policy.model_routing`) maps task signals → light/standard/heavy
 tier → concrete model per harness, passed via `omni --model` or harness
 flags. `policy.watch` gates the budget (`max_inflight`,
-`max_agent_jobs_per_day`, `budget_usd_per_day`) and fails seats over on
-quota signatures (`codex_seats`).
+`max_agent_jobs_per_day`, `budget_usd_per_day`) and names the per-account
+seat roster (`codex_seats`, generically `seats` per harness). On a
+quota-classified failure the control plane marks the dead seat
+(`provider_quota` key `provider:seat`), failovers the job onto the next
+untried seat, and only marks the whole provider exhausted when the roster
+is spent (gh-191) — a dead seat must not read as a dead provider.
 
 *Customize:* `dispatcher`, `model_routing.rules/models`, `watch` budget +
 seat fields, `harness_matrix` (which agent runs which backend; omnigent

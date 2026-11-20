@@ -97,9 +97,23 @@ export async function executeLeasedJob(job: any, call: JobCall, options: {
   } catch (error) {
     return call("finish_job", { ...owner, status: "failed", result: String(error) });
   }
+  // gh-191: a quota failover resubmit carries its next seat in spec.env
+  // (CODEX_HOME + tried list) — merge it into the child env so the harness
+  // actually rotates accounts. String values only; anything else is dropped.
+  let env: NodeJS.ProcessEnv | undefined;
+  if (job.type === "agent" && typeof job.agent_spec === "string") {
+    try {
+      const specEnv = JSON.parse(job.agent_spec).env;
+      if (specEnv && typeof specEnv === "object") {
+        env = { ...process.env };
+        for (const [k, v] of Object.entries(specEnv)) if (typeof v === "string") env[k] = v;
+      }
+    } catch { /* no env on the spec */ }
+  }
   if (options.signal?.aborted) return;
   const child = spawn(invocation.executable, invocation.args, {
     shell: job.type !== "agent", detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"],
+    ...(env ? { env } : {}),
   });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
