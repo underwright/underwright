@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, NODE_STALE_MS, NODE_JOB_GRACE_MAX_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
@@ -420,6 +420,33 @@ export class PgStore implements IStore {
     return depth;
   }
 
+  /** gh-192: is this expired job's runner demonstrably alive and still claiming
+   *  it? See SqliteStore.nodeJobLiveClaimed — a fresh heartbeat naming this job
+   *  means renew was blocked (server stall), not that the runner died. */
+  private async nodeJobLiveClaimed(s: PgStore, job: any): Promise<boolean> {
+    if (!job.target_node_id || !job.started_at) return false;
+    const started = job.started_at instanceof Date ? job.started_at.getTime() : Date.parse(job.started_at);
+    if (Date.now() - started > NODE_JOB_GRACE_MAX_MS) return false;
+    const [node] = await s.nodeQuery("SELECT last_seen_at, active_job_ids FROM nodes WHERE id=?", [job.target_node_id]) as any[];
+    if (!node || !node.last_seen_at) return false;
+    const seen = node.last_seen_at instanceof Date ? node.last_seen_at.getTime() : Date.parse(node.last_seen_at);
+    if (Date.now() - seen > NODE_STALE_MS) return false;
+    try { return (JSON.parse(node.active_job_ids || "[]") as string[]).includes(job.id); } catch { return false; }
+  }
+
+  /** Lease-extend a live-claimed job instead of failing it. Returns the new
+   *  expiry (ISO) when the grace applied. */
+  private async graceExtendNodeJob(s: PgStore, job: any, actor: string): Promise<string | undefined> {
+    const leaseExpires = new Date(Date.now() + NODE_LEASE_SECONDS * 1000);
+    const updated = await s.nodeQuery(
+      "UPDATE jobs SET lease_expires=? WHERE id=? AND status='running' RETURNING id",
+      [leaseExpires, job.id],
+    );
+    if (!updated.length) return undefined;
+    await s.log("job", job.id, "lease_graced", actor, { attempt_id: job.attempt_id, lease_expires: leaseExpires.toISOString() });
+    return leaseExpires.toISOString();
+  }
+
   async sweepExpiredNodeJobs() {
     return this.sql.begin(async sql => {
       const s = new PgStore(sql as unknown as postgres.Sql);
@@ -429,7 +456,13 @@ export class PgStore implements IStore {
       // Opt-in requeue for retryable kinds; outcome_unknown stays deliberate by default.
       const retry = getDispatcherPolicy().node_retry;
       const retried: string[] = [];
+      const graced: string[] = [];
       for (const job of expired) {
+        // A runner still heartbeating this job as active is alive — its renew
+        // was blocked, not lost. Extend and let it recover (gh-192).
+        if (await s.nodeJobLiveClaimed(s, job)) {
+          if (await s.graceExtendNodeJob(s, job, "lease-sweeper")) { graced.push(job.id); continue; }
+        }
         let successor: string | undefined;
         let spec: any = {};
         try { spec = typeof job.node_spec === "string" ? JSON.parse(job.node_spec || "{}") : (job.node_spec ?? {}); } catch {}
@@ -449,7 +482,7 @@ export class PgStore implements IStore {
         );
         await s.log("job", job.id, "failed", "lease-sweeper", { reason, ...(successor ? { successor } : {}) });
       }
-      return { expired: expired.map((row: any) => row.id as string), retried };
+      return { expired: expired.map((row: any) => row.id as string), retried, graced };
     });
   }
 
@@ -646,9 +679,23 @@ export class PgStore implements IStore {
        AND session_id=? AND lease_token=? AND lease_expires>now() RETURNING id`,
       [lease_expires.toISOString(), result === undefined ? null : boundNodeResult(result), jobId, principal.node_id, principal.node_id, sessionId, leaseToken],
     );
-    if (!updated.length) return nodeError("job lease not owned or expired", 409);
-    await this.log("job", jobId, "renewed", principal.node_id);
-    return { id: jobId, lease_expires: lease_expires.toISOString() };
+    if (updated.length) {
+      await this.log("job", jobId, "renewed", principal.node_id);
+      return { id: jobId, lease_expires: lease_expires.toISOString() };
+    }
+    // gh-192: the lease lapsed while the server was unresponsive (DB stall) and
+    // this is the first renew to get through. If the runner is still alive and
+    // heartbeating this job as active, the lease is recoverable — re-own it
+    // instead of 409ing, so a healthy agent run survives the stall window.
+    const job = (await this.nodeQuery(
+      "SELECT * FROM jobs WHERE id=? AND type='node' AND status='running' AND target_node_id=? AND runner_id=? AND session_id=? AND lease_token=?",
+      [jobId, principal.node_id, principal.node_id, sessionId, leaseToken],
+    ))[0];
+    if (job && await this.nodeJobLiveClaimed(this, job)) {
+      const graced = await this.graceExtendNodeJob(this, job, principal.node_id);
+      if (graced) return { id: jobId, lease_expires: graced };
+    }
+    return nodeError("job lease not owned or expired", 409);
   }
 
   async finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown) {
@@ -708,11 +755,18 @@ export class PgStore implements IStore {
     return res;
   }
 
-  async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
+  async nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; active_job_ids?: string[]; phase?: string } = {}) {
     const principal = await this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     await this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // The claimed-job set drives gh-192 sweeper grace: persist it whenever the
+    // heartbeat carries one (new daemons send the full list; old daemons send
+    // active_job_id only). Absent keys leave the last claim in place.
+    if (body.active_job_ids !== undefined || body.active_job_id !== undefined) {
+      const claimed = body.active_job_ids ?? (body.active_job_id ? [body.active_job_id] : []);
+      await this.nodeQuery("UPDATE nodes SET active_job_ids=? WHERE id=?", [JSON.stringify(claimed.slice(0, 32)), principal.node_id]);
+    }
     // Liveness doubles as attestation freshness: when the heartbeat echoes
     // the stored capabilities_version the node asserts that inventory is
     // still current — refresh observed_at so quiet nodes don't go stale.
@@ -721,7 +775,7 @@ export class PgStore implements IStore {
         "UPDATE nodes SET capabilities_observed_at=? WHERE id=? AND capabilities_version=?",
         [now, principal.node_id, body.capabilities_version],
       );
-    await this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
+    await this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? body.active_job_ids?.[0] ?? null, active_job_ids: body.active_job_ids ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = await this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
   }
@@ -772,6 +826,7 @@ export class PgStore implements IStore {
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_of TEXT`;
     await sql`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS review_kind TEXT`;
     await sql`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS last_poll_at TEXT`;
+    await sql`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS active_job_ids TEXT`;
     await sql`CREATE INDEX IF NOT EXISTS tasks_review_of ON tasks(review_of)`;
     await sql`CREATE INDEX IF NOT EXISTS events_entity_action ON events(entity_type, entity_id, action)`;
     await sql`CREATE INDEX IF NOT EXISTS messages_from_created ON messages(from_agent, created_at)`;

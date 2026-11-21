@@ -1,6 +1,6 @@
 /** Outbound daemon with independent liveness and lease loops, typed execution and durable receipts. */
 import { createExecutorRegistry, redact, type ExecutorConfig } from './node-executors.js';
-import { NODE_MAX_CONCURRENCY } from './node-protocol.js';
+import { NODE_MAX_CONCURRENCY, NODE_JOB_RENEW_GIVE_UP_MS } from './node-protocol.js';
 import { AttemptJournal, processStart } from './node-journal.js';
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { arch, platform } from "node:os";
@@ -155,9 +155,9 @@ export async function runNode(opts: {
         const beat = async () => {
           while (!sessionAbort.signal.aborted) {
             try {
-              const active_job_id = [...activeJobs][0];
+              const active_job_ids = [...activeJobs];
               const phase = activeJobs.size ? "running" : "idle";
-              const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_id, phase }, "POST", sessionAbort.signal);
+              const result = await nodeCall(cred, "/nodes/v1/heartbeat", { session_id, capabilities_version, active_job_ids, phase }, "POST", sessionAbort.signal);
               if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }
             } catch (error) { if (sessionAbort.signal.aborted) return; await backoff(error, sessionAbort.signal); }
             await sleep(heartbeatMs, sessionAbort.signal).catch(() => undefined);
@@ -215,16 +215,32 @@ export async function runNode(opts: {
                 sessionAbort.signal.addEventListener('abort', stopChild, { once: true });
                 if (sessionAbort.signal.aborted) childAbort.abort();
                 let expires = Date.parse(job.lease_expires);
+                // gh-192: the deadline is a give-up valve past the LAST
+                // SERVER-CONFIRMED expiry, not the current one — a stalled
+                // server makes renews fail transiently, and the sweeper's
+                // live-claimed grace keeps the lease recoverable while the
+                // heartbeat keeps naming this job. Only silence longer than
+                // NODE_JOB_RENEW_GIVE_UP_MS means the lease is truly gone.
+                let renewSilentSince: number | undefined;
                 let renewing = false;
                 const timer = setInterval(() => {
-                  if (Date.now() >= expires) childAbort.abort();
+                  if (renewSilentSince !== undefined && Date.now() - renewSilentSince > NODE_JOB_RENEW_GIVE_UP_MS) childAbort.abort();
                   if (renewing || childAbort.signal.aborted) return;
                   renewing = true;
-                  void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token }, 'POST', AbortSignal.timeout(Math.max(1, Math.min(10000, expires - Date.now()))))
-                    .then(r => { if (r.error || !r.lease_expires) childAbort.abort(); else expires = Date.parse(r.lease_expires); })
-                    .catch(() => childAbort.abort()).finally(() => { renewing = false; });
+                  void nodeCall(cred, `/nodes/v1/jobs/${job.id}/renew`, { session_id, lease_token: job.lease_token }, 'POST', AbortSignal.timeout(Math.max(1000, Math.min(10000, expires - Date.now()))))
+                    .then(r => {
+                      // Definitive auth/ownership rejection (401/403/409) kills
+                      // the child — the lease is gone or ours no longer. Anything
+                      // else (5xx/429/empty) is transient server trouble; keep
+                      // running and retry on the next tick.
+                      if ([401, 403, 409].includes(r.status)) childAbort.abort();
+                      else if (!r.error && r.lease_expires) { expires = Date.parse(r.lease_expires); renewSilentSince = undefined; }
+                      else renewSilentSince ??= Date.now();
+                    })
+                    .catch(() => { renewSilentSince ??= Date.now(); })
+                    .finally(() => { renewing = false; });
                 }, opts.renewMs ?? 10000);
-                const expiryTimer = setInterval(() => { if (Date.now() >= expires) childAbort.abort(); }, 100);
+                const expiryTimer = setInterval(() => { if (renewSilentSince !== undefined && Date.now() - renewSilentSince > NODE_JOB_RENEW_GIVE_UP_MS) childAbort.abort(); }, 100);
                 const execSpan = tel.span("job.execute", { job_id: job.id, task_id: job.task_id, attempt_id: job.attempt_id, slot });
                 try {
                   finished = await execute(job, childAbort.signal);

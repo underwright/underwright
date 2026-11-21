@@ -134,3 +134,58 @@ it("dedupes active node tasks, bounds results, and waits/cancels long-poll witho
   const timed = await store.pollNodeJob(node.token, node.session.session_id, 1);
   expect(timed.empty).toBe(true);
 });
+
+it("gh-192: a live-claimed expired job is lease-graced by the sweeper, not failed", async () => {
+  const { store } = fixture();
+  vi.useFakeTimers();
+  const node = await enrolled(store, "node", { allowed_task_types: ["run-script", "provision"], workspace_ids: ["ws-1"] });
+  // 'provision' would normally fail as lease_lost/outcome_unknown (no retry
+  // policy here) — the grace path must intercept it before that default.
+  const nodeJob = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: spec({ kind: "provision" }) });
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(leased.id).toBe(nodeJob.id);
+  // Runner heartbeats the full claimed set while its agent executes.
+  const beat = store.nodeHeartbeat(node.token, node.session.session_id, { active_job_ids: [leased.id], phase: "running" });
+  expect(beat.error).toBeUndefined();
+  // Lease lapses (renew was blocked, e.g. server-side DB stall) but the
+  // runner is demonstrably alive and still claiming the job.
+  vi.setSystemTime(Date.now() + 61_000);
+  const sweep = store.sweepExpiredNodeJobs();
+  expect(sweep.graced).toContain(nodeJob.id);
+  expect(store.getJob(nodeJob.id).status).toBe("running");
+  expect(Date.parse(store.getJob(nodeJob.id).lease_expires)).toBeGreaterThan(Date.now());
+  // The daemon keeps heartbeating while its agent runs; a second sweep past
+  // the new expiry keeps gracing it while it stays claimed.
+  store.nodeHeartbeat(node.token, node.session.session_id, { active_job_ids: [leased.id], phase: "running" });
+  vi.setSystemTime(Date.now() + 61_000);
+  expect(store.sweepExpiredNodeJobs().graced).toContain(nodeJob.id);
+  expect(store.getJob(nodeJob.id).status).toBe("running");
+  // ...but never past NODE_JOB_GRACE_MAX_MS: an old job finally fails.
+  vi.setSystemTime(Date.now() + 30 * 60 * 1000);
+  expect(store.sweepExpiredNodeJobs().graced).toEqual([]);
+  expect(store.getJob(nodeJob.id).status).toBe("failed");
+  expect(store.getJob(nodeJob.id).outcome_reason).toBe("lease_lost/outcome_unknown");
+});
+
+it("gh-192: renew after lapse re-owns a live-claimed job instead of 409ing", async () => {
+  const { store } = fixture();
+  vi.useFakeTimers();
+  const node = await enrolled(store);
+  const nodeJob = await store.submitNodeTask({ target_node_id: node.node_id, node_spec: spec() });
+  const leased = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  // Server recovers from its stall; the lease already expired but the runner
+  // never stopped heartbeating the job as active.
+  vi.setSystemTime(Date.now() + 61_000);
+  store.nodeHeartbeat(node.token, node.session.session_id, { active_job_ids: [leased.id], phase: "running" });
+  const renewed = await store.renewNodeJob(node.token, node.session.session_id, leased.id, leased.lease_token);
+  expect(renewed.error).toBeUndefined();
+  expect(renewed.id).toBe(nodeJob.id);
+  expect(Date.parse(renewed.lease_expires)).toBeGreaterThan(Date.now());
+  expect(store.getJob(nodeJob.id).status).toBe("running");
+  // Stale node heartbeats or a job set that no longer claims it do not earn
+  // the grace: an expired lease whose runner stopped claiming it still 409s.
+  vi.setSystemTime(Date.now() + 61_000);
+  store.nodeHeartbeat(node.token, node.session.session_id, { active_job_ids: [], phase: "idle" });
+  const denied = await store.renewNodeJob(node.token, node.session.session_id, leased.id, leased.lease_token);
+  expect(denied.error).toMatch(/not owned or expired/);
+});

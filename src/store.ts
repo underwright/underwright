@@ -1,4 +1,4 @@
-import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
+import { nodeEnrollmentSchema, nodePolicySchema, nodeHash, nodeSecret, nodeExpiry, nodeError, NODE_SCOPES, NODE_LEASE_SECONDS, NODE_POLL_MAX_WAIT, NODE_POLL_RETRY_MS, NODE_DISPATCH_THROTTLE_MS, NODE_STALE_MS, NODE_JOB_GRACE_MAX_MS, nodeSpecSchema, nodeInventorySchema, boundNodeResult, nodeReceiptDigest, publicNodeJob, projectNode, sleepSignal, nodeSpecAllowed, quotaAllows, selectNode, type NodeCandidate, type NodeEnrollmentInput, type NodePolicy, type NodePrincipal, type NodeError } from "./node-protocol.js";
 import { NODES_SCHEMA } from "./schema.js";
 import Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -467,6 +467,34 @@ export class SqliteStore implements IStore {
     return depth;
   }
 
+  /** gh-192: is this expired job's runner demonstrably alive and still claiming
+   *  it? The daemon heartbeats its claimed job set every ~15s, so a fresh
+   *  last_seen_at naming this job means "renew blocked" (e.g. a server-side DB
+   *  stall), not "runner dead" — the sweeper must extend, not fail. Bounded by
+   *  NODE_JOB_GRACE_MAX_MS so a runner claiming a job it cannot finish cannot
+   *  hold the lease forever. */
+  private nodeJobLiveClaimed(s: SqliteStore, job: any): boolean {
+    if (!job.target_node_id || !job.started_at) return false;
+    if (Date.now() - Date.parse(job.started_at) > NODE_JOB_GRACE_MAX_MS) return false;
+    const node = (s.nodeQuery("SELECT last_seen_at, active_job_ids FROM nodes WHERE id=?", [job.target_node_id]))[0];
+    if (!node || !node.last_seen_at) return false;
+    if (Date.now() - Date.parse(node.last_seen_at) > NODE_STALE_MS) return false;
+    try { return (JSON.parse(node.active_job_ids || "[]") as string[]).includes(job.id); } catch { return false; }
+  }
+
+  /** Lease-extend a live-claimed job instead of failing it. Returns the new
+   *  expiry when the grace applied. */
+  private graceExtendNodeJob(s: SqliteStore, job: any, actor: string): string | undefined {
+    const leaseExpires = nodeExpiry(NODE_LEASE_SECONDS);
+    const updated = s.nodeQuery(
+      "UPDATE jobs SET lease_expires=? WHERE id=? AND status='running' RETURNING id",
+      [leaseExpires, job.id],
+    );
+    if (!updated.length) return undefined;
+    s.log("job", job.id, "lease_graced", actor, { attempt_id: job.attempt_id, lease_expires: leaseExpires });
+    return leaseExpires;
+  }
+
   sweepExpiredNodeJobs() {
     const now = new Date().toISOString();
     return this.nodeTransaction(s => {
@@ -475,7 +503,13 @@ export class SqliteStore implements IStore {
       // Opt-in requeue for retryable kinds; outcome_unknown stays deliberate by default.
       const retry = getDispatcherPolicy().node_retry;
       const retried: string[] = [];
+      const graced: string[] = [];
       for (const job of expired) {
+        // A runner still heartbeating this job as active is alive — its renew
+        // was blocked, not lost. Extend and let it recover (gh-192).
+        if (s.nodeJobLiveClaimed(s, job)) {
+          if (s.graceExtendNodeJob(s, job, "lease-sweeper")) { graced.push(job.id); continue; }
+        }
         let successor: string | undefined;
         let spec: any = {};
         try { spec = JSON.parse(job.node_spec || "{}"); } catch {}
@@ -495,7 +529,7 @@ export class SqliteStore implements IStore {
         );
         s.log("job", job.id, "failed", "lease-sweeper", { reason, ...(successor ? { successor } : {}) });
       }
-      return { expired: expired.map((row: any) => row.id as string), retried };
+      return { expired: expired.map((row: any) => row.id as string), retried, graced };
     });
   }
 
@@ -714,9 +748,23 @@ export class SqliteStore implements IStore {
        AND session_id=? AND lease_token=? AND lease_expires>? RETURNING id`,
       [lease_expires, result === undefined ? null : boundNodeResult(result), jobId, principal.node_id, principal.node_id, sessionId, leaseToken, now],
     );
-    if (!updated.length) return nodeError("job lease not owned or expired", 409);
-    this.log("job", jobId, "renewed", principal.node_id);
-    return { id: jobId, lease_expires };
+    if (updated.length) {
+      this.log("job", jobId, "renewed", principal.node_id);
+      return { id: jobId, lease_expires };
+    }
+    // gh-192: the lease lapsed while the server was unresponsive (DB stall) and
+    // this is the first renew to get through. If the runner is still alive and
+    // heartbeating this job as active, the lease is recoverable — re-own it
+    // instead of 409ing, so a healthy agent run survives the stall window.
+    const job = (this.nodeQuery(
+      "SELECT * FROM jobs WHERE id=? AND type='node' AND status='running' AND target_node_id=? AND runner_id=? AND session_id=? AND lease_token=?",
+      [jobId, principal.node_id, principal.node_id, sessionId, leaseToken],
+    ))[0];
+    if (job && this.nodeJobLiveClaimed(this, job)) {
+      const graced = this.graceExtendNodeJob(this, job, principal.node_id);
+      if (graced) return { id: jobId, lease_expires: graced };
+    }
+    return nodeError("job lease not owned or expired", 409);
   }
 
   finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown) {
@@ -776,11 +824,18 @@ export class SqliteStore implements IStore {
     return res;
   }
 
-  nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; phase?: string } = {}) {
+  nodeHeartbeat(token: string, sessionId: string, body: { capabilities_version?: number; active_job_id?: string; active_job_ids?: string[]; phase?: string } = {}) {
     const principal = this.authenticateNode(token, sessionId);
     if ("error" in principal) return principal;
     const now = new Date().toISOString();
     this.nodeQuery("UPDATE nodes SET last_seen_at=? WHERE id=?", [now, principal.node_id]);
+    // The claimed-job set drives gh-192 sweeper grace: persist it whenever the
+    // heartbeat carries one (new daemons send the full list; old daemons send
+    // active_job_id only). Absent keys leave the last claim in place.
+    if (body.active_job_ids !== undefined || body.active_job_id !== undefined) {
+      const claimed = body.active_job_ids ?? (body.active_job_id ? [body.active_job_id] : []);
+      this.nodeQuery("UPDATE nodes SET active_job_ids=? WHERE id=?", [JSON.stringify(claimed.slice(0, 32)), principal.node_id]);
+    }
     // Liveness doubles as attestation freshness: nodes re-PUT capabilities
     // only when the inventory changes, so a quiet node's observed_at ages past
     // NODE_STALE_MS and every launch-agent probe is denied while heartbeats
@@ -791,7 +846,7 @@ export class SqliteStore implements IStore {
         "UPDATE nodes SET capabilities_observed_at=? WHERE id=? AND capabilities_version=?",
         [now, principal.node_id, body.capabilities_version],
       );
-    this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? null, capabilities_version: body.capabilities_version ?? null });
+    this.log("node", principal.node_id, "heartbeat", principal.node_id, { phase: body.phase ?? null, active_job_id: body.active_job_id ?? body.active_job_ids?.[0] ?? null, active_job_ids: body.active_job_ids ?? null, capabilities_version: body.capabilities_version ?? null });
     const [row] = this.nodeQuery("SELECT * FROM nodes WHERE id=?", [principal.node_id]);
     return { node_id: principal.node_id, server_time: now, ...projectNode(row) };
   }
@@ -949,6 +1004,15 @@ export class SqliteStore implements IStore {
       );
       if (!cols.has("last_poll_at")) this.db.exec("ALTER TABLE nodes ADD COLUMN last_poll_at TEXT;");
       this.db.exec("PRAGMA user_version = 11;");
+    }
+    if (v < 12) {
+      // v12: the heartbeat's full claimed-job set, so the lease sweeper can
+      // tell "runner alive but renew blocked" (gh-192) from genuinely lost.
+      const cols = new Set(
+        this.db.prepare("SELECT name FROM pragma_table_info('nodes')").all().map((r: any) => r.name)
+      );
+      if (!cols.has("active_job_ids")) this.db.exec("ALTER TABLE nodes ADD COLUMN active_job_ids TEXT;");
+      this.db.exec("PRAGMA user_version = 12;");
     }
   }
 
