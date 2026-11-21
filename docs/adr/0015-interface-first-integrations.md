@@ -1,4 +1,4 @@
-# ADR-0013: Interface-first integrations — an adapter at every external seam
+# ADR-0015: Interface-first integrations — an adapter at every external seam
 
 Status: proposed · 2026-11-21
 
