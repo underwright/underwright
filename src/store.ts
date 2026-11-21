@@ -1397,8 +1397,8 @@ export class SqliteStore implements IStore {
       if (task.status === "done") return { error: `task ${args.task_id} is completed; ledger is closed` };
       const claim = this.db.prepare("SELECT agent_id FROM claims WHERE task_id = ?").get(args.task_id) as any;
       if (claim && claim.agent_id !== args.agent_id) return { error: `task ${args.task_id} is claimed by ${claim.agent_id}` };
-      this.db.prepare("INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details) VALUES (?,?,?,?,?,?,?,?)")
-        .run(op, args.task_id, args.agent_id, args.job_id ?? null, args.attempt_id ?? null, args.status, args.summary, args.details ?? "");
+      this.db.prepare("INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details, created_at) VALUES (?,?,?,?,?,?,?,?,?)")
+        .run(op, args.task_id, args.agent_id, args.job_id ?? null, args.attempt_id ?? null, args.status, args.summary, args.details ?? "", new Date().toISOString());
       this.log("task", args.task_id, "ledger", args.agent_id, { operation_id: op, status: args.status, job_id: args.job_id ?? null });
       return this.db.prepare("SELECT * FROM task_ledger WHERE operation_id = ?").get(op);
     }).immediate();

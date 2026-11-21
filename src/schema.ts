@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS task_ledger (
   status       TEXT NOT NULL CHECK (status IN ('started','progress','blocked','done','cancelled')),
   summary      TEXT NOT NULL,
   details      TEXT NOT NULL DEFAULT '',
-  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS task_ledger_task ON task_ledger(task_id, created_at);
 `;

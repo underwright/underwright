@@ -1158,8 +1158,8 @@ export class PgStore implements IStore {
       if (task.status === "done") throw new Error(`task ${a.task_id} is completed; ledger is closed`);
       const [claim] = await sql<any[]>`SELECT agent_id FROM claims WHERE task_id = ${a.task_id}`;
       if (claim && claim.agent_id !== a.agent_id) throw new Error(`task ${a.task_id} is claimed by ${claim.agent_id}`);
-      const [row] = await sql<any[]>`INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details)
-        VALUES (${op},${a.task_id},${a.agent_id},${a.job_id ?? null},${a.attempt_id ?? null},${a.status},${a.summary},${a.details ?? ""}) RETURNING *`;
+      const [row] = await sql<any[]>`INSERT INTO task_ledger (operation_id, task_id, agent_id, job_id, attempt_id, status, summary, details, created_at)
+        VALUES (${op},${a.task_id},${a.agent_id},${a.job_id ?? null},${a.attempt_id ?? null},${a.status},${a.summary},${a.details ?? ""},${new Date().toISOString()}) RETURNING *`;
       await sql`INSERT INTO events (entity_type, entity_id, action, actor, data) VALUES ('task',${a.task_id},'ledger',${a.agent_id},${sql.json({ operation_id: op, status: a.status, job_id: a.job_id ?? null })})`;
       return row;
     }).catch((e: Error) => ({ error: e.message }));
