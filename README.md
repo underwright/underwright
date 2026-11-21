@@ -2,10 +2,15 @@
 
 **Control plane for agentic software development.** Agents that underwrite their work.
 
-Underwright is not another coding agent — it's the layer that makes *any* coding
-agents (Claude Code, Copilot, Codex, Devin, or your own) follow a real SDLC:
-shared tasks instead of scattered prompts, claims instead of collisions,
-evidence instead of "looks done to me."
+Underwright is an [MCP](https://modelcontextprotocol.io) server — a control
+plane that makes *any* coding agents (Claude Code, Copilot, Codex, Devin, or
+your own) follow a real SDLC: shared tasks instead of scattered prompts,
+claims instead of collisions, evidence instead of "looks done to me." It is
+not another coding agent; it's the coordination layer above them.
+
+[Docs](https://underwright.github.io/underwright/) ·
+[npm](https://www.npmjs.com/package/underwright) ·
+[Docker](https://github.com/underwright/underwright/pkgs/container/underwright)
 
 ## The problem it solves
 
