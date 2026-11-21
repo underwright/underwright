@@ -270,7 +270,8 @@ CREATE TABLE IF NOT EXISTS nodes (
   policy_json TEXT NOT NULL, created_at TEXT NOT NULL, last_seen_at TEXT,
   last_poll_at TEXT,
   session_epoch TEXT, session_expires_at TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
-  capabilities_version INTEGER NOT NULL DEFAULT 0, capabilities_observed_at TEXT
+  capabilities_version INTEGER NOT NULL DEFAULT 0, capabilities_observed_at TEXT,
+  active_job_ids TEXT
 );
 CREATE TABLE IF NOT EXISTS node_enrollments (
   id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, device_secret_hash TEXT NOT NULL,

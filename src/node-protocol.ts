@@ -68,6 +68,16 @@ export const nodeSecret = () => randomBytes(32).toString('hex');
 export const nodeExpiry = (seconds: number) => new Date(Date.now() + seconds * 1000).toISOString();
 export const NODE_ONLINE_MS = 45_000;
 export const NODE_STALE_MS = 120_000;
+/** Sweeper/renew grace ceiling: a live-claimed job is lease-extended instead of
+ *  lease_lost while its runner heartbeats it as active, but never beyond this
+ *  total runtime — a bound against a runner that claims a job it cannot finish. */
+export const NODE_JOB_GRACE_MAX_MS = 30 * 60 * 1000;
+/** Daemon-side give-up valve: while a job runs, renew failures are transient
+ *  (5xx/429/network/timeout — the server-side live-claimed grace keeps the
+ *  lease recoverable), but if no renew has been server-confirmed for this long
+ *  past the last confirmed expiry, the runner truly cannot reach the control
+ *  plane and the child is aborted. Bounds a job whose renews silently die. */
+export const NODE_JOB_RENEW_GIVE_UP_MS = 15 * 60 * 1000;
 /** Pull-through matching runs at most once per node per interval. The 50ms
  *  poll retry loop is cheap (queued-job lookup only); full dispatchToNode
  *  matching — dozens of synchronous queries + JSON parses — is throttled.
@@ -82,6 +92,7 @@ export const nodeHeartbeatSchema = z.object({
   session_id: z.string().min(1).max(64),
   capabilities_version: z.number().int().nonnegative().optional(),
   active_job_id: z.string().max(64).optional(),
+  active_job_ids: z.array(z.string().max(64)).max(32).optional(),
   phase: z.enum(['idle', 'polling', 'running']).optional(),
 }).strict();
 export const nodeHarnessSchema = z.object({

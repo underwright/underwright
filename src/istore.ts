@@ -100,8 +100,8 @@ export interface IStore {
   pollNodeJob(token: string, sessionId: string, waitSeconds?: number, signal?: AbortSignal, exclude?: string[]): Awaitable<any>;
   renewNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, result?: string): Awaitable<any>;
   finishNodeJob(token: string, sessionId: string, jobId: string, leaseToken: string, status: "done" | "failed", result: string, resultMetadata?: unknown): Awaitable<any>;
-  sweepExpiredNodeJobs(): Awaitable<{ expired: string[] }>;
-  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; phase?: string }): Awaitable<any>;
+  sweepExpiredNodeJobs(): Awaitable<{ expired: string[]; retried?: string[]; graced?: string[] }>;
+  nodeHeartbeat(token: string, sessionId: string, body?: { capabilities_version?: number; active_job_id?: string; active_job_ids?: string[]; phase?: string }): Awaitable<any>;
   putNodeCapabilities(token: string, sessionId: string, version: number, inventory: unknown): Awaitable<any>;
 
   issueNodeWorker(token: string, sessionId: string, jobId: string, leaseToken: string): Awaitable<any>;
