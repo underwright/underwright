@@ -53,6 +53,12 @@ Use `create_task` directly only for board-internal bookkeeping that does not
 belong on the issue tracker (review tasks, probes, ephemeral coordination).
 If in doubt, it belongs on GitHub.
 
+**Sign GitHub work with your partyline id.** The fleet shares one GitHub
+account, so the account name is not the author — your partyline id is. Include
+it (e.g. `_Filed by agent \`alan_underwright_1\`_`) on every issue you file and
+every substantive issue/PR comment you leave, so work can be traced back to
+the true author.
+
 ## Anti-escalation
 
 Escalation is a last resort and goes through the mailbox. Never stop silently.
