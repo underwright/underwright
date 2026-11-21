@@ -61,13 +61,16 @@ export function chooseReassignAgent(args: {
  */
 export const HARNESS_TIERS: Readonly<Record<string, number>> = {
   devin: 0,
-  cmdc: 0,
   opencode: 0,
+  cmdc: 1,
+  "command-code": 1,
   codex: 1,
   grok: 1,
+  cursor: 1,
   claude: 2,
   agy: 2,
   kimi: 2,
+  copilot: 2,
 };
 
 const HIGH_TIER = 2;

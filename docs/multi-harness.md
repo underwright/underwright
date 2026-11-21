@@ -472,9 +472,9 @@ should prefer the cheapest harness that satisfies task complexity (#54).
 
 | Tier | Harnesses | Notes |
 |---|---|---|
-| free | devin (swe-2), cmdc (command-code), opencode (free models) | devin@swe-2 has no marginal cost; cmdc/opencode have usable free tiers |
-| low | codex, grok | subscription/quota-bound |
-| high | claude, agy (Gemini), kimi | reserve for design/epics/review |
+| free | devin (swe-2), opencode (free models) | devin@swe-2 has no marginal cost; opencode has usable free tiers |
+| low | codex, grok, cmdc (command-code), cursor | subscription/quota-bound; cheap but not free |
+| high | claude, agy (Gemini), kimi, copilot | reserve for design/epics/review |
 
 Free tier does not mean unreviewed: free/low-tier implementations still
 need independent review evidence before merge (peer-review policy).
