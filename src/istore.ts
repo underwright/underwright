@@ -114,6 +114,8 @@ export interface IStore {
   setTaskStatus(id: string, status: TaskStatus, actor: string): Awaitable<any>;
   linkTask(id: string, spec_ref: string): Awaitable<any>;
   listTasks(status?: TaskStatus): Awaitable<any[]>;
+  /** Cheap id-only listing for sweeps — skips the per-task dependency joins. */
+  listTaskIds(status: TaskStatus): Awaitable<string[]>;
   claimTask(taskId: string, agentId: string, ttlSeconds?: number, scope?: object): Awaitable<any>;
   updateTask(id: string, patch: Partial<CreateTaskArgs>, actor: string): Awaitable<any>;
   releaseTask(taskId: string, agentId: string, scoped?: boolean): Awaitable<any>;

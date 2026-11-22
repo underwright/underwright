@@ -7,14 +7,17 @@ import type { IStore } from "./istore.js";
  *  next-task mail to a non-agent actor. */
 const IN_REVIEW_SWEEP_BATCH = 5;
 
-async function sweepInReview(store: Partial<Pick<IStore, "listTasks" | "completeTask">>, onError: (e: unknown) => void) {
-  if (!store.listTasks || !store.completeTask) return;
-  const parked = await store.listTasks("in_review");
-  for (const t of (parked ?? []).slice(0, IN_REVIEW_SWEEP_BATCH)) {
+async function sweepInReview(store: Partial<Pick<IStore, "listTaskIds" | "completeTask">>, onError: (e: unknown) => void) {
+  if (!store.listTaskIds || !store.completeTask) return;
+  const parked = (await store.listTaskIds("in_review")) ?? [];
+  // Random slice: the stable-ordered head would retry the same unclosable
+  // tasks forever and never reach the rest of the pile.
+  const batch = parked.sort(() => Math.random() - 0.5).slice(0, IN_REVIEW_SWEEP_BATCH);
+  for (const id of batch) {
     try {
       // Error objects (unproven ac_ids, foreign claim) mean "not closable
       // yet" — the store already logs completions, nothing else to do.
-      await store.completeTask(t.id, "sweeper", true);
+      await store.completeTask(id, "sweeper", true);
     } catch (error) {
       onError(error);
     }
@@ -23,7 +26,7 @@ async function sweepInReview(store: Partial<Pick<IStore, "listTasks" | "complete
 
 /** One sweep at startup, then every minute. Stop waits for in-flight work. */
 export function startLeaseSweeper(
-  store: Pick<IStore, "sweepExpiredClaims"> & Partial<Pick<IStore, "sweepIdleDispatches" | "sweepExpiredNodeJobs" | "listTasks" | "completeTask">>,
+  store: Pick<IStore, "sweepExpiredClaims"> & Partial<Pick<IStore, "sweepIdleDispatches" | "sweepExpiredNodeJobs" | "listTaskIds" | "completeTask">>,
   intervalMs = 60_000,
   onError: (error: unknown) => void = error => console.error("[underwright] lease sweep failed:", error),
 ) {
