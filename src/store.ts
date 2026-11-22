@@ -12,6 +12,7 @@ import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
+import { extractUsage, parseResultJson, sumUsage, withUsage } from "./usage.js";
 import type { IStore, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 import type { SymbolRec, RefRec } from "./codeindex.js";
 
@@ -787,7 +788,9 @@ export class SqliteStore implements IStore {
       if (job.status !== "running" || !job.lease_expires || job.lease_expires <= now) {
         return nodeError("job lease not owned or expired", 409);
       }
-      const metadata = resultMetadata == null ? null : JSON.stringify(resultMetadata);
+      const metaObj = resultMetadata != null && typeof resultMetadata === "object" ? resultMetadata as Record<string, unknown> : undefined;
+      const mergedMeta = withUsage(metaObj, metaObj, parseResultJson(bounded));
+      const metadata = mergedMeta == null ? null : JSON.stringify(mergedMeta);
       const updated = s.nodeQuery(
         `UPDATE jobs SET status=?, result=?, finished_at=?, lease_expires=NULL, receipt_digest=?, receipt_status=?, result_metadata=?
          WHERE id=? AND status='running' AND lease_token=? AND session_id=? AND lease_expires>? RETURNING id`,
@@ -1123,7 +1126,19 @@ export class SqliteStore implements IStore {
       artifacts: this.listArtifacts(id),
       ledger: this.listLedger(id),
       reviews: this.reviewIds(id),
+      usage: this.taskUsage(id),
     };
+  }
+
+  taskUsage(id: string) {
+    const rows = this.db
+      .prepare("SELECT result, result_metadata FROM jobs WHERE task_id=? AND status IN ('done','failed')")
+      .all(id) as { result: string | null; result_metadata: string | null }[];
+    return sumUsage(rows.map(r => {
+      let meta: unknown;
+      try { meta = r.result_metadata ? JSON.parse(r.result_metadata) : undefined; } catch { meta = undefined; }
+      return extractUsage(meta) ?? extractUsage(parseResultJson(r.result));
+    }));
   }
 
   private reviewIds(id: string): string[] {

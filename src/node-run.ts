@@ -253,6 +253,7 @@ export async function runNode(opts: {
               finished ??= { status: 'failed', result: 'restart/outcome_unknown; automatic replay refused' };
               const receipt = await nodeCall(cred, `/nodes/v1/jobs/${job.id}/finish`, {
                 session_id, lease_token: job.lease_token, status: finished.status, result: finished.result,
+                result_metadata: finished.metadata,
               });
               if (receipt.error) { if ([401, 409].includes(receipt.status)) sessionAbort.abort(); else throw new Error('finish failed'); }
             } catch (error) {

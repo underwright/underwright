@@ -12,6 +12,7 @@ import { parseCoverage } from "./coverage.js";
 import { chooseReassignAgent, chooseReviewer, DISPATCHER_AGENT, implementerFromRecords, isSystemActor, leaseActive, linkedReviewArgs, nextTaskMessage, overCap, reviewIndependenceError, taskIdFromNextTaskMessage } from "./dispatcher.js";
 import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./digest.js";
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
+import { extractUsage, parseResultJson, sumUsage, withUsage } from "./usage.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 
 const DDL = `
@@ -719,7 +720,9 @@ export class PgStore implements IStore {
       if (job.status !== "running" || !job.lease_expires || expires.getTime() <= Date.now()) {
         return nodeError("job lease not owned or expired", 409);
       }
-      const metadata = resultMetadata == null ? null : JSON.stringify(resultMetadata);
+      const metaObj = resultMetadata != null && typeof resultMetadata === "object" ? resultMetadata as Record<string, unknown> : undefined;
+      const mergedMeta = withUsage(metaObj, metaObj, parseResultJson(bounded));
+      const metadata = mergedMeta == null ? null : JSON.stringify(mergedMeta);
       const updated = await s.nodeQuery(
         `UPDATE jobs SET status=?, result=?, finished_at=now(), lease_expires=NULL, receipt_digest=?, receipt_status=?, result_metadata=?
          WHERE id=? AND status='running' AND lease_token=? AND session_id=? AND lease_expires>now() RETURNING id`,
@@ -927,7 +930,18 @@ export class PgStore implements IStore {
     return {
       ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
       artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
+      usage: await this.taskUsage(id),
     };
+  }
+
+  async taskUsage(id: string) {
+    const rows = await this.sql<{ result: string | null; result_metadata: unknown }[]>`
+      SELECT result, result_metadata FROM jobs WHERE task_id=${id} AND status IN ('done','failed')`;
+    return sumUsage(rows.map(r => {
+      let meta = r.result_metadata;
+      if (typeof meta === "string") { try { meta = JSON.parse(meta); } catch { meta = undefined; } }
+      return extractUsage(meta) ?? extractUsage(parseResultJson(r.result));
+    }));
   }
 
   private async reviewIds(id: string): Promise<string[]> {
