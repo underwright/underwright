@@ -63,3 +63,9 @@ Rejected:
   connection + `?`-placeholder conventions already in place.
 - Contract suite coverage is the release gate for every engine claim; the CI
   matrix (gh-28) gains one job per tier-1 engine.
+
+## Support matrix
+
+The engine × tier × divergence matrix lives in
+[database-support.md](../database-support.md) and is the source of truth for
+what is supported, implemented, expected or planned.
