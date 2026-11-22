@@ -1,4 +1,5 @@
 import postgres from "postgres";
+import { PgStore } from "./pstore.js";
 
 export type HaState = "standby" | "acquiring" | "active" | "draining";
 
@@ -70,6 +71,9 @@ export async function migrateHa(adminUrl: string, options: MigrateOptions): Prom
   const sql = postgres(adminUrl, { max: 3, onnotice: () => {} });
   try {
     await sql`SELECT pg_advisory_lock(hashtext(${`uw-ha:${domain}`}))`;
+    const core = await PgStore.connect(adminUrl);
+    await core.close();
+    const group = `uw_cp_${domain}_group`;
     await sql.unsafe(`
       CREATE TABLE IF NOT EXISTS uw_cp_leader (
         domain_id text PRIMARY KEY,
@@ -130,15 +134,18 @@ export async function migrateHa(adminUrl: string, options: MigrateOptions): Prom
       INSERT INTO uw_cp_leader (domain_id, generation) VALUES (${domain}, 0)
       ON CONFLICT (domain_id) DO NOTHING
     `;
+    const groupExists = await sql`SELECT 1 FROM pg_roles WHERE rolname = ${group}`;
+    if (groupExists.length === 0) await sql.unsafe(`CREATE ROLE "${group}"`);
     for (const id of instances) {
       const role = roleName(id);
-      const password = checkName(options.rolePassword, "role password");
+      const password = options.rolePassword.replace(/'/g, "''");
       const existing = await sql`SELECT 1 FROM pg_roles WHERE rolname = ${role}`;
       if (existing.length === 0) {
         await sql.unsafe(`CREATE ROLE "${role}" LOGIN PASSWORD '${password}'`);
       }
       await sql.unsafe(`ALTER ROLE "${role}" WITH LOGIN PASSWORD '${password}'`);
       await sql.unsafe(`ALTER ROLE "${role}" SET uw.domain = '${domain}'`);
+      await sql.unsafe(`GRANT "${group}" TO "${role}"`);
       await sql.unsafe(`GRANT USAGE, CREATE ON SCHEMA public TO "${role}"`);
       await sql.unsafe(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO "${role}"`);
       await sql.unsafe(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO "${role}"`);
@@ -155,6 +162,7 @@ export async function migrateHa(adminUrl: string, options: MigrateOptions): Prom
       BEGIN
         FOR t IN SELECT tablename FROM pg_tables
                  WHERE schemaname = current_schema() AND tablename NOT LIKE 'uw_%' LOOP
+          EXECUTE format('ALTER TABLE %I OWNER TO "${group}"', t.tablename);
           EXECUTE format('DROP TRIGGER IF EXISTS uw_fence_write ON %I', t.tablename);
           EXECUTE format('DROP TRIGGER IF EXISTS uw_fence_delete ON %I', t.tablename);
           EXECUTE format('CREATE TRIGGER uw_fence_write BEFORE INSERT OR UPDATE ON %I
