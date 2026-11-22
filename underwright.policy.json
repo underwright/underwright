@@ -331,6 +331,37 @@
         ],
         "checklist": "Apply the covasant/Aura review rubric (repo: .claude/commands/review-prs.md) to the implementer's branch/PR on the linked task. Criteria: (1) aligned with Auraa's vision \u2014 horizontal, domain-neutral, tool-first/governed; (2) no inappropriate hardcoded values \u2014 runtime config via DABs variables, not literals; (3) tests present AND passing \u2014 run them yourself and quote the output, UNVERIFIED counts as fail; (4) no serious issues \u2014 correctness, security, tenant isolation, breaking API, data-corruption patterns, error handlers that report what failed vs what they assumed; (5) post-deploy validation script at scripts/validate/<issue>.py \u2014 one command, preflight() requirements, positive+negative cases, exit 0/1/2, --selftest or --offline \u2014 or a documented reason it is infeasible. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review citing ac1, then complete_task."
       }
+    },
+    "underwright/underwright": {
+      "enforcement": "block",
+      "prompt": "UNDERWRIGHT RUBRIC (underwright/underwright \u2014 enforced at review): Follow AGENTS.md. (1) Claim the task and read its artifacts before editing; search_context before adding shared helpers. (2) npm run build must be clean \u2014 ESM Node16: relative imports carry the .js suffix. (3) Store changes must satisfy the IStore contract on BOTH backends \u2014 no engine-specific SQL in shared paths, schema lives in src/schema.ts only; run the relevant tests or state why they don't apply. (4) Work on a feat/* branch off current main \u2014 never leave the main checkout dirty; push and open a PR. (5) All mutations flow through store methods with audit logging \u2014 no ad-hoc SQL writes. (6) Attach evidence for every ac_id with real command output. If you cannot meet the bar, post a blocked artifact and release \u2014 do not report done.",
+      "dod": {
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "evidence": [
+          "test_run"
+        ],
+        "evidence_match": [
+          {
+            "kind": "test_run",
+            "pattern": "npm run build|npm test|vitest",
+            "severity": "warn",
+            "desc": "no build/test run cited in evidence"
+          }
+        ]
+      },
+      "review": {
+        "auto": true,
+        "types": [
+          "feature",
+          "bug",
+          "tdd"
+        ],
+        "checklist": "Apply the underwright/underwright review rubric to the implementer's branch/PR on the linked task. Criteria: (1) AGENTS.md conventions \u2014 claimed before work, board updated, artifacts not side channels; (2) build+typecheck actually run \u2014 npm run build output quoted in evidence, UNVERIFIED counts as fail; (3) store-layer changes verified against BOTH SQLite and PostgreSQL semantics \u2014 no engine-only SQL in shared code, IStore methods used, both stores updated when the interface changed; (4) ESM/Node16 hygiene \u2014 .js import suffixes, no undeclared deps, no secrets or host-specific values committed; (5) git hygiene \u2014 feat branch off main, PR open and linked, no orphaned dirty files; (6) mutations through store methods with audit events. Post a review artifact giving each criterion PASS/FAIL/N/A with one-line evidence and an overall verdict, attach report_evidence kind=review citing ac1, then complete_task."
+      }
     }
   }
 }
