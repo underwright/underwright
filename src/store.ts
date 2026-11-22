@@ -1037,11 +1037,13 @@ export class SqliteStore implements IStore {
       .run(entityType, entityId, title, content);
   }
 
-  private dependencies(id: string, status: TaskStatus) {
+  private dependencies(id: string, status: TaskStatus, dependentType?: string) {
     const blockers = this.db.prepare(`SELECT t.id, t.status FROM task_dependencies d
       JOIN tasks t ON t.id=d.blocker_id WHERE d.task_id=? ORDER BY t.id`).all(id) as any[];
     const blocks = this.db.prepare("SELECT task_id FROM task_dependencies WHERE blocker_id=? ORDER BY task_id").all(id) as any[];
-    const unfinished_blockers = blockers.filter(t => t.status !== "done").map(t => t.id as string);
+    // A review task's subject parked at in_review IS delivered work — the
+    // review exists to close it, so that blocker is satisfied there.
+    const unfinished_blockers = blockers.filter(t => t.status !== "done" && !(dependentType === "review" && t.status === "in_review")).map(t => t.id as string);
     return { blocked_by: blockers.map(t => t.id as string), blocks: blocks.map(t => t.task_id as string),
       unfinished_blockers, status: status === "open" && unfinished_blockers.length ? "blocked" : status };
   }
@@ -1065,11 +1067,11 @@ export class SqliteStore implements IStore {
   }
 
   private unblockDependents(blockerId: string, actor: string) {
-    const dependents = this.db.prepare(`SELECT t.id, t.status FROM task_dependencies d
+    const dependents = this.db.prepare(`SELECT t.id, t.status, t.type FROM task_dependencies d
       JOIN tasks t ON t.id=d.task_id WHERE d.blocker_id=?`).all(blockerId) as any[];
     for (const t of dependents) {
       if (t.status === "done") continue;
-      const remaining = this.dependencies(t.id, t.status).unfinished_blockers;
+      const remaining = this.dependencies(t.id, t.status, t.type).unfinished_blockers;
       const unblocked = t.status === "open" && remaining.length === 0;
       this.log("task", t.id, unblocked ? "unblocked" : "blocker_completed", actor,
         { blocker_id: blockerId, unfinished_blockers: remaining });
@@ -1121,7 +1123,7 @@ export class SqliteStore implements IStore {
     if (!t) return null;
     const claim = this.db.prepare("SELECT * FROM claims WHERE task_id = ?").get(id) ?? null;
     return {
-      ...t, ...this.dependencies(id, t.status),
+      ...t, ...this.dependencies(id, t.status, t.type),
       ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
       artifacts: this.listArtifacts(id),
       ledger: this.listLedger(id),
@@ -1197,7 +1199,7 @@ export class SqliteStore implements IStore {
 
   listTasks(status?: TaskStatus) {
     const rows = this.db.prepare("SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at").all() as any[];
-    return rows.map(t => ({ ...t, ...this.dependencies(t.id, t.status) }))
+    return rows.map(t => ({ ...t, ...this.dependencies(t.id, t.status, t.type) }))
       .filter(t => !status || t.status === status);
   }
 
@@ -1956,7 +1958,7 @@ export class SqliteStore implements IStore {
       this.db.prepare("SELECT agent_id,status,COUNT(*) n FROM jobs WHERE type='node' AND datetime(created_at) > datetime('now','-6 hours') GROUP BY agent_id,status").all() as any[],
     );
     return {
-      tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status) })),
+      tasks: (tasks as any[]).map(t => ({ ...t, ...this.dependencies(t.id, t.status, t.type) })),
       job_counts: jobs,
       helpers_registered: helpers,
       nodes,
