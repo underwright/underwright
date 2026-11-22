@@ -19,6 +19,16 @@ export type { TaskStatus } from "./istore.js";
 import type { TaskStatus } from "./istore.js";
 import { PgStore } from "./pstore.js";
 
+// JSON columns can hold a double-encoded value (a JSON string containing the
+// array) when a caller writes a pre-stringified payload; unwrap to string[].
+function asStringArray(v: unknown): string[] {
+  let val: unknown = v;
+  for (let i = 0; i < 2 && typeof val === "string"; i++) {
+    try { val = JSON.parse(val); } catch { return []; }
+  }
+  return Array.isArray(val) ? (val as string[]) : [];
+}
+
 export class SqliteStore implements IStore {
   private db: Database.Database;
   private lastDispatchAttempt = new Map<string, number>();
@@ -1119,7 +1129,7 @@ export class SqliteStore implements IStore {
     const claim = this.db.prepare("SELECT * FROM claims WHERE task_id = ?").get(id) ?? null;
     return {
       ...t, ...this.dependencies(id, t.status),
-      ac_ids: JSON.parse(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
+      ac_ids: asStringArray(t.ac_ids), ownership: JSON.parse(t.ownership), claim,
       artifacts: this.listArtifacts(id),
       ledger: this.listLedger(id),
       reviews: this.reviewIds(id),
@@ -1448,7 +1458,7 @@ export class SqliteStore implements IStore {
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
 
     const rows = this.getEvidence(taskId) as any[];
-    const proven = new Set(rows.flatMap((r) => JSON.parse(r.ac_ids)));
+    const proven = new Set(rows.flatMap((r) => asStringArray(r.ac_ids)));
     const missing = (task.ac_ids as string[]).filter((ac) => !proven.has(ac));
     if (missing.length > 0) {
       return { error: `unproven acceptance criteria: ${missing.join(", ")}. Attach evidence citing these ac_ids.` };

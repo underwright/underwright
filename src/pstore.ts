@@ -121,6 +121,16 @@ CREATE INDEX IF NOT EXISTS artifacts_search ON artifacts USING gin(to_tsvector('
 
 const EVIDENCE_KINDS = ["test_run","ci_check","review","coverage","deploy","contract_test","security_scan","smoke_test","mutation"];
 
+// JSON columns can hold a double-encoded value (a JSON string containing the
+// array) when a caller writes a pre-stringified payload; unwrap to string[].
+function asStringArray(v: unknown): string[] {
+  let val: unknown = v;
+  for (let i = 0; i < 2 && typeof val === "string"; i++) {
+    try { val = JSON.parse(val); } catch { return []; }
+  }
+  return Array.isArray(val) ? (val as string[]) : [];
+}
+
 /** Postgres control-plane store — also works against Databricks Lakebase
  *  (managed Postgres) unchanged: point DATABASE_URL at the instance. */
 export class PgStore implements IStore {
@@ -926,6 +936,7 @@ export class PgStore implements IStore {
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
     return {
       ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
+      ac_ids: asStringArray(t.ac_ids),
       artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
     };
   }
@@ -1212,7 +1223,7 @@ export class PgStore implements IStore {
     const claim = task.claim;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     const rows = await this.getEvidence(taskId);
-    const proven = new Set(rows.flatMap((r: any) => r.ac_ids as string[]));
+    const proven = new Set(rows.flatMap((r: any) => asStringArray(r.ac_ids)));
     const acs = task.ac_ids as string[];
     const missing = acs.filter((ac) => !proven.has(ac));
     if (missing.length > 0) {
