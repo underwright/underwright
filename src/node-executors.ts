@@ -15,7 +15,7 @@ export const NODE_TASK_TYPES = ['launch-agent', 'provision', 'install-harness', 
 export type NodeTaskType = (typeof NODE_TASK_TYPES)[number];
 
 export interface NodeTask { id: string; type: NodeTaskType; params: unknown; lease_expires?: string; worker?: Record<string, string> }
-export interface NodeResult { status: 'done' | 'failed'; result: string }
+export interface NodeResult { status: 'done' | 'failed'; result: string; metadata?: Record<string, unknown> }
 
 /** Injectable transport for single-attempt callers; the daemon owns its HTTP receipt journal. */
 export interface NodeTransport {

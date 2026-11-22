@@ -119,6 +119,10 @@ Rules of engagement:
     task_id: z.string(),
   }, async ({ task_id }) => text(await store.getTask(task_id) ?? { error: "not found" }));
 
+  server.tool("task_usage", "Summed token/cost usage across a task's finished jobs (all attempts).", {
+    task_id: z.string(),
+  }, async ({ task_id }) => text(await store.taskUsage(task_id)));
+
   server.tool("claim_task", "Atomically claim a task with a lease. Fails if another agent holds an unexpired claim.", {
     task_id: z.string(),
     agent_id: z.string().describe("stable identity for this agent/session"),

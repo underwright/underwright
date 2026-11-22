@@ -109,6 +109,8 @@ export interface IStore {
   createTask(a: CreateTaskArgs): Awaitable<any>;
   listTemplates(): Awaitable<any[]>;
   getTask(id: string): Awaitable<any>;
+  /** Summed token/cost usage across a task's finished jobs (gh-226). */
+  taskUsage(id: string): Awaitable<any>;
   setTaskStatus(id: string, status: TaskStatus, actor: string): Awaitable<any>;
   linkTask(id: string, spec_ref: string): Awaitable<any>;
   listTasks(status?: TaskStatus): Awaitable<any[]>;
