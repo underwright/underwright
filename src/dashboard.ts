@@ -80,6 +80,35 @@ ${body}
 
 // ---------- Task list filters + sorting (query-param driven, zero JS) ----------
 export const TASK_STATUS_FILTERS = ["active", "all", "open", "claimed", "in_review", "done", "blocked"] as const;
+/** Issue lifecycle order — panes render in this sequence so pile-ups read as a pipeline. */
+const TASK_STATUS_ORDER = ["open", "claimed", "in_review", "done", "blocked"] as const;
+
+/** Per-status pane: task count plus the job-status breakdown of jobs whose task sits there. */
+function statusPanes(tasks: any[], jobs: any[]): string {
+  const taskById = new Map(tasks.map((t) => [String(t.id), t] as const));
+  const buckets = new Map<string, { tasks: number; jobs: Map<string, number> }>();
+  for (const s of TASK_STATUS_ORDER) buckets.set(s, { tasks: 0, jobs: new Map() });
+  for (const t of tasks) {
+    const key = isBlockedTask(t) ? "blocked" : String(t.status ?? "open");
+    const b = buckets.get(key) ?? buckets.get("open")!;
+    b.tasks++;
+  }
+  for (const j of jobs) {
+    const task = taskById.get(String(j.task_id));
+    const key = task ? (isBlockedTask(task) ? "blocked" : String(task.status ?? "open")) : null;
+    const b = key ? buckets.get(key) : undefined;
+    if (!b) continue;
+    const js = String(j.status ?? "?");
+    b.jobs.set(js, (b.jobs.get(js) ?? 0) + 1);
+  }
+  const panes = TASK_STATUS_ORDER.map((s) => {
+    const b = buckets.get(s)!;
+    const jobBits = [...b.jobs.entries()].sort((a, c) => c[1] - a[1]).map(([js, n]) => `${n} ${js}`).join(" · ");
+    return `<div class="pane pane-${s}"><div class="pane-count">${b.tasks}</div><div class="pane-name">${s}</div><div class="pane-jobs">${escapeHtml(jobBits || "—")}</div></div>`;
+  });
+  return `<div class="panes">${panes.join('<div class="pane-arrow">→</div>')}</div>`;
+}
+
 export const TASK_SORTS = ["priority", "status", "updated", "claimed_by"] as const;
 export type TaskListQuery = { status: string; q: string; sort: string };
 
@@ -195,6 +224,18 @@ tr.blocked td,tr.blocked .title{color:#f6c27a}
 .iss-auth{color:#f6c27a}
 .iss-config{color:#7dd3fc}
 .iss-aborted,.iss-other{color:#6f7a89}
+.panes{display:flex;flex-wrap:wrap;align-items:stretch;gap:8px;margin:14px 0 4px}
+.pane{flex:1 1 120px;min-width:110px;padding:10px 12px;background:#151922;border:1px solid #232a36;border-top:3px solid #334155}
+.pane-count{font-size:22px;font-weight:600;color:#e2e8f0}
+.pane-name{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#8b95a5}
+.pane-jobs{font-size:11px;color:#6f7a89;margin-top:4px}
+.pane-arrow{align-self:center;color:#334155;font-size:15px}
+.pane-open{border-top-color:#7dd3fc}
+.pane-claimed{border-top-color:#a78bfa}
+.pane-in_review{border-top-color:#f6c27a}
+.pane-done{border-top-color:#4ade80}
+.pane-blocked{border-top-color:#f87171}
+.pane-blocked .pane-count{color:#f87171}
 ${MOBILE_CSS}
 </style>
 </head>
@@ -205,6 +246,7 @@ ${MOBILE_CSS}
 <p class="meta">read-only · auto-refresh ${refresh}s · rendered ${escapeHtml(new Date().toISOString())}</p>
 </header>
 <p class="meta">jobs: ${escapeHtml(jobSummary)} · tasks: ${tasks.length} · active locks: ${locks.length} · nodes: ${nodes.length}</p>
+${statusPanes(allTasks, jobs)}
 
 ${opts.tasks ? taskControls(opts.tasks.query, { token: opts.tasks.token, refreshSeconds: refresh }) : ""}
 ${section("Tasks", tasks, [
