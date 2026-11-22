@@ -7,6 +7,7 @@
 - [Multi-harness](multi-harness.md)
 - [TLS reverse proxy](tls-reverse-proxy.md)
 - [GitHub webhook](webhook.md)
+- [Database support](database-support.md)
 - [Glossary](glossary.md)
 - [Engineering standards](engineering-standards.md)
 - [Architecture decisions](adr/README.md)
