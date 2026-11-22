@@ -1,9 +1,11 @@
 {
   "mcpServers": {
     "underwright": {
-      "command": "node",
-      "args": ["dist/cli.js", "serve"],
-      "env": { "UNDERWRIGHT_DB": "underwright.db" }
+      "type": "http",
+      "url": "http://100.120.201.70:8741/worker/mcp",
+      "headers": {
+        "Authorization": "Bearer uw_worker_edafaa200efe242f3bc72a31ea98c584d8f4c787540c9f3041af1820b3e9ab18"
+      }
     }
   }
 }
