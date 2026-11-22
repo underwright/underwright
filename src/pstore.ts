@@ -15,6 +15,16 @@ import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import { extractUsage, parseResultJson, sumUsage, withUsage } from "./usage.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 
+/** jsonb columns may hold a string-wrapped JSON value (migration residue);
+ *  unwrap to a real string array, else []. */
+function jsonbArray(v: unknown): string[] {
+  if (Array.isArray(v)) return v as string[];
+  if (typeof v === "string") {
+    try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { /* fall through */ }
+  }
+  return [];
+}
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
@@ -928,7 +938,7 @@ export class PgStore implements IStore {
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
     return {
-      ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
+      ...t, ac_ids: jsonbArray(t.ac_ids), ...await this.dependencies(id, t.status), claim: claim ?? null,
       artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
       usage: await this.taskUsage(id),
     };
@@ -1226,8 +1236,8 @@ export class PgStore implements IStore {
     const claim = task.claim;
     if (claim && claim.agent_id !== agentId) return { error: `task ${taskId} is claimed by ${claim.agent_id}` };
     const rows = await this.getEvidence(taskId);
-    const proven = new Set(rows.flatMap((r: any) => r.ac_ids as string[]));
-    const acs = task.ac_ids as string[];
+    const proven = new Set(rows.flatMap((r: any) => jsonbArray(r.ac_ids)));
+    const acs = jsonbArray(task.ac_ids);
     const missing = acs.filter((ac) => !proven.has(ac));
     if (missing.length > 0) {
       return { error: `unproven acceptance criteria: ${missing.join(", ")}. Attach evidence citing these ac_ids.` };
