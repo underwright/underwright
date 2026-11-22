@@ -79,9 +79,10 @@ switch (cmd) {
 
   case "node": {
     try {
+      const nodeDir = flag("dir") ?? process.env.UNDERWRIGHT_NODE_DIR;
       if (args[0] === "enroll") {
-        await enrollNode(flag("url") ?? "", flag("name") ?? hostname(), args.includes("--allow-insecure"));
-      } else if (args[0] === "status") console.log(JSON.stringify(nodeStatus(), null, 2));
+        await enrollNode(flag("url") ?? "", flag("name") ?? hostname(), args.includes("--allow-insecure"), nodeDir);
+      } else if (args[0] === "status") console.log(JSON.stringify(nodeStatus(nodeDir), null, 2));
       else if (args[0] === "run") {
         const shutdown = new AbortController();
         process.once("SIGINT", () => shutdown.abort());
@@ -94,7 +95,7 @@ switch (cmd) {
           console.error(`[node config ${issue.level}] ${issue.section}${issue.id ? ':' + issue.id : ''} ${issue.message}`);
         }
         if (!report.ok) throw new Error(`node config invalid: ${report.issues.filter(i => i.level === 'error').length} error(s) — fix ${configPath} or run 'underwright node config validate --config ${configPath}'`);
-        await runNode({ signal: shutdown.signal, config });
+        await runNode({ signal: shutdown.signal, config, dir: nodeDir });
       } else if (args[0] === "config") {
         const sub = args[1];
         const configPath = resolve(flag("config") ?? DEFAULT_NODE_CONFIG_PATH);
@@ -185,7 +186,7 @@ switch (cmd) {
           save(config);
           console.log(`${id} auth_status = ${status}${quota ? ` quota = ${quota}` : ""}${resetsAt ? ` resets_at = ${resetsAt}` : ""}`);
         } else throw new Error("usage: underwright node config validate|init|set|add|remove|attest|set-auth [--config FILE]");
-      } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] | node status | node run | node config <cmd>");
+      } else throw new Error("usage: underwright node enroll --url ORIGIN --name NAME [--allow-insecure] [--dir STATE_DIR] | node status [--dir] | node run --config FILE [--dir] | node config <cmd>");
     } catch (error) { console.error(error instanceof Error ? error.message : "node command failed"); process.exitCode = 1; }
     break;
   }
@@ -386,9 +387,10 @@ Usage:
   underwright serve              MCP server over stdio (local agent config).
   underwright serve --http H:P   MCP over HTTP at host:port (/mcp, POST /github/webhook, GET /board) — shared across machines.
   underwright run                Execute queued jobs locally (including agent jobs).
-  underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME.
-  underwright node status        Show local credential identity/expiry without secrets.
-  underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory.
+  underwright node enroll        Enroll this machine with a scoped credential; --url ORIGIN --name NAME [--dir STATE_DIR].
+  underwright node status        Show local credential identity/expiry without secrets. --dir selects the state dir.
+  underwright node run           Outbound daemon: session, poll, heartbeat and capability inventory. --dir selects the state dir.
+                                   (UNDERWRIGHT_NODE_DIR also selects the state dir — one daemon per board per host.)
   underwright node config        Manage node-executors.json: validate|init|set|add|remove|attest|set-auth
                                  [--config FILE] (default ~/.config/underwright/node-executors.json).
   underwright service install    Install a systemd unit for autostart on reboot:
