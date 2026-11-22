@@ -1197,6 +1197,10 @@ export class SqliteStore implements IStore {
     return { id, spec_ref };
   }
 
+  listTaskIds(status: TaskStatus) {
+    return (this.db.prepare("SELECT id FROM tasks WHERE status=?").all(status) as { id: string }[]).map(r => r.id);
+  }
+
   listTasks(status?: TaskStatus) {
     const rows = this.db.prepare("SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at").all() as any[];
     return rows.map(t => ({ ...t, ...this.dependencies(t.id, t.status, t.type) }))

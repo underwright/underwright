@@ -1009,6 +1009,10 @@ export class PgStore implements IStore {
     return { id, spec_ref };
   }
 
+  async listTaskIds(status: TaskStatus) {
+    return (await this.sql`SELECT id FROM tasks WHERE status=${status}`).map(r => r.id as string);
+  }
+
   async listTasks(status?: TaskStatus) {
     const rows = await this.sql`SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at`;
     const tasks = await Promise.all(rows.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status, t.type) })));
