@@ -858,11 +858,13 @@ export class PgStore implements IStore {
     });
   }
 
-  private async dependencies(id: string, status: TaskStatus) {
+  private async dependencies(id: string, status: TaskStatus, dependentType?: string) {
     const blockers = await this.sql`SELECT t.id, t.status FROM task_dependencies d
       JOIN tasks t ON t.id=d.blocker_id WHERE d.task_id=${id} ORDER BY t.id`;
     const blocks = await this.sql`SELECT task_id FROM task_dependencies WHERE blocker_id=${id} ORDER BY task_id`;
-    const unfinished_blockers = blockers.filter(t => t.status !== "done").map(t => t.id as string);
+    // A review task's subject parked at in_review IS delivered work — the
+    // review exists to close it, so that blocker is satisfied there.
+    const unfinished_blockers = blockers.filter(t => t.status !== "done" && !(dependentType === "review" && t.status === "in_review")).map(t => t.id as string);
     return { blocked_by: blockers.map(t => t.id as string), blocks: blocks.map(t => t.task_id as string),
       unfinished_blockers, status: status === "open" && unfinished_blockers.length ? "blocked" : status };
   }
@@ -888,11 +890,11 @@ export class PgStore implements IStore {
   }
 
   private async unblockDependents(blockerId: string, actor: string) {
-    const dependents = await this.sql`SELECT t.id, t.status FROM task_dependencies d
+    const dependents = await this.sql`SELECT t.id, t.status, t.type FROM task_dependencies d
       JOIN tasks t ON t.id=d.task_id WHERE d.blocker_id=${blockerId}`;
     for (const t of dependents) {
       if (t.status === "done") continue;
-      const remaining = (await this.dependencies(t.id, t.status)).unfinished_blockers;
+      const remaining = (await this.dependencies(t.id, t.status, t.type)).unfinished_blockers;
       const unblocked = t.status === "open" && remaining.length === 0;
       await this.log("task", t.id, unblocked ? "unblocked" : "blocker_completed", actor,
         { blocker_id: blockerId, unfinished_blockers: remaining });
@@ -938,7 +940,7 @@ export class PgStore implements IStore {
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
     return {
-      ...t, ac_ids: jsonbArray(t.ac_ids), ...await this.dependencies(id, t.status), claim: claim ?? null,
+      ...t, ac_ids: jsonbArray(t.ac_ids), ...await this.dependencies(id, t.status, t.type), claim: claim ?? null,
       artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
       usage: await this.taskUsage(id),
     };
@@ -1009,7 +1011,7 @@ export class PgStore implements IStore {
 
   async listTasks(status?: TaskStatus) {
     const rows = await this.sql`SELECT id, title, status, priority FROM tasks ORDER BY priority, created_at`;
-    const tasks = await Promise.all(rows.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) })));
+    const tasks = await Promise.all(rows.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status, t.type) })));
     return tasks.filter(t => !status || t.status === status);
   }
 
@@ -1763,7 +1765,7 @@ export class PgStore implements IStore {
     const failures = await this.sql`SELECT agent_id, right(result,-800) AS result, finished_at FROM jobs WHERE type='node' AND status='failed' AND finished_at::timestamptz > now() - interval '6 hours'`;
     const counts = await this.sql`SELECT agent_id, status, COUNT(*)::int AS n FROM jobs WHERE type='node' AND created_at::timestamptz > now() - interval '6 hours' GROUP BY agent_id, status`;
     return {
-      tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status) }))),
+      tasks: await Promise.all(tasks.map(async t => ({ ...t, ...await this.dependencies(t.id, t.status, t.type) }))),
       job_counts,
       helpers_registered: n,
       nodes,
