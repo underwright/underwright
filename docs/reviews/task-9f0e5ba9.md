@@ -1,7 +1,7 @@
 # Code review: task-9f0e5ba9 — Scheduled activities: declarative cadences in policy (gh-64)
 
 - Review task: task-f1ee003c (reviewer `claude@covasant-laptop-wsl2`; implementer was `claude@alandesktop`)
-- Issue: https://github.com/alandennis1024/underwright/issues/64 (OPEN)
+- Issue: https://github.com/underwright/underwright/issues/64 (OPEN)
 - Code under review: `src/schedule.ts`, `test/schedule.test.ts`, and the `startScheduler(store)` wiring in `serveHttp` (`src/server.ts`)
 - Where the code is: **only** in commit `f2108c4` ("wip: salvage uncommitted multi-feature work from main checkout") on `origin/wip/dirty-main-salvage`. It is not on `main` (`git merge-base --is-ancestor f2108c4 origin/main` exits 1, and `src/schedule.ts` is absent from `origin/main`). No `feat/gh-64-*` branch exists, and no PR references gh-64 or task-9f0e5ba9.
 - Note: the reviewer token cannot read task-9f0e5ba9 (`get_task` returns 403 worker scope mismatch). This review is based on the issue text, the gh-64 digest comment and the code.
