@@ -14,6 +14,13 @@ import { buildDigest, normalizeDigestArgs, sendHumanNotification } from "./diges
 import { importSpecKit, type ImportSpecKitArgs } from "./speckit.js";
 import type { IStore, TaskStatus, CreateTaskArgs, SubmitJobArgs, SubmitNodeTaskArgs, DigestArgs, DigestResult } from "./istore.js";
 
+/** JSONB columns can hold a JSON-encoded string instead of the real value
+ *  when a caller passed an already-stringified payload. Coerce back. */
+function coerceJson<T>(v: T | string, fallback: T): T {
+  if (typeof v !== "string") return v;
+  try { return JSON.parse(v) as T; } catch { return fallback; }
+}
+
 const DDL = `
 CREATE TABLE IF NOT EXISTS tasks (
   id          TEXT PRIMARY KEY,
@@ -908,8 +915,8 @@ export class PgStore implements IStore {
     await this.sql`
       INSERT INTO tasks (id, title, description, spec_ref, ac_ids, priority, ownership, created_by, type, severity, estimate, review_of, review_kind)
       VALUES (${id},${a.title},${a.description ?? ""},${a.spec_ref ?? null},
-              ${this.sql.json(a.ac_ids ?? [])},${a.priority ?? 2},
-              ${this.sql.json(a.ownership ?? {})},${a.created_by ?? "human"},${a.type ?? "feature"},
+              ${this.sql.json(coerceJson<string[]>(a.ac_ids ?? [], []))},${a.priority ?? 2},
+              ${this.sql.json(coerceJson<object>(a.ownership ?? {}, {}))},${a.created_by ?? "human"},${a.type ?? "feature"},
               ${a.severity ?? "normal"},${a.estimate ?? ""},${linked.reviewOf},${a.review_kind ?? null})`;
     await this.replaceDependencies(id, a.blocked_by ?? []);
     await this.log("task", id, "created", a.created_by ?? "human", a);
@@ -925,7 +932,10 @@ export class PgStore implements IStore {
     if (!t) return null;
     const [claim] = await this.sql<any[]>`SELECT * FROM claims WHERE task_id = ${id}`;
     return {
-      ...t, ...await this.dependencies(id, t.status), claim: claim ?? null,
+      ...t,
+      ac_ids: coerceJson<string[]>(t.ac_ids, []),
+      ownership: coerceJson<Record<string, unknown>>(t.ownership, {}),
+      ...await this.dependencies(id, t.status), claim: claim ?? null,
       artifacts: await this.listArtifacts(id), ledger: await this.listLedger(id), reviews: await this.reviewIds(id),
     };
   }
@@ -963,7 +973,7 @@ export class PgStore implements IStore {
     for (const k of ["title", "description", "spec_ref", "type", "severity", "estimate"] as const) {
       if (patch[k] !== undefined) { sets.push(`${k}=$${vals.length + 2}`); vals.push(patch[k]); }
     }
-    if (patch.ac_ids !== undefined) { sets.push(`ac_ids=$${vals.length + 2}`); vals.push(JSON.stringify(patch.ac_ids)); }
+    if (patch.ac_ids !== undefined) { sets.push(`ac_ids=$${vals.length + 2}`); vals.push(JSON.stringify(coerceJson<string[]>(patch.ac_ids, []))); }
     if (patch.blocked_by !== undefined) {
       const invalid = await this.validateDependencies(id, patch.blocked_by);
       if (invalid) return { error: invalid };
@@ -1192,7 +1202,11 @@ export class PgStore implements IStore {
 
   async getEvidence(taskId: string) {
     const rows = await this.sql<any[]>`SELECT * FROM evidence WHERE task_id=${taskId} ORDER BY created_at`;
-    return rows.map((r) => (r.kind === "coverage" ? { ...r, coverage: parseCoverage(r.output ?? "") } : r));
+    return rows.map((r) => ({
+      ...r,
+      ac_ids: coerceJson<string[]>(r.ac_ids, []),
+      ...(r.kind === "coverage" ? { coverage: parseCoverage(r.output ?? "") } : {}),
+    }));
   }
 
   async completeTask(taskId: string, agentId: string, scoped = false) {
