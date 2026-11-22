@@ -18,6 +18,7 @@ import postgres from "postgres";
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
+const UPSERT = args.includes("--upsert");
 const eventsSinceIdx = args.indexOf("--events-since");
 const EVENTS_SINCE = eventsSinceIdx >= 0 ? args[eventsSinceIdx + 1] : null;
 
@@ -48,6 +49,16 @@ for (const r of colRows) {
   if (r.is_identity === "YES") (identityCols[r.table_name] ??= []).push(r.column_name);
 }
 
+const pkRows = await sql`
+  SELECT kcu.table_name, kcu.column_name
+  FROM information_schema.table_constraints tc
+  JOIN information_schema.key_column_usage kcu
+    ON tc.constraint_name = kcu.constraint_name AND tc.table_name = kcu.table_name
+  WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+  ORDER BY kcu.ordinal_position`;
+const pkMap = {};
+for (const r of pkRows) (pkMap[r.table_name] ??= []).push(r.column_name);
+
 const sqliteTables = new Set(
   sqlite.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((r) => r.name),
 );
@@ -77,7 +88,13 @@ for (const table of ORDER) {
     const ph = batch.map((_, i) => `(${cols.map((_, j) => `$${i * cols.length + j + 1}`).join(",")})`).join(",");
     const flat = batch.flatMap((row) => cols.map((c) => coerce(row[c], colInfo[c])));
     const overriding = identityCols[table] ? " OVERRIDING SYSTEM VALUE" : "";
-    if (!DRY) await sql.unsafe(`INSERT INTO ${q(table)} (${cols.map(q).join(",")})${overriding} VALUES ${ph} ON CONFLICT DO NOTHING`, flat);
+    // Upsert converges mutable tables on rerun; events stay append-only.
+    const pk = pkMap[table];
+    const upsertable = UPSERT && pk && table !== "events";
+    const onConflict = upsertable
+      ? `ON CONFLICT (${pk.map(q).join(",")}) DO UPDATE SET ${cols.filter((c) => !pk.includes(c)).map((c) => `${q(c)}=excluded.${q(c)}`).join(",") || `${q(pk[0])}=excluded.${q(pk[0])}`}`
+      : "ON CONFLICT DO NOTHING";
+    if (!DRY) await sql.unsafe(`INSERT INTO ${q(table)} (${cols.map(q).join(",")})${overriding} VALUES ${ph} ${onConflict}`, flat);
     done += batch.length; totalRows += batch.length; batch = [];
     if (done % 10000 < CHUNK) process.stdout.write(`\r  ${done}/${count}`);
   };
