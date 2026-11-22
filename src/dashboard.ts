@@ -88,25 +88,32 @@ function statusPanes(tasks: any[], jobs: any[]): string {
   const taskById = new Map(tasks.map((t) => [String(t.id), t] as const));
   const buckets = new Map<string, { tasks: number; jobs: Map<string, number> }>();
   for (const s of TASK_STATUS_ORDER) buckets.set(s, { tasks: 0, jobs: new Map() });
+  // Tasks count in their true status pane; `blocked` is an escalation flag
+  // overlay, not a lifecycle stage — flagged tasks still show in their real
+  // stage, so the pane count overlaps the others by design.
   for (const t of tasks) {
-    const key = isBlockedTask(t) ? "blocked" : String(t.status ?? "open");
-    const b = buckets.get(key) ?? buckets.get("open")!;
-    b.tasks++;
+    const key = String(t.status ?? "open");
+    (buckets.get(key) ?? buckets.get("open")!).tasks++;
+    if (isBlockedTask(t)) buckets.get("blocked")!.tasks++;
   }
   for (const j of jobs) {
     const task = taskById.get(String(j.task_id));
-    const key = task ? (isBlockedTask(task) ? "blocked" : String(task.status ?? "open")) : null;
-    const b = key ? buckets.get(key) : undefined;
-    if (!b) continue;
+    if (!task) continue;
+    const b = buckets.get(String(task.status ?? "open")) ?? buckets.get("open")!;
     const js = String(j.status ?? "?");
     b.jobs.set(js, (b.jobs.get(js) ?? 0) + 1);
+    if (isBlockedTask(task)) {
+      const bb = buckets.get("blocked")!;
+      bb.jobs.set(js, (bb.jobs.get(js) ?? 0) + 1);
+    }
   }
-  const panes = TASK_STATUS_ORDER.map((s) => {
+  const pane = (s: string) => {
     const b = buckets.get(s)!;
     const jobBits = [...b.jobs.entries()].sort((a, c) => c[1] - a[1]).map(([js, n]) => `${n} ${js}`).join(" · ");
     return `<div class="pane pane-${s}"><div class="pane-count">${b.tasks}</div><div class="pane-name">${s}</div><div class="pane-jobs">${escapeHtml(jobBits || "—")}</div></div>`;
-  });
-  return `<div class="panes">${panes.join('<div class="pane-arrow">→</div>')}</div>`;
+  };
+  const stages = TASK_STATUS_ORDER.filter(s => s !== "blocked").map(pane);
+  return `<div class="panes">${stages.join('<div class="pane-arrow">→</div>')}<div class="pane-arrow">+</div>${pane("blocked")}</div>`;
 }
 
 export const TASK_SORTS = ["priority", "status", "updated", "claimed_by"] as const;
