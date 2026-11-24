@@ -13,6 +13,7 @@ import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 import { initTelemetry } from "./telemetry.js";
+import { startLoopWatch } from "./loopwatch.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -321,8 +322,14 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
   initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
   const stopSweeper = startLeaseSweeper(store);
+  startLoopWatch(Number(process.env.UNDERWRIGHT_LOOP_STALL_MS ?? 2000));
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
+    const reqStart = Date.now();
+    res.on("finish", () => {
+      const ms = Date.now() - reqStart;
+      if (ms > 3000) console.error(`[underwright] slow request: ${req.method} ${req.url} ${ms}ms`);
+    });
     if (req.url?.startsWith("/nodes/")) {
       if (nodeRequests >= 32) { res.writeHead(429, { "retry-after": "3" }).end(); return; }
       nodeRequests++;
