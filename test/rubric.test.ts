@@ -148,5 +148,20 @@ describe("repo rubrics (gh-155)", () => {
       expect(store.getTask(reviewId).reviews).toHaveLength(0);
       store.close();
     });
+
+    it("dod.review.artifacts refuses a review task closed without its artifact (gh-257)", () => {
+      const store = fixture({ dod: { review: { artifacts: ["review"] } }, enforcement: "block" });
+      const subj = store.createTask({ title: "subject", spec_ref: AURA, type: "bug", estimate: "M", ac_ids: ["ac1"] }) as any;
+      const r = store.createTask({ title: "rubric review", type: "review", review_of: subj.id, review_kind: "code", estimate: "M", ac_ids: ["ac1"] }) as any;
+      store.claimTask(r.id, "codex@laptop");
+      store.reportEvidence({ task_id: r.id, agent_id: "codex@laptop", kind: "review", output: "PASS", exit_code: 0, ac_ids: ["ac1"] });
+      const denied = store.completeTask(r.id, "codex@laptop") as any;
+      expect(denied.error).toContain("artifact kind: review");
+      expect(store.getTask(r.id).status).not.toBe("done");
+      store.postArtifact({ task_id: r.id, agent_id: "codex@laptop", kind: "review", title: "rubric verdict", content: "ACs verified" });
+      const ok = store.completeTask(r.id, "codex@laptop") as any;
+      expect(ok.completed).toBe(r.id);
+      store.close();
+    });
   });
 });

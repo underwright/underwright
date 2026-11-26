@@ -632,13 +632,19 @@ export class SqliteStore implements IStore {
       for (const h of (JSON.parse(node.capabilities_json || "{}").harnesses ?? []) as any[])
         if (h.installed && h.auth_status === "ready") myAgents.add(`${h.id}@${node.name ?? nodeId}`);
     } catch { /* capabilities unreadable — matcher decides harness anyway */ }
+    // gh-256 WIP gate: above review_wip_limit in_review tasks, only review
+    // work may dispatch — feature dispatch pauses until the lane drains.
+    const inReview = dispatch.review_wip_limit > 0
+      ? Number((s.nodeQuery("SELECT COUNT(*) c FROM tasks WHERE status='in_review'") as any[])[0]?.c ?? 0)
+      : 0;
+    const wipGate = dispatch.review_wip_limit > 0 && inReview > dispatch.review_wip_limit;
     const candidates = s.nodeQuery(
       `SELECT id,title,type,estimate,ac_ids,spec_ref,review_kind,priority,updated_at FROM tasks
        WHERE estimate<>'' AND ac_ids<>'[]' AND (
          status='open'${myAgents.size
            ? ` OR (status='claimed' AND id IN (SELECT task_id FROM claims WHERE agent_id IN (${[...myAgents].map(() => "?").join(",")})))`
            : ""})
-       ORDER BY priority ASC, updated_at ASC LIMIT 25`,
+       ORDER BY ${dispatch.review_first ? "(type='review') DESC," : ""} priority ASC, updated_at ASC LIMIT 25`,
       [...myAgents],
     ) as DispatchTask[];
     meta.eligible = candidates.length;
@@ -664,6 +670,7 @@ export class SqliteStore implements IStore {
       meta.considered++;
       const claim = (s.nodeQuery("SELECT agent_id FROM claims WHERE task_id=? AND lease_expires>? LIMIT 1", [task.id, now]) as any[])[0];
       if (claim && !myAgents.has(claim.agent_id)) { skip("claimed"); continue; }
+      if (wipGate && task.type !== "review") { skip("wip_gate"); continue; }
       // Review tasks depend on their subject to prevent reviewing unfinished
       // work — 'in_review' IS the delivered-awaiting-review state, so it
       // satisfies the dep. Otherwise review ↔ subject deadlock (gh-179).
