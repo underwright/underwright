@@ -3,6 +3,7 @@ import { NODES_SCHEMA } from "./schema.js";
 import postgres from "postgres";
 import { TASK_DEPENDENCIES_SCHEMA, PG_JOBS_MIGRATION, PG_ARTIFACTS_MIGRATION, ARTIFACT_KIND_SQL, isArtifactKind, LEDGER_STATUSES, LEDGER_SCHEMA } from "./schema.js";
 import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { loadPolicy, evaluateDoD, evaluateDoR, expandTemplate, listTemplates as allTemplates, getDispatcherPolicy, getDispatchPolicy, getModelRouting, getRubric, type DispatcherPolicy, type RubricRule } from "./policy.js";
 import { matchTaskToNode, buildLaunchSpec, matchAttrs, mergeObservedQuota, repoFromSpecRef, type DispatchTask, type DispatchMeta, type SkipReason } from "./node-dispatch.js";
 import { failoverEnv, nextUntriedSeat, quotaRowKey, seatKeyOfEnv, seatNameOf, seatRosterFor, seatRowsLike, triedSeatsOfEnv } from "./seats.js";
@@ -23,6 +24,23 @@ function jsonbArray(v: unknown): string[] {
     try { const p = JSON.parse(v); return Array.isArray(p) ? p : []; } catch { /* fall through */ }
   }
   return [];
+}
+
+/** Credential bridge (Lakebase OAuth): UW_PG_TOKEN_CMD is a shell command
+ *  whose stdout becomes the Postgres password for each new connection —
+ *  e.g. `uw-pg-token <project> <profile>` minting via the databricks CLI.
+ *  Cached 45 min so pool churn doesn't exec per connection. */
+let pgTokenCache: { v: string; at: number } | null = null;
+function pgPasswordProvider(): (() => Promise<string>) | undefined {
+  const cmd = process.env.UW_PG_TOKEN_CMD;
+  if (!cmd) return undefined;
+  return async () => {
+    if (pgTokenCache && Date.now() - pgTokenCache.at < 45 * 60 * 1000) return pgTokenCache.v;
+    const v = execFileSync("/bin/sh", ["-c", cmd], { encoding: "utf8", timeout: 30000 }).trim();
+    if (!v) throw new Error("UW_PG_TOKEN_CMD produced no token");
+    pgTokenCache = { v, at: Date.now() };
+    return v;
+  };
 }
 
 const DDL = `
@@ -827,7 +845,8 @@ export class PgStore implements IStore {
   }
 
   static async connect(url: string) {
-    const sql = postgres(url, { max: 5 });
+    const pw = pgPasswordProvider();
+    const sql = postgres(url, { max: 5, ...(pw ? { password: pw } : {}) });
     await sql.unsafe(DDL);
     await sql.unsafe(NODES_SCHEMA);
     await sql.unsafe(PG_JOBS_MIGRATION);

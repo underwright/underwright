@@ -28,7 +28,15 @@ export class SqliteStore implements IStore {
   private stmtCache = new Map<string, Database.Statement>();
 
   private nodeTransaction(work: (s: SqliteStore) => any): any {
-    return this.db.transaction(() => work(this))();
+    // gh-253: synchronous sqlite work blocks the HTTP loop — time the big
+    // writes so a wedge names its culprit instead of just timing out.
+    const t0 = Date.now();
+    try {
+      return this.db.transaction(() => work(this))();
+    } finally {
+      const ms = Date.now() - t0;
+      if (ms > 1000) console.error(`[underwright] slow nodeTransaction: ${ms}ms`);
+    }
   }
   private nodeQuery(query: string, params: any[] = []): any[] {
     let statement = this.stmtCache.get(query);

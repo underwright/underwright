@@ -13,6 +13,8 @@ import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 import { initTelemetry } from "./telemetry.js";
+import { startLoopWatch } from "./loopwatch.js";
+import { syncIssues, syncPRs } from "./github.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -53,6 +55,12 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
+  server.tool("github_sync", "Import GitHub issues as gh-* tasks and close stale ones — same as `underwright github sync`, but through the board so fenced/HA stores can be synced over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => syncIssues(store, a.repo)));
+  server.tool("github_sync_prs", "Sync linked PR state into task evidence — `underwright github sync-prs` over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => syncPRs(store, a.repo)));
   server.tool("submit_node_task", "Queue a node-targeted job. Omit target_node_id to route to the best eligible approved node. Legacy next_job consumers never receive these leases.", {
     target_node_id: z.string().min(1).max(64).optional(),
     node_spec: nodeSpecSchema,
@@ -321,8 +329,14 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
   // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
   initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
   const stopSweeper = startLeaseSweeper(store);
+  startLoopWatch(Number(process.env.UNDERWRIGHT_LOOP_STALL_MS ?? 2000));
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
+    const reqStart = Date.now();
+    res.on("finish", () => {
+      const ms = Date.now() - reqStart;
+      if (ms > 3000) console.error(`[underwright] slow request: ${req.method} ${req.url} ${ms}ms`);
+    });
     if (req.url?.startsWith("/nodes/")) {
       if (nodeRequests >= 32) { res.writeHead(429, { "retry-after": "3" }).end(); return; }
       nodeRequests++;
