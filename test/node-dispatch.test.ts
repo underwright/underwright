@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { SqliteStore } from "../src/store.js";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,10 +12,19 @@ process.env.UNDERWRIGHT_DISPATCH_THROTTLE_MS = "0"; // tests poll back-to-back
 
 const cleanup: (() => void)[] = [];
 const savedPolicy = process.env.UNDERWRIGHT_POLICY;
+let policyFile = "";
+/** Merge overrides into the written policy's dispatch block and rewrite —
+ *  loadPolicy reads the file fresh on every call. */
+function setDispatch(overrides: Record<string, unknown>) {
+  const p = JSON.parse(readFileSync(policyFile, "utf8"));
+  p.dispatch = { ...p.dispatch, ...overrides };
+  writeFileSync(policyFile, JSON.stringify(p));
+}
 beforeEach(() => {
   const dir = mkdtempSync(join(tmpdir(), "uw-dispatch-policy-"));
   cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
-  writeFileSync(join(dir, "policy.json"), JSON.stringify({
+  policyFile = join(dir, "policy.json");
+  writeFileSync(policyFile, JSON.stringify({
     dod: {}, enforcement: "observe",
     dispatch: {
       enabled: true,
@@ -518,4 +527,53 @@ it("heartbeat refreshes capabilities_observed_at for a quiet node", async () => 
   expect(hb.error).toBeUndefined();
   const row = store.db.prepare("SELECT capabilities_observed_at FROM nodes WHERE id=?").get(node.node_id ?? hb.node_id) as { capabilities_observed_at: string };
   expect(Date.parse(row.capabilities_observed_at)).toBeGreaterThan(Date.now() - 60_000);
+});
+
+it("review-first: a review task outranks an older open feature (gh-255)", async () => {
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const feat = await store.createTask(task({ title: "feature first" }));
+  const subj = await store.createTask(task({ title: "subject" }));
+  await store.setTaskStatus(subj.id, "in_review", "agent-A");
+  const rev = await store.createTask(task({ title: "review second", type: "review", review_of: subj.id, review_kind: "code" }));
+
+  const j1 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j1.task_id).toBe(rev.id);
+  // Second slot: the feature forms a job once the review is running.
+  const j2 = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j2.task_id).toBe(feat.id);
+});
+
+it("review_first:false restores plain priority/age ordering (gh-255)", async () => {
+  setDispatch({ review_first: false });
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const feat = await store.createTask(task({ title: "feature first" }));
+  const subj = await store.createTask(task({ title: "subject" }));
+  await store.setTaskStatus(subj.id, "in_review", "agent-A");
+  await store.createTask(task({ title: "review second", type: "review", review_of: subj.id, review_kind: "code" }));
+
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(feat.id);
+});
+
+it("review_wip_limit gates non-review dispatch until the lane drains (gh-256)", async () => {
+  setDispatch({ review_wip_limit: 1 });
+  const { store } = fixture();
+  const node = await enrolled(store);
+  await attest(store, node);
+  const s1 = await store.createTask(task({ title: "subject 1" }));
+  const s2 = await store.createTask(task({ title: "subject 2" }));
+  await store.setTaskStatus(s1.id, "in_review", "agent-A");
+  await store.setTaskStatus(s2.id, "in_review", "agent-A"); // 2 in_review > limit 1
+  const feat = await store.createTask(task({ title: "new feature" }));
+  const rev = await store.createTask(task({ title: "review work", type: "review", review_of: s1.id, review_kind: "code" }));
+
+  const j = await store.pollNodeJob(node.token, node.session.session_id, 0);
+  expect(j.task_id).toBe(rev.id); // review work still dispatches under the gate
+  const again = await store.pollNodeJob(node.token, node.session.session_id, 0, undefined, [j.id]);
+  expect(again.empty).toBe(true);
+  expect(again.match.skipped.wip_gate).toBeGreaterThanOrEqual(1);
 });

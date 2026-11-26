@@ -161,6 +161,12 @@ export interface DispatchRule {
   workspaces?: Record<string, string>;
   harness_order?: string[];
   free_fallback?: string[];
+  /** Consider review tasks before new work when forming pull-through jobs.
+   *  Default on — the review lane should drain ahead of the open pool. */
+  review_first?: boolean;
+  /** Backpressure: above this many in_review tasks, only review work
+   *  dispatches — implementers wait for validators. 0 = gate off. */
+  review_wip_limit?: number;
 }
 
 export interface ModelRoutingRule {
@@ -588,13 +594,15 @@ export function expandTemplate<T extends TemplateSeedArgs>(args: T, policy: Poli
 /** gh-126 pull-through dispatch policy. Disabled when the block is absent. */
 export function getDispatchPolicy(policy: Policy = loadPolicy()): Required<DispatchRule> & { workspaces: Record<string, string> } {
   const d = policy.dispatch;
-  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [], free_fallback: [] };
+  if (!d || typeof d !== "object") return { enabled: false, default_workspace: "", workspaces: {}, harness_order: [], free_fallback: [], review_first: false, review_wip_limit: 0 };
   return {
     enabled: d.enabled !== false,
     default_workspace: typeof d.default_workspace === "string" ? d.default_workspace : "",
     workspaces: d.workspaces && typeof d.workspaces === "object" ? d.workspaces : {},
     harness_order: Array.isArray(d.harness_order) ? d.harness_order.filter(h => typeof h === "string") : [],
     free_fallback: Array.isArray(d.free_fallback) ? d.free_fallback.filter(h => typeof h === "string") : ["devin", "cmdc", "command-code", "opencode"],
+    review_first: d.review_first !== false,
+    review_wip_limit: typeof d.review_wip_limit === "number" && d.review_wip_limit > 0 ? Math.floor(d.review_wip_limit) : 0,
   };
 }
 

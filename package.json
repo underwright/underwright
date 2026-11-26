@@ -6,6 +6,24 @@
   "type": "module",
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./istore": {
+      "types": "./dist/istore.d.ts",
+      "import": "./dist/istore.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    },
+    "./dist/github.js": {
+      "types": "./dist/github.d.ts",
+      "import": "./dist/github.js"
+    }
+  },
   "bin": {
     "underwright": "./dist/cli.js",
     "uw-runner": "./dist/uw-runner.js"
