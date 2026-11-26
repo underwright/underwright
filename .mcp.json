@@ -2,8 +2,15 @@
   "mcpServers": {
     "underwright": {
       "command": "node",
-      "args": ["dist/cli.js", "serve"],
-      "env": { "UNDERWRIGHT_DB": "underwright.db" }
+      "args": [
+        "dist/cli.js",
+        "serve"
+      ],
+      "env": {
+        "UNDERWRIGHT_DB": "underwright.db",
+        "DATABASE_URL": "postgres://alan_l_dennis%40outlook.com@ep-cool-cake-ebbchz6t.database.southcentralus.azuredatabricks.net:5432/underwright?sslmode=require",
+        "UW_PG_TOKEN_CMD": "/home/alan/.local/bin/uw-pg-token underwright dev"
+      }
     }
   }
 }
