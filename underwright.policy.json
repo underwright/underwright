@@ -259,9 +259,9 @@
         "heavy": "claude-opus-5"
       },
       "devin": {
-        "light": "adaptive",
-        "standard": "adaptive",
-        "heavy": "adaptive"
+        "light": "swe-2-high",
+        "standard": "swe-2-high",
+        "heavy": "swe-2-high"
       }
     },
     "flags": {

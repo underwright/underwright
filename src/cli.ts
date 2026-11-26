@@ -70,9 +70,9 @@ switch (cmd) {
     const httpIdx = args.indexOf("--http");
     if (httpIdx !== -1) {
       const [host, port] = (args[httpIdx + 1] ?? "127.0.0.1:8741").split(":");
-      await serveHttp(dbPath, host, Number(port), process.env.UNDERWRIGHT_TOKEN);
+      await serveHttp(dbPath, host, Number(port), process.env.UNDERWRIGHT_TOKEN, { githubSync: { issues: syncIssues, prs: syncPRs } });
     } else {
-      await serve(dbPath);
+      await serve(dbPath, { githubSync: { issues: syncIssues, prs: syncPRs } });
     }
     break;
   }

@@ -13,6 +13,16 @@ import { startLeaseSweeper } from "./sweeper.js";
 import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } from "./dashboard.js";
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 import { initTelemetry } from "./telemetry.js";
+import { startLoopWatch } from "./loopwatch.js";
+
+/** Adapters wired by the entrypoint (cli.ts / pro serve) — the depcruise
+ *  github-adapter-only rule keeps server.ts from importing github.ts. */
+export interface ServeDeps {
+  githubSync?: {
+    issues?: (store: IStore, repo: string) => Promise<unknown>;
+    prs?: (store: IStore, repo: string) => Promise<unknown>;
+  };
+}
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -26,7 +36,7 @@ const text = (data: unknown) => ({
   content: [{ type: "text" as const, text: typeof data === "string" ? data : JSON.stringify(data, null, 2) }],
 });
 
-export function createServer(store: IStore, adminConfigured = Boolean(process.env.UNDERWRIGHT_TOKEN)) {
+export function createServer(store: IStore, adminConfigured = Boolean(process.env.UNDERWRIGHT_TOKEN), deps: ServeDeps = {}) {
   const server = new McpServer(
     { name: "underwright", version: "0.1.0" },
     { instructions: `Underwright is the shared control plane for agentic development on this workspace.
@@ -53,6 +63,12 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
+  server.tool("github_sync", "Import GitHub issues as gh-* tasks and close stale ones — same as `underwright github sync`, but through the board so fenced/HA stores can be synced over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => deps.githubSync?.issues ? deps.githubSync.issues(store, a.repo) : { error: "github adapter not wired by this entrypoint" }));
+  server.tool("github_sync_prs", "Sync linked PR state into task evidence — `underwright github sync-prs` over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => deps.githubSync?.prs ? deps.githubSync.prs(store, a.repo) : { error: "github adapter not wired by this entrypoint" }));
   server.tool("submit_node_task", "Queue a node-targeted job. Omit target_node_id to route to the best eligible approved node. Legacy next_job consumers never receive these leases.", {
     target_node_id: z.string().min(1).max(64).optional(),
     node_spec: nodeSpecSchema,
@@ -292,8 +308,8 @@ Rules of engagement:
   return { server, store };
 }
 
-export async function serve(dbPath: string) {
-  const { server, store } = createServer(await openStore(dbPath));
+export async function serve(dbPath: string, deps: ServeDeps = {}) {
+  const { server, store } = createServer(await openStore(dbPath), Boolean(process.env.UNDERWRIGHT_TOKEN), deps);
   const stopSweeper = startLeaseSweeper(store);
   const onEnd = () => { void server.close(); };
   server.server.onclose = () => {
@@ -315,14 +331,20 @@ export async function serve(dbPath: string) {
 /** Shared control plane over HTTP — agents on any machine connect to /mcp.
  *  Bearer auth required when UNDERWRIGHT_TOKEN is set. /health stays open.
  *  POST /github/webhook stays open and authenticates with the HMAC secret. */
-export async function serveHttp(dbPath: string, host: string, port: number, token?: string) {
+export async function serveHttp(dbPath: string, host: string, port: number, token?: string, deps: ServeDeps = {}) {
   const store = await openStore(dbPath);
   // gh-136: control-plane telemetry — UNDERWRIGHT_TELEMETRY=file|stdout|off,
   // UNDERWRIGHT_TELEMETRY_FILE overrides the default JSONL path beside the DB.
   initTelemetry({ file: process.env.UNDERWRIGHT_TELEMETRY_FILE ?? dbPath.replace(/\.[^.]+$/, "") + "-telemetry.jsonl" });
   const stopSweeper = startLeaseSweeper(store);
+  startLoopWatch(Number(process.env.UNDERWRIGHT_LOOP_STALL_MS ?? 2000));
   let nodeRequests = 0;
   const http = createHttpServer(async (req, res) => {
+    const reqStart = Date.now();
+    res.on("finish", () => {
+      const ms = Date.now() - reqStart;
+      if (ms > 3000) console.error(`[underwright] slow request: ${req.method} ${req.url} ${ms}ms`);
+    });
     if (req.url?.startsWith("/nodes/")) {
       if (nodeRequests >= 32) { res.writeHead(429, { "retry-after": "3" }).end(); return; }
       nodeRequests++;
@@ -369,7 +391,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
     if (req.url === "/mcp") {
       // Stateless mode: fresh transport + server per request — all shared
       // state lives in the store, so any agent can call any tool anytime.
-      const { server } = createServer(store, Boolean(token));
+      const { server } = createServer(store, Boolean(token), deps);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => { transport.close(); server.close(); });
       await server.connect(transport);
