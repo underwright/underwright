@@ -6,3 +6,5 @@ underwright.db*
 .claude/
 underwright-telemetry.jsonl
 .partyline/
+.neon
+.env.local
