@@ -18,6 +18,10 @@
     "./schema": {
       "types": "./dist/schema.d.ts",
       "import": "./dist/schema.js"
+    },
+    "./dist/github.js": {
+      "types": "./dist/github.d.ts",
+      "import": "./dist/github.js"
     }
   },
   "bin": {
