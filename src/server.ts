@@ -14,6 +14,7 @@ import { handleDashboardRequest, dashboardAuth, sessionCookie, SESSION_COOKIE } 
 import { handleGithubWebhookHttp, isGithubWebhookRequest, webhookSecretFromEnv } from "./webhook.js";
 import { initTelemetry } from "./telemetry.js";
 import { startLoopWatch } from "./loopwatch.js";
+import { syncIssues, syncPRs } from "./github.js";
 
 const isDashboardPath = (path: string | undefined): boolean => {
   const p = (path ?? "").split("?")[0];
@@ -54,6 +55,12 @@ Rules of engagement:
     async a => admin(() => store.rejectNodeEnrollment(a.enrollment_id, "admin")));
   server.tool("revoke_node", "Revoke every credential and session for one node.", { node_id: z.string().max(64) },
     async a => admin(() => store.revokeNode(a.node_id, "admin")));
+  server.tool("github_sync", "Import GitHub issues as gh-* tasks and close stale ones — same as `underwright github sync`, but through the board so fenced/HA stores can be synced over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => syncIssues(store, a.repo)));
+  server.tool("github_sync_prs", "Sync linked PR state into task evidence — `underwright github sync-prs` over HTTP.", {
+    repo: z.string().max(128),
+  }, async a => admin(() => syncPRs(store, a.repo)));
   server.tool("submit_node_task", "Queue a node-targeted job. Omit target_node_id to route to the best eligible approved node. Legacy next_job consumers never receive these leases.", {
     target_node_id: z.string().min(1).max(64).optional(),
     node_spec: nodeSpecSchema,
