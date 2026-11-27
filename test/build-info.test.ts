@@ -24,7 +24,7 @@ it("stamps a fixed UTC build time into the artifact", () => {
 });
 
 it("reports unstamped source execution as unknown, not startup time", () => {
-  expect(BUILD_INFO.version).toBe("0.1.1");
+  expect(BUILD_INFO.version).toBe("0.1.2");
   expect(BUILD_INFO.build_time).toBeNull();
 });
 
