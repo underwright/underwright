@@ -111,6 +111,7 @@ export const nodeHarnessSchema = z.object({
 export const nodeInventorySchema = z.object({
   protocol_version: z.literal(1).default(1),
   daemon_version: z.string().max(32).optional(),
+  build_time: z.string().datetime().nullable().optional(),
   os: z.string().max(32).optional(),
   arch: z.string().max(32).optional(),
   labels: z.array(z.string().max(64)).max(16).default([]),
@@ -165,6 +166,7 @@ export function projectNode(node: any, now = Date.now()) {
     current_job_id: node.current_job_id ?? null,
     capabilities_version: node.capabilities_version ?? 0,
     capabilities_freshness, capabilities_observed_at,
+    daemon_version: inventory.daemon_version ?? 'unknown', build_time: inventory.build_time ?? null,
     supported_operation_kinds: inventory.supported_operation_kinds ?? [],
     harnesses,
   };

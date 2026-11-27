@@ -29,7 +29,7 @@
     "provenance": true
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/stamp-build.mjs",
     "prepack": "npm run build",
     "preversion": "npm test",
     "version": "npm run build",

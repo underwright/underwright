@@ -1,3 +1,4 @@
+import { BUILD_INFO } from "./build-info.js";
 import { createWorkerServer } from './node-worker.js';
 import { handleNodeHttp } from "./node-http.js";
 import { nodePolicySchema, nodeSpecSchema } from "./node-protocol.js";
@@ -38,7 +39,7 @@ const text = (data: unknown) => ({
 
 export function createServer(store: IStore, adminConfigured = Boolean(process.env.UNDERWRIGHT_TOKEN), deps: ServeDeps = {}) {
   const server = new McpServer(
-    { name: "underwright", version: "0.1.0" },
+    { name: "underwright", version: BUILD_INFO.version },
     { instructions: `Underwright is the shared control plane for agentic development on this workspace.
 Rules of engagement:
 1. Before writing shared code, call search_context — reuse helpers that exist.
@@ -399,7 +400,7 @@ export async function serveHttp(dbPath: string, host: string, port: number, toke
       return;
     }
     if (req.url === "/health") {
-      res.writeHead(200, { "content-type": "application/json" }).end('{"ok":true}');
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, ...BUILD_INFO }));
       return;
     }
     // Interactive dashboard: reads and form-posted mutations share the

@@ -6,6 +6,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { SqliteStore } from "../src/store.js";
 import { saveNodeCredential } from "../src/node-client.js";
 import { runNode } from "../src/node-run.js";
+import { BUILD_INFO } from "../src/build-info.js";
 import { NODE_ONLINE_MS, NODE_STALE_MS, nodeSecret } from "../src/node-protocol.js";
 import { renderDashboard } from "../src/dashboard.js";
 import { serveHttp } from "../src/server.js";
@@ -67,12 +68,14 @@ it("heartbeats independently while a job is running and redacts inventory secret
   const running = runNode({
     dir, signal: shutdown.signal, heartbeatMs: 30, capabilitiesMs: 40,
     executor: async () => blocked,
-    probe: () => ({ protocol_version: 1, harnesses: [{ id: "grok", version: "unknown", installed: false, auth_status: "unknown", quota: { state: "unknown" } }] }),
+    probe: () => ({ protocol_version: 1, daemon_version: "wrong-probe-version", build_time: "2000-01-01T00:00:00.000Z", harnesses: [{ id: "grok", version: "unknown", installed: false, auth_status: "unknown", quota: { state: "unknown" } }] }),
   });
   const finished = await blocked;
   expect(finished.result).toContain("harmless");
   expect(heartbeats).toBeGreaterThanOrEqual(2);
   await vi.waitFor(() => expect(store.listNodes()[0].capabilities_freshness).toBe("fresh"));
+  expect(store.listNodes()[0]).toMatchObject({ daemon_version: BUILD_INFO.version, build_time: BUILD_INFO.build_time });
+  expect(await (await fetch(`${url}/health`)).json()).toEqual({ ok: true, ...BUILD_INFO });
   expect(JSON.stringify(store.listNodes()[0])).not.toContain(node.token);
   expect(JSON.stringify(store.auditLog(200))).not.toContain(node.token);
   shutdown.abort();

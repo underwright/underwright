@@ -1,4 +1,5 @@
 /** Outbound daemon with independent liveness and lease loops, typed execution and durable receipts. */
+import { BUILD_INFO } from "./build-info.js";
 import { createExecutorRegistry, redact, type ExecutorConfig } from './node-executors.js';
 import { NODE_MAX_CONCURRENCY, NODE_JOB_RENEW_GIVE_UP_MS } from './node-protocol.js';
 import { AttemptJournal, processStart } from './node-journal.js';
@@ -55,7 +56,7 @@ export const harmlessExecutor: NodeExecutor = async (job) => ({
 
 export function defaultInventoryProbe(): Record<string, unknown> {
   return {
-    protocol_version: 1, daemon_version: "0.1.0", os: platform(), arch: arch(),
+    protocol_version: 1, daemon_version: BUILD_INFO.version, build_time: BUILD_INFO.build_time, os: platform(), arch: arch(),
     labels: [], supported_operation_kinds: ["run-script", "launch-agent", "provision", "install-harness"],
     approved_workspace_ids: [], max_concurrency: 1, current_slots: 0,
     harnesses: ["claude", "codex", "grok", "agy"].map((id) => ({
@@ -175,7 +176,7 @@ export async function runNode(opts: {
                 probed.supported_operation_kinds = configSupportedKinds(opts.config);
                 probed.approved_workspace_ids = Object.keys(opts.config.workspaces ?? {});
               }
-              const inventory = { ...probed, max_concurrency: maxConcurrency, current_slots: activeJobs.size, features: ["launch-model-flag", "worktree-mcp"] };
+              const inventory = { ...probed, daemon_version: BUILD_INFO.version, build_time: BUILD_INFO.build_time, max_concurrency: maxConcurrency, current_slots: activeJobs.size, features: ["launch-model-flag", "worktree-mcp"] };
               capabilities_version += 1;
               const result = await nodeCall(cred, "/nodes/v1/capabilities", { session_id, version: capabilities_version, inventory }, "PUT", sessionAbort.signal);
               if ([401, 409].includes(result.status)) { sessionAbort.abort(); return; }

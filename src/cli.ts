@@ -2,6 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { enrollNode, nodeStatus } from "./node-client.js";
+import { BUILD_INFO } from "./build-info.js";
 import { attestHarnesses, DEFAULT_NODE_CONFIG_PATH, initConfig, validateConfig, which } from "./node-config.js";
 import type { ExecutorConfig } from "./node-executors.js";
 import {
@@ -39,8 +40,7 @@ switch (cmd) {
   case "--version":
   case "-v":
   case "version": {
-    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-    console.log(pkg.version);
+    console.log(args.includes("--json") ? JSON.stringify(BUILD_INFO) : `${BUILD_INFO.version} (built ${BUILD_INFO.build_time ?? "unknown"})`);
     break;
   }
 
